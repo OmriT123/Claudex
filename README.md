@@ -109,6 +109,30 @@ The `claudex_collab` tool supports these request types:
 | `testing_strategy` | You want Codex to suggest what and how to test |
 | `general` | Open-ended analysis and suggestions |
 
+## Artifact Scratchpad
+
+Codex can produce file artifacts — code snippets, test drafts, verification scripts, analysis docs — without ever having write access to your codebase.
+
+**How it works:**
+1. Codex runs in `--sandbox read-only` (enforced by Codex CLI — physically cannot write)
+2. Codex embeds `<claudex-artifact>` blocks in its text output
+3. The **server** parses these from the final-answer section only
+4. The server writes them to `.claudex/run-<uuid>/` (isolated per invocation)
+5. Claude Code receives clean text + an artifact listing and can read the files
+
+**Security model:**
+- Codex never has write access — the sandbox enforces it
+- Filenames are validated against path traversal (`Path.resolve()` + `is_relative_to()`)
+- Symlink writes are rejected; exclusive-create (`open('x')`) prevents overwrite races
+- Only the final-answer section is parsed (reasoning traces are ignored)
+- Artifacts > 100KB are skipped
+- Run directories are cleaned up after 1 hour
+
+**Setup:** Add `.claudex` to your `.gitignore`:
+```bash
+echo '.claudex' >> .gitignore
+```
+
 ## Defaults
 
 - **Model**: `gpt-5.3-codex` — current best Codex model
@@ -140,6 +164,8 @@ Claudex/
 ├── skills/
 │   └── claudex/
 │       └── SKILL.md         # Auto-triggers during plan mode
+├── .claudex/                # Artifact scratchpad (gitignored)
+│   └── run-<uuid>/          # Per-run artifact directories
 ├── docs/
 │   └── initial-plan.md      # Original design document
 ├── README.md

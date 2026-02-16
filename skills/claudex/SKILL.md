@@ -150,6 +150,17 @@ Use when you need targeted help from Codex on a specific problem. Unlike the oth
 - Use `claudex_review` when your plan is complete and needs stress-testing
 - Use `claudex_brainstorm` when exploring open-ended problems without direction
 
+## Reading Codex Artifacts
+
+Codex may produce file artifacts (code snippets, tests, verification scripts, analysis docs) that the server writes to `.claudex/run-<uuid>/`. When Codex's output includes an **"Artifacts Created"** section:
+
+1. **Read every artifact file** listed — they contain the code/evidence Codex references in its text
+2. Use the exact paths shown (e.g. `.claudex/run-abc123/proposed_handler.py`)
+3. Evaluate artifact contents with the same critical eye you apply to Codex's text output
+4. Reference specific artifact files when presenting findings to the user
+
+Artifacts are read-only evidence — Codex cannot write to your codebase. The server extracts artifacts from Codex's output and writes them to an isolated per-run directory.
+
 ## Critical Rules
 
 ### ALWAYS:

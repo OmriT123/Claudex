@@ -16,6 +16,14 @@ without modifying anything.
 Two different AI architectures collaborate on the same codebase.
 Claude Code synthesizes the best of both.
 
+Artifact Scratchpad
+-------------------
+Codex can produce structured file artifacts (code snippets, tests, analysis
+docs) embedded in its text output. The **server** extracts these from the
+final-answer section and writes them to ``.claudex/run-<uuid>/``, isolated
+per invocation. Codex itself never has write access — ``--sandbox read-only``
+is enforced by the Codex CLI. The server is the sole gatekeeper.
+
 Requires:
   - Codex CLI installed: npm i -g @openai/codex
   - Codex authenticated: codex login (ChatGPT subscription)
@@ -24,9 +32,13 @@ Requires:
 
 import asyncio
 import os
+import re
 import shutil
 import logging
+import time
+import uuid
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -39,6 +51,44 @@ from pydantic import BaseModel, Field, ConfigDict
 DEFAULT_MODEL = "gpt-5.3-codex"
 DEFAULT_REASONING_EFFORT = "xhigh"
 EXEC_TIMEOUT_SECONDS = 300  # 5 min max per Codex call
+
+FINAL_ANSWER_DELIMITER = "---FINAL-ANSWER---"
+ARTIFACT_MAX_BYTES = 100 * 1024  # 100 KB per artifact
+ARTIFACT_TAG_RE = re.compile(
+    r'<claudex-artifact\s+([^>]+)>(.*?)</claudex-artifact>',
+    re.DOTALL,
+)
+ARTIFACT_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+RUN_DIR_MAX_AGE_SECONDS = 3600  # 1 hour
+
+# ---------------------------------------------------------------------------
+# Artifact instructions (appended to all system prompts)
+# ---------------------------------------------------------------------------
+
+ARTIFACT_INSTRUCTIONS = """
+
+## Demonstrating Code & Evidence
+
+When you want to show code, write tests, or provide evidence, wrap them in artifact blocks.
+Place ALL artifact blocks AFTER the delimiter line `---FINAL-ANSWER---` at the end of your response.
+
+Format:
+<claudex-artifact filename="descriptive_name.py" language="python">
+# Your code here
+</claudex-artifact>
+
+Use artifacts for:
+- Code snippets showing your proposed implementation
+- Test cases that prove your point
+- Verification scripts or analysis
+- Detailed explanations in markdown (.md files)
+
+Rules:
+- Place all artifacts after ---FINAL-ANSWER---
+- Use descriptive filenames (no paths, just filenames like `proposed_handler.py`)
+- Reference your artifacts in the text above the delimiter
+- Keep artifacts focused and small
+"""
 
 # ---------------------------------------------------------------------------
 # System prompts for each mode
@@ -67,7 +117,7 @@ Format your response as:
 
 ## Verdict
 (adopt / adapt / rethink)
-"""
+""" + ARTIFACT_INSTRUCTIONS
 
 PARALLEL_PLAN_SYSTEM = """\
 You are a senior engineer. You have full read access to the codebase. \
@@ -90,7 +140,7 @@ Read the relevant files in the codebase first, then produce a plan with:
 
 Be concrete — reference actual files, existing patterns, and real constraints \
 from this codebase. No vague hand-waving.
-"""
+""" + ARTIFACT_INSTRUCTIONS
 
 BRAINSTORM_SYSTEM = """\
 You are a senior engineer brainstorming with a peer. You have full read access to the \
@@ -99,7 +149,7 @@ trade-offs, and think about what the ideal solution looks like if there were no 
 constraints, then work backward to what's practical.
 
 Be concrete. Reference actual files and patterns in the codebase when relevant.
-"""
+""" + ARTIFACT_INSTRUCTIONS
 
 COLLABORATE_SYSTEM = """\
 You are collaborating with another AI (Claude Code) to solve a problem together.
@@ -122,7 +172,7 @@ Your job:
 4. Where you AGREE with Claude's analysis, say so briefly
 5. Where you DISAGREE or see something Claude missed, explain in detail
 6. End with 2-3 concrete next steps
-"""
+""" + ARTIFACT_INSTRUCTIONS
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -159,6 +209,166 @@ def _find_codex_bin() -> str:
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     return "codex"  # Let it fail with a clear FileNotFoundError
+
+
+def _cleanup_old_run_dirs(claudex_dir: Path) -> None:
+    """Best-effort removal of run directories older than RUN_DIR_MAX_AGE_SECONDS."""
+    if not claudex_dir.is_dir():
+        return
+    cutoff = time.time() - RUN_DIR_MAX_AGE_SECONDS
+    for entry in claudex_dir.iterdir():
+        if entry.is_symlink():
+            continue  # Never follow symlinks during cleanup
+        if entry.is_dir() and entry.name.startswith("run-"):
+            try:
+                if entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry)
+                    logger.info("Cleaned up stale run dir: %s", entry.name)
+            except OSError:
+                pass  # best-effort
+
+
+def _prepare_run_dir(project_dir: str) -> Path:
+    """Create an isolated per-run artifact directory under .claudex/.
+
+    Returns the Path to the run directory (e.g. <project>/.claudex/run-<uuid>/).
+    Also performs best-effort cleanup of stale run dirs and warns if .claudex
+    is not in .gitignore.
+    """
+    root = Path(project_dir)
+    claudex_dir = root / ".claudex"
+
+    # Best-effort cleanup of old runs
+    _cleanup_old_run_dirs(claudex_dir)
+
+    # Warn if .claudex not in .gitignore
+    gitignore = root / ".gitignore"
+    if gitignore.is_file():
+        try:
+            content = gitignore.read_text()
+            if ".claudex" not in content:
+                logger.warning(
+                    ".claudex is not in .gitignore — artifact dirs may be committed. "
+                    "Add '.claudex' to your .gitignore."
+                )
+        except OSError:
+            pass
+    else:
+        logger.warning(
+            "No .gitignore found — .claudex artifact dirs may be committed."
+        )
+
+    run_dir = claudex_dir / f"run-{uuid.uuid4()}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def _extract_and_save_artifacts(
+    output: str, run_dir: Path
+) -> tuple[str, list[tuple[str, str]]]:
+    """Parse artifact blocks from Codex output and write them to run_dir.
+
+    Only parses artifacts in the final-answer section (after the
+    FINAL_ANSWER_DELIMITER) to avoid picking up tags from reasoning traces
+    or repo content echoed in the reasoning stream.
+
+    Returns (cleaned_text, artifacts) where cleaned_text has the artifact
+    blocks stripped and artifacts is a list of (filename, language) tuples.
+    """
+    # Split at the LAST occurrence of the delimiter to avoid false matches
+    # from reasoning traces that echo the delimiter string
+    idx = output.rfind(FINAL_ANSWER_DELIMITER)
+    if idx == -1:
+        # No delimiter found — no artifacts to parse
+        return output, []
+
+    preamble = output[:idx]
+    answer_section = output[idx + len(FINAL_ANSWER_DELIMITER):]
+
+    artifacts: list[tuple[str, str]] = []
+
+    for match in ARTIFACT_TAG_RE.finditer(answer_section):
+        attrs = dict(ARTIFACT_ATTR_RE.findall(match.group(1)))
+        filename = attrs.get("filename", "").strip()
+        language = attrs.get("language", "").strip()
+        content = match.group(2)
+
+        if not filename or not language:
+            logger.warning("Artifact rejected — missing filename or language")
+            continue
+
+        # --- Filename validation ---
+        # Reject empty, null-byte, or path-separator names
+        if "\x00" in filename or "/" in filename or "\\" in filename:
+            logger.warning("Artifact rejected — invalid filename: %r", filename)
+            continue
+
+        # Reject overly long filenames (filesystem NAME_MAX)
+        if len(filename.encode("utf-8")) > 255:
+            logger.warning(
+                "Artifact rejected — filename too long: %r", filename
+            )
+            continue
+
+        # Reject hidden files or path components with ..
+        fname_path = Path(filename)
+        if any(
+            part.startswith(".") or part == ".." for part in fname_path.parts
+        ):
+            logger.warning(
+                "Artifact rejected — suspicious path component: %r", filename
+            )
+            continue
+
+        target = (run_dir / filename).resolve()
+        if not target.is_relative_to(run_dir.resolve()):
+            logger.warning(
+                "Artifact rejected — path traversal attempt: %r", filename
+            )
+            continue
+
+        # Reject symlinks at the target location (defense-in-depth;
+        # the UUID-based run dir + exclusive create already mitigate this)
+        if os.path.islink(target):
+            logger.warning(
+                "Artifact rejected — symlink exists at target: %r", filename
+            )
+            continue
+
+        # Size guard
+        content_bytes = content.encode("utf-8")
+        if len(content_bytes) > ARTIFACT_MAX_BYTES:
+            logger.warning(
+                "Artifact skipped — exceeds %d bytes: %r (%d bytes)",
+                ARTIFACT_MAX_BYTES,
+                filename,
+                len(content_bytes),
+            )
+            continue
+
+        # Write with exclusive create to avoid overwriting via symlink race
+        try:
+            with open(target, "x", encoding="utf-8") as f:
+                f.write(content)
+            artifacts.append((filename, language))
+            logger.info("Artifact saved: %s (%s)", filename, language)
+        except FileExistsError:
+            logger.warning(
+                "Artifact rejected — file already exists: %r", filename
+            )
+        except OSError as exc:
+            logger.warning("Artifact write failed for %r: %s", filename, exc)
+
+    # Strip artifact blocks from the answer section
+    cleaned_answer = ARTIFACT_TAG_RE.sub("", answer_section).strip()
+
+    # Reconstruct output: preamble + cleaned answer
+    # The delimiter itself is stripped — it's internal to the Codex protocol
+    cleaned_text = preamble.strip()
+    if cleaned_answer:
+        cleaned_text = cleaned_text + "\n\n" + cleaned_answer if cleaned_text else cleaned_answer
+
+    return cleaned_text, artifacts
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +681,35 @@ async def _run_codex(
             return fallback
         return "Codex returned no output. The prompt may need to be more specific."
 
-    return output
+    # --- Artifact extraction ---
+    # Create a per-run directory and extract any artifact blocks from the
+    # final-answer section. Codex stays read-only; the *server* writes.
+    try:
+        run_dir = _prepare_run_dir(cwd)
+        cleaned_output, artifacts = _extract_and_save_artifacts(output, run_dir)
+
+        if artifacts:
+            # Build relative path from project root for readability
+            rel_run = run_dir.relative_to(Path(cwd))
+            lines = [
+                "\n\n---",
+                "## Artifacts Created",
+                "The following files were written for your reference:",
+            ]
+            for fname, lang in artifacts:
+                lines.append(f"- `{rel_run / fname}` ({lang})")
+            lines.append(
+                "\nRead these files to see the code/evidence referenced above."
+            )
+            cleaned_output += "\n".join(lines)
+        else:
+            # No artifacts — clean up the empty run dir
+            shutil.rmtree(run_dir, ignore_errors=True)
+    except OSError as exc:
+        logger.warning("Artifact directory setup failed: %s", exc)
+        cleaned_output = output  # Fall back to raw output
+
+    return cleaned_output
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +738,9 @@ async def claudex_review(params: SecondOpinionInput) -> str:
 
     Use this during planning to stress-test your approach with a different AI
     architecture's perspective before committing to implementation.
+
+    Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
+    Read them when referenced in the output.
     """
     parts = [SECOND_OPINION_SYSTEM, "\n---\n", f"## Proposed Plan\n{params.plan}"]
 
@@ -543,6 +784,9 @@ async def claudex_plan(params: ParallelPlanInput) -> str:
 
     This is the "plan vs plan" approach — two different AI architectures
     independently planning for the same goal, then the best ideas win.
+
+    Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
+    Read them when referenced in the output.
     """
     parts = [PARALLEL_PLAN_SYSTEM, "\n---\n", f"## Task\n{params.task}"]
 
@@ -586,6 +830,9 @@ async def claudex_brainstorm(params: BrainstormInput) -> str:
     and weighs trade-offs. It reads your codebase for context.
 
     Use this when you don't have a plan yet and want to explore options.
+
+    Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
+    Read them when referenced in the output.
     """
     parts = [BRAINSTORM_SYSTEM, "\n---\n", f"## Topic\n{params.topic}"]
 
@@ -630,6 +877,9 @@ async def claudex_collab(params: CollaborateInput) -> str:
     - verification: Independently verify implementation correctness
     - testing_strategy: Suggest what to test, edge cases, and test structure
     - general: Provide independent analysis and suggestions
+
+    Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
+    Read them when referenced in the output.
     """
     parts = [
         COLLABORATE_SYSTEM,
@@ -675,6 +925,9 @@ async def claudex_review_files(params: QuickReviewInput) -> str:
     Codex reads the specified files (and surrounding codebase for context)
     and provides targeted feedback. Useful for getting a different perspective
     on code you've just written or are about to refactor.
+
+    Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
+    Read them when referenced in the output.
     """
     focus_instruction = ""
     if params.focus:
@@ -685,6 +938,7 @@ async def claudex_review_files(params: QuickReviewInput) -> str:
         f"{focus_instruction}"
         "Provide specific, actionable feedback. Reference line numbers where possible. "
         "Don't list things that are fine — focus on what needs attention."
+        + ARTIFACT_INSTRUCTIONS
     )
 
     return await _run_codex(
