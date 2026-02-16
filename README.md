@@ -48,49 +48,45 @@ with clear CC/Codex attribution
 
 ## Installation
 
-### One-liner (recommended)
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/OmriT123/Claudex/main/install.sh | bash
 ```
 
-This adds the Claudex marketplace, registers it with Claude Code, and installs the plugin globally.
+This checks prerequisites, registers the plugin marketplace, and installs Claudex globally. Start a new Claude Code session and you're ready to go.
 
-### Manual install
+### Verify
 
-If you prefer to do it step by step:
+- `/mcp` — should show `claudex` with its tools
+- Type: `use claudex_ping to check if Codex is working`
 
-1. **Add the marketplace:**
-   ```bash
-   git clone https://github.com/OmriT123/claude-plugins.git \
-     ~/.claude/plugins/marketplaces/omri-plugins
-   ```
+<details>
+<summary>Manual install / local development</summary>
 
-2. **Register it** — add this entry to `~/.claude/plugins/known_marketplaces.json`:
-   ```json
-   "omri-plugins": {
-     "source": { "source": "github", "repo": "OmriT123/claude-plugins" },
-     "installLocation": "<HOME>/.claude/plugins/marketplaces/omri-plugins",
-     "lastUpdated": "2026-02-17T00:00:00.000Z"
-   }
-   ```
+**Manual install:**
 
-3. **Install the plugin:**
-   ```bash
-   claude plugin install claudex
-   ```
+```bash
+# 1. Clone the marketplace
+git clone https://github.com/OmriT123/claude-plugins.git \
+  ~/.claude/plugins/marketplaces/omri-plugins
 
-### Local development
+# 2. Register it — add to ~/.claude/plugins/known_marketplaces.json:
+#    "omri-plugins": {
+#      "source": { "source": "github", "repo": "OmriT123/claude-plugins" },
+#      "installLocation": "~/.claude/plugins/marketplaces/omri-plugins",
+#      "lastUpdated": "2026-02-17T00:00:00.000Z"
+#    }
+
+# 3. Install
+claude plugin install claudex
+```
+
+**Local development:**
 
 ```bash
 claude --plugin-dir /path/to/Claudex
 ```
 
-### Verify
-
-Start a new Claude Code session, then:
-- `/mcp` — should show `claudex` with its tools
-- Type: `use claudex_ping to check if Codex is working`
+</details>
 
 ## Commands
 
