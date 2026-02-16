@@ -49,8 +49,8 @@ from pydantic import BaseModel, Field, ConfigDict
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = "gpt-5.3-codex"
-DEFAULT_REASONING_EFFORT = "xhigh"
-EXEC_TIMEOUT_SECONDS = 300  # 5 min max per Codex call
+DEFAULT_REASONING_EFFORT = "high"
+EXEC_TIMEOUT_SECONDS = 600  # 10 min max per Codex call
 
 FINAL_ANSWER_DELIMITER = "---FINAL-ANSWER---"
 ARTIFACT_MAX_BYTES = 100 * 1024  # 100 KB per artifact
@@ -442,8 +442,8 @@ class SecondOpinionInput(BaseModel):
         description="Codex model to use. gpt-5.3-codex is best for deep architectural analysis.",
     )
     reasoning_effort: ReasoningEffort = Field(
-        default=ReasoningEffort.XHIGH,
-        description="How deeply Codex should reason. 'xhigh' recommended for plan review.",
+        default=ReasoningEffort.HIGH,
+        description="How deeply Codex should reason. Use 'xhigh' for maximum depth (slower).",
     )
 
 
@@ -482,8 +482,8 @@ class ParallelPlanInput(BaseModel):
         description="Codex model to use. gpt-5.3-codex recommended for planning.",
     )
     reasoning_effort: ReasoningEffort = Field(
-        default=ReasoningEffort.XHIGH,
-        description="How deeply Codex should reason. 'xhigh' recommended for planning.",
+        default=ReasoningEffort.HIGH,
+        description="How deeply Codex should reason. Use 'xhigh' for maximum depth (slower).",
     )
 
 
@@ -512,8 +512,8 @@ class BrainstormInput(BaseModel):
         description="Codex model to use.",
     )
     reasoning_effort: ReasoningEffort = Field(
-        default=ReasoningEffort.XHIGH,
-        description="How deeply Codex should reason.",
+        default=ReasoningEffort.HIGH,
+        description="How deeply Codex should reason. Use 'xhigh' for maximum depth (slower).",
     )
 
 
@@ -551,8 +551,8 @@ class CollaborateInput(BaseModel):
         description="Codex model to use.",
     )
     reasoning_effort: ReasoningEffort = Field(
-        default=ReasoningEffort.XHIGH,
-        description="How deeply Codex should reason.",
+        default=ReasoningEffort.HIGH,
+        description="How deeply Codex should reason. Use 'xhigh' for maximum depth (slower).",
     )
 
 

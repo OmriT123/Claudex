@@ -158,7 +158,7 @@ echo '.claudex' >> .gitignore
 ## Defaults
 
 - **Model**: `gpt-5.3-codex` — current best Codex model
-- **Reasoning effort**: `xhigh` (extra high) — maximum reasoning depth
+- **Reasoning effort**: `high` — deep analysis without timeouts (use `xhigh` for maximum depth)
 - **Reasoning summary**: `detailed` — includes Codex's chain-of-thought
 - **Sandbox**: `read-only` — Codex can read your repo but never modify it
 

@@ -196,7 +196,7 @@ When Codex disagrees with your approach:
 | gpt-5-codex | Original Codex variant | ~30-60s |
 | gpt-5-codex-mini | Quick checks, cost-effective | ~15-30s |
 
-Default is **gpt-5.3-codex** with **xhigh** (extra high) reasoning effort for maximum depth.
+Default is **gpt-5.3-codex** with **high** reasoning effort. Use `xhigh` for maximum depth when you have time to wait.
 
 ## Rate Limit Awareness
 
