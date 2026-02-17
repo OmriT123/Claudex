@@ -1,5 +1,5 @@
 {
-  "claudex": {
+  "codex": {
     "command": "uv",
     "args": ["run", "${CLAUDE_PLUGIN_ROOT}/server/server.py"]
   }

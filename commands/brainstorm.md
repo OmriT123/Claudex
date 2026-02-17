@@ -1,18 +1,18 @@
 ---
 name: brainstorm
-description: "Brainstorm with Claudex — explore approaches to a problem from two AI perspectives"
+description: "Brainstorm with Codex — explore approaches to a problem from two AI perspectives"
 argument-hint: "[topic or problem]"
 allowed-tools: Read, Glob, Grep
 ---
 
-# Brainstorm with Claudex
+# Brainstorm with Codex
 
 **Topic**: $ARGUMENTS
 
 ## Your workflow:
 
 1. **Understand the problem**: Read relevant code to build context
-2. **Call `claudex_brainstorm`** with:
+2. **Call `codex_brainstorm`** with:
    - user_prompt: The user's exact words (copy "$ARGUMENTS" verbatim — do NOT rephrase)
    - topic: Your understanding of the core question (factual grounding only)
    - context: Technical constraints and relevant files

@@ -1,11 +1,11 @@
 ---
 name: collab
-description: "Collaborate with Claudex to solve a problem — red-team, debug, verify, review code, suggest features, or get an independent analysis"
+description: "Collaborate with Codex to solve a problem — red-team, debug, verify, review code, suggest features, or get an independent analysis"
 argument-hint: "[problem description]"
 allowed-tools: Read, Glob, Grep
 ---
 
-# Collaborate with Claudex
+# Collaborate with Codex
 
 **Problem**: $ARGUMENTS
 
@@ -20,7 +20,7 @@ allowed-tools: Read, Glob, Grep
    - `verification` — you want Codex to independently verify correctness
    - `testing_strategy` — you want Codex to suggest what and how to test
    - `general` — open-ended analysis and suggestions
-3. **Call `claudex_collab`** with:
+3. **Call `codex_collab`** with:
    - problem: The problem description above
    - cc_analysis: Your own findings and current thinking (be honest about what you're unsure of)
    - request_type: The type from step 2
@@ -35,6 +35,6 @@ allowed-tools: Read, Glob, Grep
    - Where you agree and where you differ
    - Recommended next steps with rationale
 6. **Iterate if needed**: If Codex's suggestions lead to new findings:
-   - Call `claudex_collab` again with accumulated context
+   - Call `codex_collab` again with accumulated context
    - Include: previous Codex suggestions + what you tried + results
    - This builds a shared understanding across rounds

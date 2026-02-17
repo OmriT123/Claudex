@@ -195,7 +195,7 @@ logger = logging.getLogger("claudex")
 # Server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("claudex")
+mcp = FastMCP("codex")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -404,7 +404,7 @@ class ReasoningEffort(str, Enum):
 
 
 class RequestType(str, Enum):
-    """Collaboration request types for claudex_collab."""
+    """Collaboration request types for codex_collab."""
     FEATURE_SUGGESTION = "feature_suggestion"
     BUG_APPROACH = "bug_approach"
     CODE_CRITIQUE = "code_critique"
@@ -744,7 +744,7 @@ async def _run_codex(
 
 
 @mcp.tool(
-    name="claudex_review",
+    name="codex_review",
     annotations={
         "title": "Get Codex Second Opinion on a Plan",
         "readOnlyHint": True,
@@ -753,7 +753,7 @@ async def _run_codex(
         "openWorldHint": True,
     },
 )
-async def claudex_review(params: SecondOpinionInput) -> str:
+async def codex_review(params: SecondOpinionInput) -> str:
     """Get an independent second opinion from Codex on your implementation plan.
 
     Codex reads your codebase in read-only mode and provides:
@@ -792,7 +792,7 @@ async def claudex_review(params: SecondOpinionInput) -> str:
 
 
 @mcp.tool(
-    name="claudex_plan",
+    name="codex_plan",
     annotations={
         "title": "Get Codex's Own Independent Plan",
         "readOnlyHint": True,
@@ -801,10 +801,10 @@ async def claudex_review(params: SecondOpinionInput) -> str:
         "openWorldHint": True,
     },
 )
-async def claudex_plan(params: ParallelPlanInput) -> str:
+async def codex_plan(params: ParallelPlanInput) -> str:
     """Have Codex generate its OWN independent implementation plan for a task.
 
-    Unlike claudex_review (which critiques YOUR plan), claudex_plan gives
+    Unlike codex_review (which critiques YOUR plan), codex_plan gives
     Codex the same task description and lets it plan from scratch. You can
     then compare both plans side-by-side and synthesize the best of both.
 
@@ -849,7 +849,7 @@ async def claudex_plan(params: ParallelPlanInput) -> str:
 
 
 @mcp.tool(
-    name="claudex_brainstorm",
+    name="codex_brainstorm",
     annotations={
         "title": "Brainstorm with Codex",
         "readOnlyHint": True,
@@ -858,10 +858,10 @@ async def claudex_plan(params: ParallelPlanInput) -> str:
         "openWorldHint": True,
     },
 )
-async def claudex_brainstorm(params: BrainstormInput) -> str:
+async def codex_brainstorm(params: BrainstormInput) -> str:
     """Brainstorm with Codex about a problem, feature, or architecture decision.
 
-    Unlike claudex_review (which reviews a specific plan), brainstorm is
+    Unlike codex_review (which reviews a specific plan), brainstorm is
     open-ended — Codex explores the problem space, suggests creative approaches,
     and weighs trade-offs. It reads your codebase for context.
 
@@ -899,7 +899,7 @@ async def claudex_brainstorm(params: BrainstormInput) -> str:
 
 
 @mcp.tool(
-    name="claudex_collab",
+    name="codex_collab",
     annotations={
         "title": "Collaborate with Codex on a Problem",
         "readOnlyHint": True,
@@ -908,7 +908,7 @@ async def claudex_brainstorm(params: BrainstormInput) -> str:
         "openWorldHint": True,
     },
 )
-async def claudex_collab(params: CollaborateInput) -> str:
+async def codex_collab(params: CollaborateInput) -> str:
     """Collaborate with Codex to solve a problem together.
 
     Unlike other tools which are one-shot consultations, this is designed for
@@ -956,7 +956,7 @@ async def claudex_collab(params: CollaborateInput) -> str:
 
 
 @mcp.tool(
-    name="claudex_review_files",
+    name="codex_review_files",
     annotations={
         "title": "Quick Code Review from Codex",
         "readOnlyHint": True,
@@ -965,7 +965,7 @@ async def claudex_collab(params: CollaborateInput) -> str:
         "openWorldHint": True,
     },
 )
-async def claudex_review_files(params: QuickReviewInput) -> str:
+async def codex_review_files(params: QuickReviewInput) -> str:
     """Get a focused code review from Codex on specific files.
 
     Codex reads the specified files (and surrounding codebase for context)
@@ -996,7 +996,7 @@ async def claudex_review_files(params: QuickReviewInput) -> str:
 
 
 @mcp.tool(
-    name="claudex_ping",
+    name="codex_ping",
     annotations={
         "title": "Test Codex Connection",
         "readOnlyHint": True,
@@ -1005,7 +1005,7 @@ async def claudex_review_files(params: QuickReviewInput) -> str:
         "openWorldHint": False,
     },
 )
-async def claudex_ping() -> str:
+async def codex_ping() -> str:
     """Test that Codex CLI is installed, authenticated, and working."""
     codex_path = shutil.which("codex")
     if not codex_path:

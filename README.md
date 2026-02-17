@@ -11,7 +11,7 @@ You ask Claude Code to implement something
 CC formulates its own plan
         |
         v
-CC calls claudex_plan via MCP -----------------+
+CC calls codex_plan via MCP -----------------+
         |                                       |
         v                                       v
 CC has Plan A                          Codex reads your repo
@@ -56,8 +56,8 @@ This checks prerequisites, registers the plugin marketplace, and installs Claude
 
 ### Verify
 
-- `/mcp` — should show `claudex` with its tools
-- Type: `use claudex_ping to check if Codex is working`
+- `/mcp` — should show `codex` with its tools
+- Type: `use codex_ping to check if Codex is working`
 
 <details>
 <summary>Manual install / local development</summary>
@@ -77,7 +77,7 @@ git clone https://github.com/OmriT123/claude-plugins.git \
 #    }
 
 # 3. Install
-claude plugin install claudex
+claude plugin install codex
 ```
 
 **Local development:**
@@ -92,34 +92,34 @@ claude --plugin-dir /path/to/Claudex
 
 | Command | What It Does |
 |---------|-------------|
-| `/claudex:plan [task]` | CC and Codex independently plan the same task, then CC synthesizes |
-| `/claudex:brainstorm [topic]` | Explore approaches from two AI perspectives |
-| `/claudex:collab [problem]` | CC shares its analysis, Codex provides targeted suggestions |
+| `/codex:plan [task]` | CC and Codex independently plan the same task, then CC synthesizes |
+| `/codex:brainstorm [topic]` | Explore approaches from two AI perspectives |
+| `/codex:collab [problem]` | CC shares its analysis, Codex provides targeted suggestions |
 
 ### Examples
 
 ```
-/claudex:plan Add rate limiting to all API endpoints
+/codex:plan Add rate limiting to all API endpoints
 
-/claudex:brainstorm How should we handle caching for the dashboard?
+/codex:brainstorm How should we handle caching for the dashboard?
 
-/claudex:collab I'm getting a race condition in the worker queue
+/codex:collab I'm getting a race condition in the worker queue
 ```
 
 ## MCP Tools Reference
 
 | Tool | Purpose | Quota Cost |
 |------|---------|------------|
-| `claudex_plan` | Codex makes its OWN plan, CC compares with its plan | 1 message |
-| `claudex_review` | Codex critiques a specific plan you provide | 1 message |
-| `claudex_brainstorm` | Open-ended exploration of a problem | 1 message |
-| `claudex_collab` | Targeted collaboration — CC sends analysis, gets suggestions | 1 message |
-| `claudex_review_files` | Targeted code review of specific files | 1 message |
-| `claudex_ping` | Test that Codex is installed and working | 1 message |
+| `codex_plan` | Codex makes its OWN plan, CC compares with its plan | 1 message |
+| `codex_review` | Codex critiques a specific plan you provide | 1 message |
+| `codex_brainstorm` | Open-ended exploration of a problem | 1 message |
+| `codex_collab` | Targeted collaboration — CC sends analysis, gets suggestions | 1 message |
+| `codex_review_files` | Targeted code review of specific files | 1 message |
+| `codex_ping` | Test that Codex is installed and working | 1 message |
 
 ## Collaboration Modes
 
-The `claudex_collab` tool supports these request types:
+The `codex_collab` tool supports these request types:
 
 | Type | Use When |
 |------|----------|
@@ -180,9 +180,9 @@ Claudex/
 ├── server/
 │   └── server.py            # Python MCP server (runs via uv)
 ├── commands/
-│   ├── plan.md              # /claudex:plan
-│   ├── brainstorm.md        # /claudex:brainstorm
-│   └── collab.md            # /claudex:collab
+│   ├── plan.md              # /codex:plan
+│   ├── brainstorm.md        # /codex:brainstorm
+│   └── collab.md            # /codex:collab
 ├── skills/
 │   └── claudex/
 │       └── SKILL.md         # Auto-triggers during plan mode

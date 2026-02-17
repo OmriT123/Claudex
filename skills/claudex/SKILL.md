@@ -1,9 +1,9 @@
 ---
-name: claudex
+name: codex
 description: "Use when entering plan mode for non-trivial tasks, when making architecture decisions, when debugging complex issues, when the user asks for a second opinion, when you need to verify correctness, or when collaborating with Codex. Auto-triggers during plan mode for complex implementations."
 ---
 
-# Claudex — Claude Code Skill
+# Codex — Claude Code Skill
 
 ## Purpose
 
@@ -37,37 +37,37 @@ Use this skill to consult **OpenAI Codex as a specialist teammate** during plann
 What's your situation?
 │
 ├─ "I have a task, no plan yet"
-│   ├─ Want independent plans to compare → claudex_plan
-│   └─ Want to explore options broadly   → claudex_brainstorm
+│   ├─ Want independent plans to compare → codex_plan
+│   └─ Want to explore options broadly   → codex_brainstorm
 │
 ├─ "I have a plan already"
-│   └─ Want it stress-tested/critiqued   → claudex_review
+│   └─ Want it stress-tested/critiqued   → codex_review
 │
 ├─ "I have a specific problem"
-│   ├─ Need feature ideas               → claudex_collab (feature_suggestion)
-│   ├─ Need debugging help              → claudex_collab (bug_approach)
-│   ├─ Want my code critiqued           → claudex_collab (code_critique)
-│   ├─ Want assumptions challenged      → claudex_collab (red_team)
-│   ├─ Want correctness verified        → claudex_collab (verification)
-│   └─ Want testing guidance            → claudex_collab (testing_strategy)
+│   ├─ Need feature ideas               → codex_collab (feature_suggestion)
+│   ├─ Need debugging help              → codex_collab (bug_approach)
+│   ├─ Want my code critiqued           → codex_collab (code_critique)
+│   ├─ Want assumptions challenged      → codex_collab (red_team)
+│   ├─ Want correctness verified        → codex_collab (verification)
+│   └─ Want testing guidance            → codex_collab (testing_strategy)
 │
 ├─ "I want specific files reviewed"
-│   └─ Targeted code review             → claudex_review_files
+│   └─ Targeted code review             → codex_review_files
 │
 └─ "Is Codex even working?"
-    └─ Connection test                   → claudex_ping
+    └─ Connection test                   → codex_ping
 ```
 
 ## Available Tools
 
 | Tool | When | What It Does |
 |------|------|-------------|
-| `claudex_plan` | **You have a task, want both plans** | Codex generates its OWN independent plan. You compare and synthesize. |
-| `claudex_review` | **You have YOUR plan, want it critiqued** | Codex reviews and stress-tests your specific approach. |
-| `claudex_brainstorm` | **No plan yet, exploring options** | Open-ended exploration of the problem space. |
-| `claudex_collab` | **You need help solving a specific problem** | Send your analysis + a request type, get targeted suggestions back. |
-| `claudex_review_files` | **Want specific files reviewed** | Targeted code review from a different angle. |
-| `claudex_ping` | **Setup/debug** | Verify Codex CLI is installed and working. |
+| `codex_plan` | **You have a task, want both plans** | Codex generates its OWN independent plan. You compare and synthesize. |
+| `codex_review` | **You have YOUR plan, want it critiqued** | Codex reviews and stress-tests your specific approach. |
+| `codex_brainstorm` | **No plan yet, exploring options** | Open-ended exploration of the problem space. |
+| `codex_collab` | **You need help solving a specific problem** | Send your analysis + a request type, get targeted suggestions back. |
+| `codex_review_files` | **Want specific files reviewed** | Targeted code review from a different angle. |
+| `codex_ping` | **Setup/debug** | Verify Codex CLI is installed and working. |
 
 ## Workflow 1: Divergent — Parallel Planning & Brainstorming
 
@@ -77,7 +77,7 @@ to Codex without interpretation, so both models think independently.
 
 ```
 1. User describes a task/feature
-2. **Immediately** call `claudex_plan` or `claudex_brainstorm` with:
+2. **Immediately** call `codex_plan` or `codex_brainstorm` with:
    - user_prompt: The user's EXACT words (verbatim, do NOT rephrase)
    - task/topic: Factual grounding only — tech stack, relevant files, constraints
    - Do NOT include your interpretation of HOW to solve it
@@ -103,7 +103,7 @@ then Codex reviews the polished output (fine filter).
 1. Complete your implementation or plan
 2. **Self-review first**: Check for obvious issues, edge cases, style
 3. Fix anything you find — send Codex a clean version
-4. Call `claudex_review` or `claudex_review_files` with the polished output
+4. Call `codex_review` or `codex_review_files` with the polished output
 5. Evaluate Codex's critique:
    - Adopt suggestions that are genuinely better
    - Defer suggestions that are style preferences
@@ -122,12 +122,12 @@ Claude stays the arbitrator — decides which hypotheses to test.
 
 ```
 1. Analyze the problem yourself first
-2. Call `claudex_collab` with:
+2. Call `codex_collab` with:
    - problem: What you're trying to solve
    - cc_analysis: Your findings and current thinking
    - request_type: bug_approach, red_team, verification, etc.
 3. Evaluate Codex's response. Test its suggestions.
-4. **If you need another round**, call `claudex_collab` again with:
+4. **If you need another round**, call `codex_collab` again with:
    - problem: Updated with new findings
    - cc_analysis: Include what Codex suggested + what you tried + results
    - This creates a shared understanding across rounds
@@ -135,9 +135,9 @@ Claude stays the arbitrator — decides which hypotheses to test.
 ```
 
 **When to use which workflow:**
-- **Divergent** (`claudex_plan`, `claudex_brainstorm`): Starting fresh, want independent thinking
-- **Convergent** (`claudex_review`, `claudex_review_files`): Have a plan/code, want it stress-tested
-- **Iterative** (`claudex_collab`): Solving a specific problem, may need multiple rounds
+- **Divergent** (`codex_plan`, `codex_brainstorm`): Starting fresh, want independent thinking
+- **Convergent** (`codex_review`, `codex_review_files`): Have a plan/code, want it stress-tested
+- **Iterative** (`codex_collab`): Solving a specific problem, may need multiple rounds
 
 ## Reading Codex Artifacts
 
@@ -203,7 +203,7 @@ User: "Add a webhook system to our Express API so clients can subscribe
 
 YOU (internal):
   1. **Immediately** dispatch to Codex with the raw user prompt:
-     Call claudex_plan(
+     Call codex_plan(
        user_prompt="Add a webhook system to our Express API so clients can
                     subscribe to events like order.created, order.shipped, etc.",
        task="Express.js API on PostgreSQL, deployed on Railway, ~50 concurrent
