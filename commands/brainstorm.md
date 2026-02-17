@@ -13,8 +13,9 @@ allowed-tools: Read, Glob, Grep
 
 1. **Understand the problem**: Read relevant code to build context
 2. **Call `claudex_brainstorm`** with:
-   - topic: The topic above
-   - context: Your understanding of constraints and requirements
+   - user_prompt: The user's exact words (copy "$ARGUMENTS" verbatim — do NOT rephrase)
+   - topic: Your understanding of the core question (factual grounding only)
+   - context: Technical constraints and relevant files
    - project_dir: The current project root
 3. **Synthesize**: Combine Codex's ideas with your own thinking
 4. **Present 2-3 approaches** with trade-offs, marking which ideas came from which source

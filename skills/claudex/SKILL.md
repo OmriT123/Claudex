@@ -69,86 +69,75 @@ What's your situation?
 | `claudex_review_files` | **Want specific files reviewed** | Targeted code review from a different angle. |
 | `claudex_ping` | **Setup/debug** | Verify Codex CLI is installed and working. |
 
-## Workflow 1: Parallel Planning (Recommended for Complex Tasks)
+## Workflow 1: Divergent — Parallel Planning & Brainstorming
 
-This is the most powerful workflow. Both you and Codex independently plan for the same task, then you merge the best of both.
+Use when the user describes a task/feature and you need independent perspectives.
+The key principle is **Immediate Verbatim Dispatch**: send the raw user prompt
+to Codex without interpretation, so both models think independently.
 
 ```
 1. User describes a task/feature
-2. You formulate YOUR plan as you normally would (don't present it yet)
-3. Call `claudex_plan` with:
-   - task: The same task description (WHAT, not HOW)
-   - constraints: Tech stack, deadlines, backward compatibility requirements
-   - focus_files: Key files/dirs involved
-   - project_dir: The project root
-4. Now you have TWO independent plans. Compare them:
-   - Where do they agree? (high confidence — both architectures converge)
-   - Where do they differ? (interesting — examine why)
-   - What did Codex think of that you didn't? (potential blind spots)
-   - What did you think of that Codex didn't? (your contextual advantage)
-5. Synthesize into ONE plan, clearly showing:
+2. **Immediately** call `claudex_plan` or `claudex_brainstorm` with:
+   - user_prompt: The user's EXACT words (verbatim, do NOT rephrase)
+   - task/topic: Factual grounding only — tech stack, relevant files, constraints
+   - Do NOT include your interpretation of HOW to solve it
+3. **While waiting**, formulate YOUR plan/ideas independently
+4. Compare the two perspectives:
+   - Agreement → High confidence (independent convergence)
+   - Disagreement → Examine why, adopt what's stronger
+   - Codex found something you missed → Investigate (potential blind spot)
+   - You found something Codex missed → Keep (you have conversation context)
+5. Synthesize with clear attribution:
    "Both CC and Codex agree on X.
-    Codex suggested Y for [this part] — adopting because [reason].
-    I'm keeping my approach for Z because [reason]."
+    Codex suggested Y — adopting because [reason].
+    Keeping my approach for Z because [reason]."
 ```
 
-## Workflow 2: Second Opinion (For Plans Already Formed)
+## Workflow 2: Convergent — Review & Verification
 
-Use when you already have a specific approach and want it stress-tested.
+Use when you have code or a plan that needs quality assurance.
+The key principle is the **Double Strainer**: you self-review first (coarse filter),
+then Codex reviews the polished output (fine filter).
 
 ```
-1. You've formed a plan during planning
-2. Call `claudex_review` with your detailed plan
-3. Evaluate Codex's critique:
+1. Complete your implementation or plan
+2. **Self-review first**: Check for obvious issues, edge cases, style
+3. Fix anything you find — send Codex a clean version
+4. Call `claudex_review` or `claudex_review_files` with the polished output
+5. Evaluate Codex's critique:
    - Adopt suggestions that are genuinely better
-   - Defer suggestions that are style preferences, not improvements
-4. Present with attribution:
-   "My plan is X. Codex flagged [risk] and suggested [alternative].
-    I'm [adopting/deferring] because [reason]."
+   - Defer suggestions that are style preferences
+   - Investigate anything Codex found that you missed in self-review
+6. Present with attribution:
+   "My plan is X. After self-review, I fixed [Y].
+    Codex additionally flagged [risk] and suggested [alternative].
+    Adopting/deferring because [reason]."
 ```
 
-## Workflow 3: Brainstorming (Exploration Phase)
+## Workflow 3: Iterative — Debugging & Problem-Solving
 
-Use when the user describes a problem without a clear direction.
-
-```
-1. Call `claudex_brainstorm` with the topic and constraints
-2. Review alongside your own thinking
-3. Present a synthesized set of options with trade-offs
-```
-
-## Workflow 4: Collaboration (Interactive Problem-Solving)
-
-Use when you need targeted help from Codex on a specific problem. Unlike the other workflows which are one-shot consultations, this is designed for you to share your analysis and get focused suggestions back.
+Use when debugging tricky issues or solving complex problems.
+The key principle is **Accumulated Context**: each round builds on previous findings.
+Claude stays the arbitrator — decides which hypotheses to test.
 
 ```
-1. Analyze the problem yourself first — form your own understanding
-2. Determine what you need from Codex:
-   - feature_suggestion: You need feature ideas or implementation approaches
-   - bug_approach: You need help debugging or identifying root causes
-   - code_critique: You want Codex to review your proposed solution
-   - red_team: You want Codex to challenge every assumption and find weaknesses
-   - verification: You want Codex to independently verify correctness
-   - testing_strategy: You want Codex to suggest what and how to test
-   - general: Open-ended analysis and suggestions
-3. Call `claudex_collab` with:
+1. Analyze the problem yourself first
+2. Call `claudex_collab` with:
    - problem: What you're trying to solve
-   - cc_analysis: Your findings and current thinking (be honest about uncertainties)
-   - request_type: The type from above
-   - files_involved: Key files related to this problem
-   - project_dir: The project root
-4. Evaluate Codex's response:
-   - Did it find something you missed? Investigate the specific files/lines
-   - Does it disagree? Compare evidence, adopt what's stronger
-   - Did it suggest next steps? Evaluate feasibility and priority
-5. Present a unified analysis with clear attribution
+   - cc_analysis: Your findings and current thinking
+   - request_type: bug_approach, red_team, verification, etc.
+3. Evaluate Codex's response. Test its suggestions.
+4. **If you need another round**, call `claudex_collab` again with:
+   - problem: Updated with new findings
+   - cc_analysis: Include what Codex suggested + what you tried + results
+   - This creates a shared understanding across rounds
+5. Present unified analysis with clear attribution
 ```
 
-**When to use `/claudex:collab` vs other tools:**
-- Use `collab` when you already have partial analysis and need a second brain
-- Use `claudex_plan` when starting fresh and want independent plans
-- Use `claudex_review` when your plan is complete and needs stress-testing
-- Use `claudex_brainstorm` when exploring open-ended problems without direction
+**When to use which workflow:**
+- **Divergent** (`claudex_plan`, `claudex_brainstorm`): Starting fresh, want independent thinking
+- **Convergent** (`claudex_review`, `claudex_review_files`): Have a plan/code, want it stress-tested
+- **Iterative** (`claudex_collab`): Solving a specific problem, may need multiple rounds
 
 ## Reading Codex Artifacts
 
@@ -213,15 +202,17 @@ User: "Add a webhook system to our Express API so clients can subscribe
        to events like order.created, order.shipped, etc."
 
 YOU (internal):
-  1. Form your plan: event registry, webhook model, async dispatch queue...
-  2. Call claudex_plan(
-       task="Add a webhook system where API clients can subscribe to events
-             (order.created, order.shipped, etc.) and receive HTTP POST
-             notifications with retry logic",
+  1. **Immediately** dispatch to Codex with the raw user prompt:
+     Call claudex_plan(
+       user_prompt="Add a webhook system to our Express API so clients can
+                    subscribe to events like order.created, order.shipped, etc.",
+       task="Express.js API on PostgreSQL, deployed on Railway, ~50 concurrent
+             users. Relevant dirs: src/routes/, src/models/, src/services/",
        constraints="Express.js, PostgreSQL, deployed on Railway, ~50 concurrent users",
        focus_files="src/routes/,src/models/,src/services/",
        project_dir="/home/user/my-api"
      )
+  2. **While waiting**, form YOUR plan: event registry, webhook model, async dispatch queue...
   3. Compare plans → Codex suggested using pg LISTEN/NOTIFY for event
      dispatch instead of your polling approach. Good catch.
   4. Merge: adopt pg LISTEN/NOTIFY, keep your retry logic design.

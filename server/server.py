@@ -140,6 +140,11 @@ Read the relevant files in the codebase first, then produce a plan with:
 
 Be concrete — reference actual files, existing patterns, and real constraints \
 from this codebase. No vague hand-waving.
+
+If an "Original User Request" section is provided, treat it as the primary input. \
+Form your OWN interpretation of what needs to be done — do not assume the "Task Context" \
+section below it is the correct or only framing. The task context provides useful \
+grounding (constraints, relevant files) but may reflect another engineer's interpretation.
 """ + ARTIFACT_INSTRUCTIONS
 
 BRAINSTORM_SYSTEM = """\
@@ -149,6 +154,11 @@ trade-offs, and think about what the ideal solution looks like if there were no 
 constraints, then work backward to what's practical.
 
 Be concrete. Reference actual files and patterns in the codebase when relevant.
+
+If an "Original User Request" section is provided, treat it as the primary input. \
+Form your OWN interpretation of the problem — do not assume the "Topic" section \
+below it is the correct or only framing. The topic provides useful grounding \
+but may reflect another engineer's interpretation. Think independently.
 """ + ARTIFACT_INSTRUCTIONS
 
 COLLABORATE_SYSTEM = """\
@@ -459,6 +469,14 @@ class ParallelPlanInput(BaseModel):
         ),
         min_length=10,
     )
+    user_prompt: Optional[str] = Field(
+        default=None,
+        description=(
+            "The user's original request, verbatim. Pass this EXACTLY as the user "
+            "typed it — do not rephrase, interpret, or add your own framing. "
+            "This ensures Codex forms its own independent understanding."
+        ),
+    )
     constraints: Optional[str] = Field(
         default=None,
         description=(
@@ -498,6 +516,14 @@ class BrainstormInput(BaseModel):
             "what you're trying to solve."
         ),
         min_length=10,
+    )
+    user_prompt: Optional[str] = Field(
+        default=None,
+        description=(
+            "The user's original request, verbatim. Pass this EXACTLY as the user "
+            "typed it — do not rephrase, interpret, or add your own framing. "
+            "This ensures Codex forms its own independent understanding."
+        ),
     )
     context: Optional[str] = Field(
         default=None,
@@ -788,7 +814,17 @@ async def claudex_plan(params: ParallelPlanInput) -> str:
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     Read them when referenced in the output.
     """
-    parts = [PARALLEL_PLAN_SYSTEM, "\n---\n", f"## Task\n{params.task}"]
+    parts = [PARALLEL_PLAN_SYSTEM, "\n---\n"]
+
+    if params.user_prompt:
+        parts.append(
+            "## Original User Request (verbatim — form your own interpretation)\n"
+            "```\n"
+            f"{params.user_prompt}\n"
+            "```\n"
+        )
+
+    parts.append(f"## Task Context\n{params.task}")
 
     if params.constraints:
         parts.append(f"\n## Constraints\n{params.constraints}")
@@ -834,7 +870,17 @@ async def claudex_brainstorm(params: BrainstormInput) -> str:
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     Read them when referenced in the output.
     """
-    parts = [BRAINSTORM_SYSTEM, "\n---\n", f"## Topic\n{params.topic}"]
+    parts = [BRAINSTORM_SYSTEM, "\n---\n"]
+
+    if params.user_prompt:
+        parts.append(
+            "## Original User Request (verbatim — form your own interpretation)\n"
+            "```\n"
+            f"{params.user_prompt}\n"
+            "```\n"
+        )
+
+    parts.append(f"## Topic\n{params.topic}")
 
     if params.context:
         parts.append(f"\n## Context & Constraints\n{params.context}")

@@ -14,10 +14,11 @@ allowed-tools: Read, Glob, Grep
 1. **Understand the task**: Read relevant files to understand the codebase context
 2. **Form YOUR plan first**: Think through the implementation approach independently — do NOT present it yet
 3. **Call `claudex_plan`** with:
-   - task: The task description above
+   - user_prompt: The user's exact words (copy "$ARGUMENTS" verbatim — do NOT rephrase)
+   - task: Factual context only — tech stack, relevant files, constraints you identified
    - project_dir: The current project root
    - focus_files: Key files relevant to this task
-   - constraints: Any constraints you've identified
+   - constraints: Hard constraints you've identified from the codebase
 4. **Compare both plans**:
    - Where you AGREE → High confidence (independent convergence)
    - Where you DIFFER → Examine why — adopt what's stronger, defer what's weaker

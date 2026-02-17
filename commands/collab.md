@@ -34,3 +34,7 @@ allowed-tools: Read, Glob, Grep
    - Your findings + Codex's findings, clearly attributed
    - Where you agree and where you differ
    - Recommended next steps with rationale
+6. **Iterate if needed**: If Codex's suggestions lead to new findings:
+   - Call `claudex_collab` again with accumulated context
+   - Include: previous Codex suggestions + what you tried + results
+   - This builds a shared understanding across rounds
