@@ -38,6 +38,8 @@ from server import (
     _get_truncated_session,
     _build_collaborate_system,
     _auto_session_id,
+    _check_codex_version,
+    _version_cache,
     RequestType,
     COLLAB_PERSONAS,
     MAX_SESSION_ROUNDS,
@@ -266,6 +268,80 @@ class TestAutoSessionId:
         parts = result.rsplit("-", 1)
         slug = parts[0]
         assert len(slug) <= 50
+
+
+# =========================================================================
+# _check_codex_version (consume / display-once semantics)
+# =========================================================================
+
+
+def _reset_version_cache(warning: str = "", resolved: bool = True):
+    """Reset _version_cache to a known state for testing."""
+    _version_cache["warning"] = warning
+    _version_cache["resolved"] = resolved
+    _version_cache["consumed"] = False
+    _version_cache["lock"] = None
+
+
+FAKE_WARNING = (
+    "\u26a0 Codex CLI v0.99.0 is outdated (latest: v1.0.0).\n"
+    "  Run: npm i -g @openai/codex\n"
+)
+
+
+class TestCheckCodexVersion:
+    """Version check consume semantics — warning shown once in tool output."""
+
+    @pytest.mark.asyncio
+    async def test_consume_returns_warning_once(self):
+        """consume=True returns warning on first call, empty on second."""
+        _reset_version_cache(warning=FAKE_WARNING)
+        first = await _check_codex_version(consume=True)
+        assert first == FAKE_WARNING
+        second = await _check_codex_version(consume=True)
+        assert second == ""
+
+    @pytest.mark.asyncio
+    async def test_no_consume_always_returns_warning(self):
+        """consume=False (default) always returns the cached warning."""
+        _reset_version_cache(warning=FAKE_WARNING)
+        first = await _check_codex_version(consume=False)
+        assert first == FAKE_WARNING
+        second = await _check_codex_version(consume=False)
+        assert second == FAKE_WARNING
+
+    @pytest.mark.asyncio
+    async def test_status_sees_warning_after_consume(self):
+        """codex_status (consume=False) still sees warning after _run_codex consumed it."""
+        _reset_version_cache(warning=FAKE_WARNING)
+        # _run_codex path consumes
+        consumed = await _check_codex_version(consume=True)
+        assert consumed == FAKE_WARNING
+        # codex_status path — should still see it
+        status = await _check_codex_version(consume=False)
+        assert status == FAKE_WARNING
+
+    @pytest.mark.asyncio
+    async def test_no_warning_returns_empty(self):
+        """When CLI is up to date, both paths return empty."""
+        _reset_version_cache(warning="")
+        assert await _check_codex_version(consume=True) == ""
+        assert await _check_codex_version(consume=False) == ""
+
+    @pytest.mark.asyncio
+    async def test_unresolved_retries_on_failure(self, monkeypatch):
+        """When the check fails (e.g. timeout), resolved stays False so next call retries."""
+        import server as server_mod
+        _reset_version_cache(warning="", resolved=False)
+
+        def _fake_find_codex_bin():
+            raise FileNotFoundError("no codex")
+
+        monkeypatch.setattr(server_mod, "_find_codex_bin", _fake_find_codex_bin)
+        result = await _check_codex_version(consume=False)
+        assert result == ""
+        # Failed check should NOT set resolved — allows retry
+        assert _version_cache["resolved"] is False
 
 
 # =========================================================================

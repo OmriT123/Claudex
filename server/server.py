@@ -1077,62 +1077,92 @@ class RecapInput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Version check (runs once per server lifetime)
+# Version check (runs once per server lifetime, warning displayed once)
 # ---------------------------------------------------------------------------
 
-_version_cache: dict = {"checked": False, "warning": ""}
+_version_cache: dict = {"warning": "", "resolved": False, "consumed": False,
+                        "lock": None}
 
 
-async def _check_codex_version() -> str:
+async def _check_codex_version(*, consume: bool = False) -> str:
     """Check if Codex CLI is up to date. Returns warning string or empty.
 
-    Runs once per server lifetime — subsequent calls return cached result.
+    The npm lookup runs at most once per server lifetime. Results are cached.
+
+    Args:
+        consume: If True, the warning is returned on the first call only —
+                 subsequent consume=True calls return empty. Used by _run_codex
+                 so the warning appears on the first tool response only.
+                 If False (default), always returns the cached warning. Used by
+                 codex_status so diagnostics always reflect outdated status.
     """
-    if _version_cache["checked"]:
-        return _version_cache["warning"]
-    _version_cache["checked"] = True
+    # Lazy-init lock (no event loop at module load time)
+    if _version_cache["lock"] is None:
+        _version_cache["lock"] = asyncio.Lock()
 
-    try:
-        codex_bin = _find_codex_bin()
+    async with _version_cache["lock"]:
+        if not _version_cache["resolved"]:
+            # First call (or retry after previous failure) — run the check
+            try:
+                codex_bin = _find_codex_bin()
 
-        # Get installed version
-        proc = await asyncio.create_subprocess_exec(
-            codex_bin, "--version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
-        if proc.returncode != 0:
-            return ""
-        installed = stdout.decode().strip()  # e.g. "codex-cli 0.101.0"
-        installed_ver = installed.split()[-1] if installed else ""
-
-        # Get latest version from npm registry
-        proc = await asyncio.create_subprocess_exec(
-            "npm", "view", "@openai/codex", "version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode != 0:
-            return ""
-        latest_ver = stdout.decode().strip()
-
-        if installed_ver and latest_ver and installed_ver != latest_ver:
-            inst_parts = tuple(int(x) for x in installed_ver.split('.'))
-            lat_parts = tuple(int(x) for x in latest_ver.split('.'))
-            if inst_parts < lat_parts:
-                warning = (
-                    f"\u26a0 Codex CLI v{installed_ver} is outdated "
-                    f"(latest: v{latest_ver}).\n"
-                    f"  Run: npm i -g @openai/codex\n"
+                # Get installed version
+                proc = await asyncio.create_subprocess_exec(
+                    codex_bin, "--version",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-                _version_cache["warning"] = warning
-                return warning
+                stdout, _ = await asyncio.wait_for(
+                    proc.communicate(), timeout=3,
+                )
+                if proc.returncode != 0:
+                    return ""
+                installed = stdout.decode().strip()
+                installed_ver = installed.split()[-1] if installed else ""
 
-        return ""
-    except (asyncio.TimeoutError, OSError, FileNotFoundError, ValueError):
-        return ""
+                # Get latest version from npm registry
+                proc = await asyncio.create_subprocess_exec(
+                    "npm", "view", "@openai/codex", "version",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(
+                    proc.communicate(), timeout=5,
+                )
+                if proc.returncode != 0:
+                    return ""
+                latest_ver = stdout.decode().strip()
+
+                if installed_ver and latest_ver and installed_ver != latest_ver:
+                    inst_parts = tuple(
+                        int(x) for x in installed_ver.split('.')
+                    )
+                    lat_parts = tuple(
+                        int(x) for x in latest_ver.split('.')
+                    )
+                    if inst_parts < lat_parts:
+                        _version_cache["warning"] = (
+                            f"\u26a0 Codex CLI v{installed_ver} is outdated "
+                            f"(latest: v{latest_ver}).\n"
+                            f"  Run: npm i -g @openai/codex\n"
+                        )
+
+                # Mark resolved only on success — failures will retry
+                _version_cache["resolved"] = True
+
+            except (asyncio.TimeoutError, OSError, FileNotFoundError,
+                    ValueError):
+                # Don't set resolved — next call will retry
+                return ""
+
+        # Return logic: consume=True returns warning once, then empty
+        if consume:
+            if _version_cache["consumed"]:
+                return ""
+            _version_cache["consumed"] = True
+            return _version_cache["warning"]
+
+        return _version_cache["warning"]
 
 
 class StatusInput(BaseModel):
@@ -1284,7 +1314,7 @@ async def _run_codex(
     cleaned_output += f"\n\n---\n_Codex: {model}, {reasoning_effort}, {elapsed:.0f}s_"
 
     # Version check — prepend warning on first invocation only
-    version_warning = await _check_codex_version()
+    version_warning = await _check_codex_version(consume=True)
     if version_warning:
         cleaned_output = version_warning + "\n" + cleaned_output
 
