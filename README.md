@@ -98,6 +98,7 @@ claude --plugin-dir /path/to/Claudex
 | `/codex:plan [task]` | CC and Codex independently plan the same task, then CC synthesizes |
 | `/codex:brainstorm [topic]` | Explore approaches from two AI perspectives |
 | `/codex:collab [problem]` | CC shares its analysis, Codex provides targeted suggestions |
+| `/codex:status` | Show Claudex diagnostics (zero Codex cost) |
 
 ### Examples
 
@@ -120,6 +121,7 @@ claude --plugin-dir /path/to/Claudex
 | `codex_review_files` | Targeted code review of specific files | Senior Code Reviewer |
 | `codex_evaluate` | Analyze tradeoffs between options — user decides | Technical Advisor |
 | `codex_recap` | Generate decision record from a session | Technical Writer |
+| `codex_status` | Show Claudex diagnostics (no Codex call, zero cost) | — |
 | `codex_ping` | Test that Codex is installed and working | — |
 
 ## Collaboration Modes
@@ -159,7 +161,7 @@ Tested Codex's hypothesis — confirmed partial match...
 ...
 ```
 
-CC manages the document. The server writes Codex's responses. Each `codex_collab` call with the same `session_id` appends to the existing session. After 4 rounds or resolution, use `codex_recap` to generate a formal decision record.
+CC manages the document. The server writes Codex's responses. Each `codex_collab` call with the same `session_id` appends to the existing session. Pass `session_id="auto"` to auto-generate a descriptive ID from the problem statement. After 4 rounds or resolution, use `codex_recap` to generate a formal decision record.
 
 ## Decision Support with `codex_evaluate`
 
@@ -203,11 +205,12 @@ echo '.claudex' >> .gitignore
 
 ## Defaults
 
-- **Model**: `gpt-5.3-codex`
-- **Reasoning effort**: `high` (use `xhigh` for maximum depth)
+- **Model**: `gpt-5.3-codex` (hardcoded)
+- **Reasoning effort**: `high` (override per-call: `medium`, `high`, `xhigh`)
 - **Reasoning summary**: `detailed` — includes Codex's chain-of-thought
 - **Sandbox**: `read-only` — Codex reads your repo but never modifies it
 - **Timeout**: 600s (10 min)
+- **Version check**: Auto-checks for Codex CLI updates on first invocation
 
 ## Rate Limits
 
@@ -229,13 +232,15 @@ Claudex/
 ├── commands/
 │   ├── plan.md              # /codex:plan
 │   ├── brainstorm.md        # /codex:brainstorm
-│   └── collab.md            # /codex:collab
+│   ├── collab.md            # /codex:collab
+│   └── status.md            # /codex:status
 ├── skills/
 │   └── codex/
 │       └── SKILL.md         # Auto-triggers during plan mode
 ├── .claudex/                  # Scratchpad (gitignored)
 │   ├── run-<uuid>/          # Per-run artifact directories
-│   └── sessions/            # Iterative session documents
+│   ├── sessions/            # Iterative session documents
+│   └── recaps/              # Decision records from codex_recap
 ├── install.sh               # One-liner installer
 ├── docs/
 │   └── initial-plan.md      # Original design document

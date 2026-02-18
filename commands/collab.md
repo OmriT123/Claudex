@@ -24,6 +24,8 @@ allowed-tools: Read, Glob, Grep
    - problem: The problem description above
    - cc_analysis: Your own findings and current thinking (be honest about what you're unsure of)
    - request_type: The type from step 2
+   - user_prompt: The user's exact words (copy "$ARGUMENTS" verbatim — do NOT rephrase)
+   - session_id: A short descriptive slug for this problem (e.g. "fix-race-condition") — enables multi-round shared memory
    - files_involved: Key files related to this problem
    - project_dir: The current project root
 4. **Evaluate Codex's response**:
@@ -35,6 +37,7 @@ allowed-tools: Read, Glob, Grep
    - Where you agree and where you differ
    - Recommended next steps with rationale
 6. **Iterate if needed**: If Codex's suggestions lead to new findings:
-   - Call `codex_collab` again with accumulated context
+   - Call `codex_collab` again with the same `session_id` (accumulates context)
    - Include: previous Codex suggestions + what you tried + results
    - This builds a shared understanding across rounds
+   - Sessions terminate after **4 rounds** — use `codex_recap` to generate a summary

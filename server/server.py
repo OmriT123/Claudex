@@ -123,15 +123,6 @@ Rules:
 # ---------------------------------------------------------------------------
 
 
-class CodexModel(str, Enum):
-    """Supported Codex models (current only, retired models removed)."""
-    GPT5_3_CODEX = "gpt-5.3-codex"       # Best. Default.
-    GPT5_2_CODEX = "gpt-5.2-codex"       # Previous flagship
-    GPT5_1_CODEX = "gpt-5.1-codex"       # Long-horizon tasks
-    GPT5_CODEX = "gpt-5-codex"           # Original Codex variant
-    GPT5_CODEX_MINI = "gpt-5-codex-mini" # Cost-effective
-
-
 class ReasoningEffort(str, Enum):
     """Codex reasoning effort levels."""
     LOW = "low"
@@ -648,6 +639,16 @@ def _extract_and_save_artifacts(
 # --- Session management ---
 
 
+def _auto_session_id(problem: str) -> str:
+    """Generate a descriptive session ID from the problem statement.
+
+    Slugifies the first 50 chars + appends a short UUID suffix for uniqueness.
+    """
+    slug = re.sub(r'[^a-zA-Z0-9]+', '-', problem[:50]).strip('-').lower()
+    suffix = uuid.uuid4().hex[:6]
+    return f"{slug}-{suffix}" if slug else f"session-{suffix}"
+
+
 def _init_session(session_path: Path, session_id: str) -> None:
     """Create a new session document with structured header."""
     session_path.parent.mkdir(parents=True, exist_ok=True)
@@ -841,10 +842,6 @@ class SecondOpinionInput(BaseModel):
             "directory. Codex reads the repo from this location."
         ),
     )
-    model: CodexModel = Field(
-        default=CodexModel.GPT5_3_CODEX,
-        description="Codex model to use. gpt-5.3-codex is best for deep architectural analysis.",
-    )
     reasoning_effort: ReasoningEffort = Field(
         default=ReasoningEffort.HIGH,
         description="How deeply Codex should reason. Use 'xhigh' for maximum depth (slower).",
@@ -889,10 +886,6 @@ class ParallelPlanInput(BaseModel):
         default=None,
         description="Absolute path to the project directory. Defaults to cwd.",
     )
-    model: CodexModel = Field(
-        default=CodexModel.GPT5_3_CODEX,
-        description="Codex model to use. gpt-5.3-codex recommended for planning.",
-    )
     reasoning_effort: ReasoningEffort = Field(
         default=ReasoningEffort.HIGH,
         description="How deeply Codex should reason. Use 'xhigh' for maximum depth (slower).",
@@ -926,10 +919,6 @@ class BrainstormInput(BaseModel):
     project_dir: Optional[str] = Field(
         default=None,
         description="Absolute path to the project directory. Defaults to cwd.",
-    )
-    model: CodexModel = Field(
-        default=CodexModel.GPT5_3_CODEX,
-        description="Codex model to use.",
     )
     reasoning_effort: ReasoningEffort = Field(
         default=ReasoningEffort.HIGH,
@@ -969,7 +958,8 @@ class CollaborateInput(BaseModel):
         default=None,
         description=(
             "Session ID for iterative workflows. Creates/continues a session "
-            "document in .claudex/sessions/ for shared memory across rounds."
+            "document in .claudex/sessions/ for shared memory across rounds. "
+            "Pass 'auto' to auto-generate a descriptive ID from the problem."
         ),
     )
     files_involved: Optional[str] = Field(
@@ -979,10 +969,6 @@ class CollaborateInput(BaseModel):
     project_dir: Optional[str] = Field(
         default=None,
         description="Absolute path to the project directory. Defaults to cwd.",
-    )
-    model: CodexModel = Field(
-        default=CodexModel.GPT5_3_CODEX,
-        description="Codex model to use.",
     )
     reasoning_effort: ReasoningEffort = Field(
         default=ReasoningEffort.HIGH,
@@ -1019,10 +1005,6 @@ class QuickReviewInput(BaseModel):
     project_dir: Optional[str] = Field(
         default=None,
         description="Absolute path to the project directory. Defaults to cwd.",
-    )
-    model: CodexModel = Field(
-        default=CodexModel.GPT5_3_CODEX,
-        description="Codex model to use.",
     )
     reasoning_effort: ReasoningEffort = Field(
         default=ReasoningEffort.MEDIUM,
@@ -1065,10 +1047,6 @@ class EvaluateInput(BaseModel):
         default=None,
         description="Absolute path to the project directory. Defaults to cwd.",
     )
-    model: CodexModel = Field(
-        default=CodexModel.GPT5_3_CODEX,
-        description="Codex model to use.",
-    )
     reasoning_effort: ReasoningEffort = Field(
         default=ReasoningEffort.HIGH,
         description="How deeply Codex should reason.",
@@ -1092,13 +1070,78 @@ class RecapInput(BaseModel):
         default=None,
         description="Absolute path to the project directory. Defaults to cwd.",
     )
-    model: CodexModel = Field(
-        default=CodexModel.GPT5_3_CODEX,
-        description="Codex model to use.",
-    )
     reasoning_effort: ReasoningEffort = Field(
         default=ReasoningEffort.MEDIUM,
         description="Reasoning depth. 'medium' is usually fine for recaps.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Version check (runs once per server lifetime)
+# ---------------------------------------------------------------------------
+
+_version_cache: dict = {"checked": False, "warning": ""}
+
+
+async def _check_codex_version() -> str:
+    """Check if Codex CLI is up to date. Returns warning string or empty.
+
+    Runs once per server lifetime — subsequent calls return cached result.
+    """
+    if _version_cache["checked"]:
+        return _version_cache["warning"]
+    _version_cache["checked"] = True
+
+    try:
+        codex_bin = _find_codex_bin()
+
+        # Get installed version
+        proc = await asyncio.create_subprocess_exec(
+            codex_bin, "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+        if proc.returncode != 0:
+            return ""
+        installed = stdout.decode().strip()  # e.g. "codex-cli 0.101.0"
+        installed_ver = installed.split()[-1] if installed else ""
+
+        # Get latest version from npm registry
+        proc = await asyncio.create_subprocess_exec(
+            "npm", "view", "@openai/codex", "version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode != 0:
+            return ""
+        latest_ver = stdout.decode().strip()
+
+        if installed_ver and latest_ver and installed_ver != latest_ver:
+            inst_parts = tuple(int(x) for x in installed_ver.split('.'))
+            lat_parts = tuple(int(x) for x in latest_ver.split('.'))
+            if inst_parts < lat_parts:
+                warning = (
+                    f"\u26a0 Codex CLI v{installed_ver} is outdated "
+                    f"(latest: v{latest_ver}).\n"
+                    f"  Run: npm i -g @openai/codex\n"
+                )
+                _version_cache["warning"] = warning
+                return warning
+
+        return ""
+    except (asyncio.TimeoutError, OSError, FileNotFoundError, ValueError):
+        return ""
+
+
+class StatusInput(BaseModel):
+    """Input for codex_status — lightweight diagnostics (no Codex call)."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    project_dir: Optional[str] = Field(
+        default=None,
+        description="Absolute path to the project directory. Defaults to cwd.",
     )
 
 
@@ -1194,7 +1237,7 @@ async def _run_codex(
             return (
                 f"{ERROR_PREFIX}Codex rate limit reached. Your ChatGPT subscription has "
                 "per-window message limits (resets every ~5 hours). "
-                "Try a lighter model: gpt-5-codex-mini."
+                "Try again later or use lower reasoning_effort."
             )
         return f"{ERROR_PREFIX}Codex exited with code {proc.returncode}.\nStderr: {err_msg}"
 
@@ -1239,6 +1282,11 @@ async def _run_codex(
     # Append metadata footer AFTER artifact extraction (Enhancement D+G)
     elapsed = time.monotonic() - start_time
     cleaned_output += f"\n\n---\n_Codex: {model}, {reasoning_effort}, {elapsed:.0f}s_"
+
+    # Version check — prepend warning on first invocation only
+    version_warning = await _check_codex_version()
+    if version_warning:
+        cleaned_output = version_warning + "\n" + cleaned_output
 
     return cleaned_output
 
@@ -1308,7 +1356,7 @@ async def codex_review(params: SecondOpinionInput) -> str:
     return await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
-        model=params.model.value,
+
         reasoning_effort=params.reasoning_effort.value,
     )
 
@@ -1372,7 +1420,7 @@ async def codex_plan(params: ParallelPlanInput) -> str:
     return await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
-        model=params.model.value,
+
         reasoning_effort=params.reasoning_effort.value,
     )
 
@@ -1427,7 +1475,7 @@ async def codex_brainstorm(params: BrainstormInput) -> str:
     return await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
-        model=params.model.value,
+
         reasoning_effort=params.reasoning_effort.value,
     )
 
@@ -1466,6 +1514,12 @@ async def codex_collab(params: CollaborateInput) -> str:
     Read them when referenced in the output.
     """
     cwd = params.project_dir or os.getcwd()
+
+    # --- Auto-generate session ID if requested ---
+    session_was_auto = False
+    if params.session_id == "auto":
+        params.session_id = _auto_session_id(params.problem)
+        session_was_auto = True
 
     # --- Session management: check round cap ---
     session_path = None
@@ -1524,7 +1578,7 @@ async def codex_collab(params: CollaborateInput) -> str:
     result = await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
-        model=params.model.value,
+
         reasoning_effort=params.reasoning_effort.value,
     )
 
@@ -1539,11 +1593,14 @@ async def codex_collab(params: CollaborateInput) -> str:
                 session_result = session_result.rsplit("\n\n---\n_Codex:", 1)[0]
             rounds = _read_session_rounds(session_path) + 1
             _append_to_session(session_path, rounds, params.cc_analysis, session_result)
-            result += (
-                f"\n\nSession document updated: "
-                f".claudex/sessions/{session_path.name} "
+            session_line = (
+                f"\n\nSession: {params.session_id} "
                 f"(Round {rounds}/{MAX_SESSION_ROUNDS})"
             )
+            if session_was_auto:
+                session_line += " [auto-generated]"
+            session_line += f"\nDocument: .claudex/sessions/{session_path.name}"
+            result += session_line
         except (OSError, UnicodeDecodeError) as exc:
             logger.warning("Session update failed: %s", exc)
 
@@ -1603,7 +1660,7 @@ async def codex_review_files(params: QuickReviewInput) -> str:
     return await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
-        model=params.model.value,
+
         reasoning_effort=params.reasoning_effort.value,
     )
 
@@ -1662,7 +1719,7 @@ async def codex_evaluate(params: EvaluateInput) -> str:
     return await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
-        model=params.model.value,
+
         reasoning_effort=params.reasoning_effort.value,
     )
 
@@ -1714,7 +1771,7 @@ async def codex_recap(params: RecapInput) -> str:
     result = await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
-        model=params.model.value,
+
         reasoning_effort=params.reasoning_effort.value,
     )
 
@@ -1730,6 +1787,143 @@ async def codex_recap(params: RecapInput) -> str:
                 logger.warning("Recap save failed: %s", exc)
 
     return result
+
+
+@mcp.tool(
+    name="codex_status",
+    annotations={
+        "title": "Claudex Status Dashboard",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def codex_status(params: StatusInput) -> str:
+    """Show Claudex status: Codex CLI info, active sessions, recaps, artifacts, disk usage.
+
+    This is a lightweight diagnostic tool that does NOT call Codex (zero subscription cost).
+    Use it for situational awareness without consuming a ChatGPT message.
+    """
+    cwd = params.project_dir or os.getcwd()
+    lines = ["Claudex Status", "\u2550" * 14]
+
+    # --- Codex CLI ---
+    codex_bin = _find_codex_bin()
+    codex_version = "unknown"
+    codex_location = codex_bin
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            codex_bin, "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+        if proc.returncode == 0:
+            codex_version = stdout.decode().strip() or "unknown"
+    except (asyncio.TimeoutError, OSError):
+        codex_version = "not found"
+        codex_location = "not found"
+
+    # Check for updates
+    version_warning = await _check_codex_version()
+    if version_warning:
+        lines.append(f"Codex CLI:     {codex_location} ({codex_version}) — OUTDATED")
+        lines.append(version_warning.strip())
+    else:
+        lines.append(f"Codex CLI:     {codex_location} ({codex_version})")
+    lines.append(f"Default Model: {DEFAULT_MODEL}")
+    lines.append(f"Effort:        {DEFAULT_REASONING_EFFORT}")
+    lines.append(f"Timeout:       {EXEC_TIMEOUT_SECONDS}s")
+
+    # Plugin version
+    plugin_json = Path(cwd) / ".claude-plugin" / "plugin.json"
+    plugin_version = "unknown"
+    if plugin_json.is_file():
+        try:
+            import json
+            plugin_version = json.loads(plugin_json.read_text()).get("version", "unknown")
+        except (OSError, ValueError):
+            pass
+    lines.append(f"Plugin:        v{plugin_version}")
+
+    # --- Sessions ---
+    claudex_dir = Path(cwd) / ".claudex"
+    sessions_dir = claudex_dir / "sessions"
+    session_entries = []
+    if sessions_dir.is_dir():
+        for f in sorted(sessions_dir.iterdir()):
+            if f.is_file() and f.suffix == ".md":
+                try:
+                    rounds = _read_session_rounds(f)
+                    stat = f.stat()
+                    age_secs = time.time() - stat.st_mtime
+                    if age_secs < 3600:
+                        age_str = f"{int(age_secs / 60)}m ago"
+                    else:
+                        age_str = f"{age_secs / 3600:.1f}h ago"
+                    size_kb = stat.st_size / 1024
+                    name = f.stem
+                    session_entries.append(
+                        f"  {name:<20s} Round {rounds}/{MAX_SESSION_ROUNDS}  "
+                        f"({age_str}, {size_kb:.1f} KB)"
+                    )
+                except OSError:
+                    pass
+
+    if session_entries:
+        lines.append(f"\nSessions ({len(session_entries)} active):")
+        lines.extend(session_entries)
+    else:
+        lines.append("\nSessions: none")
+
+    # --- Recaps ---
+    recaps_dir = claudex_dir / "recaps"
+    recap_count = 0
+    recap_bytes = 0
+    if recaps_dir.is_dir():
+        for f in recaps_dir.iterdir():
+            if f.is_file():
+                try:
+                    recap_count += 1
+                    recap_bytes += f.stat().st_size
+                except OSError:
+                    pass
+    if recap_count:
+        lines.append(f"Recaps: {recap_count} file(s) ({recap_bytes / 1024:.1f} KB)")
+    else:
+        lines.append("Recaps: none")
+
+    # --- Artifact run dirs ---
+    run_dir_count = 0
+    run_dir_bytes = 0
+    if claudex_dir.is_dir():
+        for entry in claudex_dir.iterdir():
+            if entry.is_dir() and entry.name.startswith("run-") and not entry.is_symlink():
+                run_dir_count += 1
+                for root_path, _dirs, files in os.walk(entry):
+                    for fname in files:
+                        try:
+                            run_dir_bytes += os.path.getsize(os.path.join(root_path, fname))
+                        except OSError:
+                            pass
+    if run_dir_count:
+        lines.append(f"Artifacts: {run_dir_count} run dir(s) ({run_dir_bytes / 1024:.1f} KB)")
+    else:
+        lines.append("Artifacts: none")
+
+    # --- Total .claudex/ disk usage ---
+    total_bytes = 0
+    if claudex_dir.is_dir():
+        for root_path, _dirs, files in os.walk(claudex_dir):
+            for fname in files:
+                try:
+                    total_bytes += os.path.getsize(os.path.join(root_path, fname))
+                except OSError:
+                    pass
+        lines.append(f"\n.claudex/ total: {total_bytes / 1024:.1f} KB")
+
+    return "\n".join(lines)
 
 
 @mcp.tool(
@@ -1758,7 +1952,7 @@ async def codex_ping() -> str:
             "--sandbox", "read-only",
             "--skip-git-repo-check",
             "--color", "never",
-            "-m", "gpt-5-codex-mini",
+            "-m", DEFAULT_MODEL,
             "Say 'pong' and nothing else.",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

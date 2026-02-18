@@ -40,6 +40,9 @@ What's your situation?
 ├─ "We just finished a multi-round session"
 │   └─ Want a decision record / summary   → codex_recap
 │
+├─ "What's the current state of Claudex?"
+│   └─ Sessions, artifacts, disk usage    → codex_status (zero cost)
+│
 └─ "Is Codex even working?"
     └─ Connection test                    → codex_ping
 ```
@@ -59,6 +62,7 @@ What's your situation?
 | `codex_review_files` | Targeted code review of specific files. | **Senior Code Reviewer** — patterns, anti-patterns, maintainability, correctness |
 | `codex_evaluate` | Codex analyzes tradeoffs between options. User makes the final call. | **Technical Advisor** — balanced analysis, explicit tradeoffs, no recommendation bias |
 | `codex_recap` | Generate a decision record summarizing a session. | **Technical Writer** — clear, concise, decision-focused documentation |
+| `codex_status` | Show Claudex diagnostics (no Codex call, zero subscription cost). | N/A |
 | `codex_ping` | Verify Codex CLI is installed and working. | N/A |
 
 ### Collab Personas (by `request_type`)
@@ -161,7 +165,7 @@ Use when debugging tricky issues or solving complex problems. Uses session docum
    - problem: What you're trying to solve
    - cc_analysis: Your findings, hypotheses, what you've tried
    - request_type: bug_approach, red_team, verification, etc.
-   - session_id: (optional) Creates/continues a session document
+   - session_id: Pass "auto" to auto-generate a descriptive ID, or a custom slug for the session
    - user_prompt: The ORIGINAL task description from when the session started.
      Use the same user_prompt across all rounds — gives Codex consistent framing.
 3. Server writes Codex's response to .claudex/sessions/{session_id}.md
@@ -273,14 +277,11 @@ When Codex disagrees with your approach:
 
 ---
 
-## Model Selection
+## Model & Reasoning
 
-| Model | Best For |
-|-------|----------|
-| gpt-5.3-codex (default) | Architecture, complex plans, deep analysis |
-| gpt-5.2-codex | Previous flagship, still excellent |
-| gpt-5.1-codex | Long-horizon tasks |
-| gpt-5-codex | Original Codex variant |
-| gpt-5-codex-mini | Quick checks when you need speed |
+**Model:** `gpt-5.3-codex` (hardcoded — all tools use this).
 
-Default: **gpt-5.3-codex** with **high** reasoning effort. Use `xhigh` for maximum depth.
+**Reasoning effort:** `high` by default. Override with `reasoning_effort` parameter:
+- `medium` — faster, good for reviews and recaps
+- `high` — default, good for most analysis
+- `xhigh` — maximum depth, slower but more thorough
