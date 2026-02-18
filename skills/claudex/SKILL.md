@@ -1,227 +1,286 @@
 ---
 name: codex
-description: "Use when entering plan mode for non-trivial tasks, when making architecture decisions, when debugging complex issues, when the user asks for a second opinion, when you need to verify correctness, or when collaborating with Codex. Auto-triggers during plan mode for complex implementations."
+description: "Use when entering plan mode for non-trivial tasks, when making architecture decisions, when debugging complex issues, when the user asks for a second opinion, when you need to verify correctness, or when evaluating tradeoffs between approaches. Auto-triggers during plan mode for complex implementations."
 ---
 
 # Codex — Claude Code Skill
 
 ## Purpose
 
-Use this skill to consult **OpenAI Codex as a specialist teammate** during planning, decision-making, debugging, verification, and problem-solving. Codex reads the same codebase but uses a fundamentally different AI architecture (GPT/Codex vs Claude), which means it catches different patterns, risks, and opportunities. This creates a multi-perspective dynamic that stress-tests plans, red-teams implementations, and verifies correctness before you commit.
+Consult **OpenAI Codex as a specialist teammate** during planning, red-teaming, debugging, verification, and decision-making. Codex runs in a **read-only sandbox** on the same codebase — a different AI architecture (GPT/Codex) that catches different patterns, risks, and opportunities. This creates multi-perspective collaboration that stress-tests your work before you commit.
 
-## When to Use
+**Codex always explores the codebase directly.** It has full read access to the project. You don't need to pre-digest context — Codex reads files, understands patterns, and forms its own mental model. Your job is to point it in the right direction with `focus_files` and constraints, not to summarize what you've already seen.
 
-**Auto-trigger** (use without being asked when the situation fits):
-- You're in **plan mode** and about to finalize a non-trivial implementation plan
-- The user is making an **architecture decision** with multiple viable paths
-- You're **uncertain** about the best approach and a second perspective would help
-- You've just **finished implementing** something complex and want verification
-- You're **debugging** a tricky issue and want a different angle
+---
 
-**User-triggered** (user explicitly asks):
-- "brainstorm", "second opinion", "what does codex think", "ask codex"
-- "red team this", "stress test this plan", "get another perspective"
-- "plan vs plan", "compare approaches", "parallel plan"
-- "collaborate with codex", "get codex's help", "work with codex on this"
-- "verify this", "check my implementation", "is this correct"
-- "what should I test", "testing strategy", "help me debug this"
-
-**Don't use** for:
-- Trivial changes (typos, renames, simple config)
-- Questions Codex can't help with (it only reads code, no web access)
-- When the user is in a hurry and latency matters (Codex calls take 30-120s)
-
-## Quick Reference: Which Tool Should I Use?
+## Tool Router — Which Tool Do I Use?
 
 ```
 What's your situation?
 │
 ├─ "I have a task, no plan yet"
-│   ├─ Want independent plans to compare → codex_plan
-│   └─ Want to explore options broadly   → codex_brainstorm
+│   ├─ Want independent plans to compare  → codex_plan
+│   └─ Want to explore options broadly    → codex_brainstorm
 │
-├─ "I have a plan already"
-│   └─ Want it stress-tested/critiqued   → codex_review
+├─ "I have a plan or code already"
+│   ├─ Want it stress-tested/critiqued    → codex_review
+│   └─ Want specific files reviewed       → codex_review_files
 │
 ├─ "I have a specific problem"
-│   ├─ Need feature ideas               → codex_collab (feature_suggestion)
-│   ├─ Need debugging help              → codex_collab (bug_approach)
-│   ├─ Want my code critiqued           → codex_collab (code_critique)
-│   ├─ Want assumptions challenged      → codex_collab (red_team)
-│   ├─ Want correctness verified        → codex_collab (verification)
-│   └─ Want testing guidance            → codex_collab (testing_strategy)
+│   ├─ Need debugging help               → codex_collab (bug_approach)
+│   ├─ Want assumptions challenged        → codex_collab (red_team)
+│   ├─ Want correctness verified          → codex_collab (verification)
+│   ├─ Want testing guidance              → codex_collab (testing_strategy)
+│   ├─ Want my code critiqued             → codex_collab (code_critique)
+│   └─ Need feature ideas                → codex_collab (feature_suggestion)
 │
-├─ "I want specific files reviewed"
-│   └─ Targeted code review             → codex_review_files
+├─ "I need to choose between approaches"
+│   └─ Want tradeoff analysis for MY decision → codex_evaluate
+│
+├─ "We just finished a multi-round session"
+│   └─ Want a decision record / summary   → codex_recap
 │
 └─ "Is Codex even working?"
-    └─ Connection test                   → codex_ping
+    └─ Connection test                    → codex_ping
 ```
 
-## Available Tools
+**Auto-trigger guidance:** Use Codex whenever a second perspective would **materially improve** the output — architecture decisions, complex implementations, subtle bugs, security-sensitive code, or anything the user will deploy to production. When in doubt, use it.
 
-| Tool | When | What It Does |
-|------|------|-------------|
-| `codex_plan` | **You have a task, want both plans** | Codex generates its OWN independent plan. You compare and synthesize. |
-| `codex_review` | **You have YOUR plan, want it critiqued** | Codex reviews and stress-tests your specific approach. |
-| `codex_brainstorm` | **No plan yet, exploring options** | Open-ended exploration of the problem space. |
-| `codex_collab` | **You need help solving a specific problem** | Send your analysis + a request type, get targeted suggestions back. |
-| `codex_review_files` | **Want specific files reviewed** | Targeted code review from a different angle. |
-| `codex_ping` | **Setup/debug** | Verify Codex CLI is installed and working. |
+---
+
+## Tools Reference
+
+| Tool | Purpose | Codex Persona |
+|------|---------|---------------|
+| `codex_plan` | Codex generates its OWN independent plan. You compare and synthesize. | **Creative Architect** — explore broadly, challenge conventions, suggest alternatives |
+| `codex_review` | Codex critiques your specific plan or implementation. | **Critical QA Engineer** — find bugs, edge cases, security holes, perf issues |
+| `codex_brainstorm` | Open-ended exploration of a problem space. | **Innovation Consultant** — divergent thinking, cross-domain connections |
+| `codex_collab` | Targeted collaboration on a specific problem. Persona varies by `request_type`. | See Collab Personas below |
+| `codex_review_files` | Targeted code review of specific files. | **Senior Code Reviewer** — patterns, anti-patterns, maintainability, correctness |
+| `codex_evaluate` | Codex analyzes tradeoffs between options. User makes the final call. | **Technical Advisor** — balanced analysis, explicit tradeoffs, no recommendation bias |
+| `codex_recap` | Generate a decision record summarizing a session. | **Technical Writer** — clear, concise, decision-focused documentation |
+| `codex_ping` | Verify Codex CLI is installed and working. | N/A |
+
+### Collab Personas (by `request_type`)
+
+| Type | Persona | Behavioral Instruction |
+|------|---------|----------------------|
+| `bug_approach` | **Diagnostic Specialist** | Systematic hypothesis testing. Rank hypotheses by likelihood. Suggest targeted tests. |
+| `red_team` | **Adversarial Researcher** | Assume everything can break. Find failure modes, attack vectors, race conditions. |
+| `verification` | **Formal Methods Engineer** | Prove correctness. Check invariants, data flow, boundary conditions, error paths. |
+| `testing_strategy` | **Test Architect** | Coverage analysis, boundary testing, integration points, test structure. |
+| `code_critique` | **Senior Developer** | Patterns, readability, maintainability, performance, idiomatic usage. |
+| `feature_suggestion` | **Product Engineer** | Feasibility, user impact, implementation complexity, integration risks. |
+| `general` | **Collaborative Engineer** | Concrete analysis, add missed perspectives, evidence-based suggestions. |
+
+---
+
+## Server-Side Features (v1.3)
+
+These are handled automatically by the server. Understand them so you use them correctly.
+
+### `user_prompt` — Preserve the User's Voice
+
+`codex_plan`, `codex_review`, `codex_brainstorm`, `codex_collab`, and `codex_review_files` accept an optional `user_prompt` field. **Always pass it** — it ensures Codex responds to the user's actual intent, not just your interpretation.
+
+| Context | What to pass as `user_prompt` |
+|---------|-------------------------------|
+| Independent planning (`codex_plan`, `codex_brainstorm`) | The user's current message, verbatim — Codex forms its OWN interpretation |
+| Single-shot review (`codex_review`, `codex_review_files`) | The user's current message, verbatim |
+| Iterative session (`codex_collab` with `session_id`) | The ORIGINAL task description from session start — same across all rounds |
+
+### File Path Auto-Normalization
+
+`focus_files`, `files_involved`, and `files` are auto-normalized server-side: resolved relative to `project_dir`, non-existent paths silently dropped. **You do NOT need to verify file existence before passing paths.** Just pass what seems relevant.
+
+### Git Context Injection
+
+All analysis tools (`codex_plan`, `codex_review`, `codex_brainstorm`, `codex_collab`, `codex_review_files`, `codex_evaluate`) automatically include the current git branch and `git diff --stat` (capped at 20 lines) in the prompt sent to Codex. **You do NOT need to manually include git state** — it's injected server-side. `codex_recap` and `codex_ping` skip this (recap summarizes a session, ping is a connectivity test). If the project isn't a git repo, this is silently skipped.
+
+### Response Metadata Footer
+
+Every successful Codex response includes a footer: `_Codex: {model}, {effort}, {elapsed}s_`. Reference this for transparency when reporting to the user, e.g.: "Codex (gpt-5.3-codex, high, 45s) suggests..."
+
+---
 
 ## Workflow 1: Divergent — Parallel Planning & Brainstorming
 
 Use when the user describes a task/feature and you need independent perspectives.
-The key principle is **Immediate Verbatim Dispatch**: send the raw user prompt
-to Codex without interpretation, so both models think independently.
 
 ```
 1. User describes a task/feature
-2. **Immediately** call `codex_plan` or `codex_brainstorm` with:
-   - user_prompt: The user's EXACT words (verbatim, do NOT rephrase)
-   - task/topic: Factual grounding only — tech stack, relevant files, constraints
+2. IMMEDIATELY call codex_plan or codex_brainstorm:
+   - user_prompt: The user's EXACT words (preserve original intent for independent interpretation)
+   - task/topic: Factual grounding — tech stack, relevant files, constraints
+   - focus_files: Point Codex WHERE to explore (it reads them directly)
    - Do NOT include your interpretation of HOW to solve it
-3. **While waiting**, formulate YOUR plan/ideas independently
-4. Compare the two perspectives:
-   - Agreement → High confidence (independent convergence)
-   - Disagreement → Examine why, adopt what's stronger
-   - Codex found something you missed → Investigate (potential blind spot)
-   - You found something Codex missed → Keep (you have conversation context)
-5. Synthesize with clear attribution:
+   NOTE: Codex will explore the codebase itself. You're pointing, not summarizing.
+3. WHILE WAITING, formulate YOUR plan/ideas independently
+4. Compare using these criteria:
+   - Novelty: Did Codex find an approach you didn't consider?
+   - Feasibility: Is the suggestion practical given constraints?
+   - Architecture alignment: Does it fit existing patterns?
+   - Risk: What could go wrong with each approach?
+5. Synthesize with CLEAR attribution:
    "Both CC and Codex agree on X.
     Codex suggested Y — adopting because [reason].
     Keeping my approach for Z because [reason]."
 ```
 
+**Key principle:** Send the raw prompt. Let Codex form its OWN understanding by reading the code. Two models looking at the same codebase independently = genuine second opinion.
+
 ## Workflow 2: Convergent — Review & Verification
 
 Use when you have code or a plan that needs quality assurance.
-The key principle is the **Double Strainer**: you self-review first (coarse filter),
-then Codex reviews the polished output (fine filter).
 
 ```
 1. Complete your implementation or plan
-2. **Self-review first**: Check for obvious issues, edge cases, style
+2. Self-review first: check for obvious issues, edge cases, style
 3. Fix anything you find — send Codex a clean version
-4. Call `codex_review` or `codex_review_files` with the polished output
+4. Call codex_review or codex_review_files with the polished output
+   - user_prompt: The user's EXACT current message (preserves original intent)
 5. Evaluate Codex's critique:
-   - Adopt suggestions that are genuinely better
-   - Defer suggestions that are style preferences
-   - Investigate anything Codex found that you missed in self-review
+   - Adopt: genuinely better suggestions (architecture, correctness, security)
+   - Defer: style preferences or matters of taste
+   - Investigate: anything Codex found that you missed in self-review
 6. Present with attribution:
-   "My plan is X. After self-review, I fixed [Y].
-    Codex additionally flagged [risk] and suggested [alternative].
+   "After self-review, I fixed [Y].
+    Codex flagged [risk] and suggested [alternative].
     Adopting/deferring because [reason]."
 ```
 
+**Key principle (Double Strainer):** Your self-review is the coarse filter. Codex is the orthogonal filter — it catches *different types* of issues, not necessarily subtler ones.
+
 ## Workflow 3: Iterative — Debugging & Problem-Solving
 
-Use when debugging tricky issues or solving complex problems.
-The key principle is **Accumulated Context**: each round builds on previous findings.
-Claude stays the arbitrator — decides which hypotheses to test.
+Use when debugging tricky issues or solving complex problems. Uses session documents for shared memory.
 
 ```
 1. Analyze the problem yourself first
-2. Call `codex_collab` with:
+2. Call codex_collab with:
    - problem: What you're trying to solve
-   - cc_analysis: Your findings and current thinking
+   - cc_analysis: Your findings, hypotheses, what you've tried
    - request_type: bug_approach, red_team, verification, etc.
-3. Evaluate Codex's response. Test its suggestions.
-4. **If you need another round**, call `codex_collab` again with:
-   - problem: Updated with new findings
-   - cc_analysis: Include what Codex suggested + what you tried + results
-   - This creates a shared understanding across rounds
-5. Present unified analysis with clear attribution
+   - session_id: (optional) Creates/continues a session document
+   - user_prompt: The ORIGINAL task description from when the session started.
+     Use the same user_prompt across all rounds — gives Codex consistent framing.
+3. Server writes Codex's response to .claudex/sessions/{session_id}.md
+4. Read the session document. Test Codex's top suggestions.
+5. IF another round is needed, call codex_collab again:
+   - Update cc_analysis with: what Codex suggested + what you tried + results
+   - Same session_id (accumulates context across rounds)
+6. TERMINATION: Max 4 rounds. After that, summarize findings for the user.
+   Call codex_recap to generate a decision record if the session was substantive.
 ```
 
-**When to use which workflow:**
-- **Divergent** (`codex_plan`, `codex_brainstorm`): Starting fresh, want independent thinking
-- **Convergent** (`codex_review`, `codex_review_files`): Have a plan/code, want it stress-tested
-- **Iterative** (`codex_collab`): Solving a specific problem, may need multiple rounds
+**Key principle:** The session document IS the shared memory. Each round builds on all previous findings. CC stays the arbitrator — you decide which hypotheses to test.
+
+### Session Document Format
+
+The server automatically manages `.claudex/sessions/{session_id}.md`:
+
+```markdown
+# Session: {session_id}
+Started: {timestamp}
+<!-- claudex:rounds=0 -->
+
+## Round 1
+### CC Analysis
+{cc_analysis from the call}
+
+### Codex Response
+{codex output}
+
+### Test Results
+{added by CC after testing — update the file before next round}
+
+## Round 2
+...
+```
+
+## Workflow 4: Evaluate — Decision Support
+
+Use when choosing between approaches. This is the ONLY tool where CC does NOT arbitrate — the user decides.
+
+```
+1. Frame the decision:
+   - Options being considered (2-4)
+   - Constraints and priorities
+   - What you're optimizing for
+2. Call codex_evaluate:
+   - options: List of approaches with brief descriptions
+   - constraints: Non-negotiable requirements
+   - priorities: What matters most (performance? maintainability? speed to ship?)
+   - focus_files: Relevant codebase context
+3. Codex analyzes each option:
+   - Tradeoffs (explicit pros/cons)
+   - Risk profile
+   - Implementation complexity
+   - Long-term maintenance implications
+4. Present BOTH your analysis and Codex's to the user
+5. The user decides. You execute their choice.
+```
+
+**Key principle:** `codex_evaluate` presents options. It does NOT recommend. The user has context you and Codex don't (business priorities, team skills, timeline pressure).
+
+---
 
 ## Reading Codex Artifacts
 
-Codex may produce file artifacts (code snippets, tests, verification scripts, analysis docs) that the server writes to `.claudex/run-<uuid>/`. When Codex's output includes an **"Artifacts Created"** section:
+Codex may produce file artifacts (code snippets, tests, analysis docs) written by the server to `.claudex/run-<uuid>/`. When output includes an **"Artifacts Created"** section:
 
-1. **Read every artifact file** listed — they contain the code/evidence Codex references in its text
-2. Use the exact paths shown (e.g. `.claudex/run-abc123/proposed_handler.py`)
-3. Evaluate artifact contents with the same critical eye you apply to Codex's text output
-4. Reference specific artifact files when presenting findings to the user
+1. **Read every artifact file** — they contain the evidence Codex references
+2. Use exact paths shown (e.g., `.claudex/run-abc123/proposed_handler.py`)
+3. Evaluate with the same critical eye you apply to Codex's text
+4. Reference specific artifacts when presenting findings to the user
 
-Artifacts are read-only evidence — Codex cannot write to your codebase. The server extracts artifacts from Codex's output and writes them to an isolated per-run directory.
+## Error Handling
+
+If Codex fails (timeout, rate limit, empty response, error):
+1. **Inform the user** — be specific about what happened
+2. **Proceed with CC-only analysis** — don't block on Codex
+3. **Flag it** — note the output was NOT dual-verified
+4. For rate limits: suggest waiting for the 5-hour window reset
+
+---
 
 ## Critical Rules
 
 ### ALWAYS:
 - Pass `project_dir` so Codex reads the correct codebase
-- Be specific in plan/task descriptions — vague input = vague output
-- Include constraints (perf requirements, deadlines, backward compat)
-- Use `focus_files` to direct Codex's attention to relevant code
+- Pass `user_prompt` on every tool that accepts it (see v1.3 features above)
+- Use `focus_files` to direct Codex's exploration — paths are auto-normalized, no need to verify existence
+- Let Codex read the codebase directly — don't pre-summarize context for it
 - Critically evaluate Codex's output — it's a perspective, not authority
 - Show the user WHERE ideas came from (CC vs Codex) for transparency
-- Note when Codex's reasoning chain (from `model_reasoning_summary=detailed`) reveals important context about WHY it suggests something
+- Include the response metadata footer when attributing Codex findings to the user
 
 ### NEVER:
 - Pass credentials, API keys, or secrets in prompts
-- Call Codex for trivial changes (rate limits are real)
 - Blindly adopt everything Codex says without critical evaluation
-- Call repeatedly on the same topic without new information
+- Call repeatedly on the same topic without new information between rounds
 - Ignore Codex's output — if you called it, use the result
+- Pre-digest codebase context into summaries for Codex (let it read directly)
+- Manually inject git state into prompts (the server does this automatically)
+- Omit `user_prompt` when calling any tool that accepts it — Codex needs the user's voice
 
 ### Evaluating Disagreements:
 When Codex disagrees with your approach:
 1. Did it read a file you didn't consider? → Investigate
 2. Is this architectural or just style? → Only adopt architectural improvements
 3. Does it align with the project's existing patterns? → Prefer consistency
-4. Would the user benefit from seeing both options? → Present both
+4. Would the user benefit from seeing both options? → Present both with tradeoffs
+
+---
 
 ## Model Selection
 
-| Model | Best For | Speed |
-|-------|----------|-------|
-| gpt-5.3-codex (default) | Architecture, complex plans, deep analysis | ~30-60s |
-| gpt-5.2-codex | Previous flagship, still excellent | ~30-60s |
-| gpt-5.1-codex | Long-horizon tasks | ~30-60s |
-| gpt-5-codex | Original Codex variant | ~30-60s |
-| gpt-5-codex-mini | Quick checks, cost-effective | ~15-30s |
+| Model | Best For |
+|-------|----------|
+| gpt-5.3-codex (default) | Architecture, complex plans, deep analysis |
+| gpt-5.2-codex | Previous flagship, still excellent |
+| gpt-5.1-codex | Long-horizon tasks |
+| gpt-5-codex | Original Codex variant |
+| gpt-5-codex-mini | Quick checks when you need speed |
 
-Default is **gpt-5.3-codex** with **high** reasoning effort. Use `xhigh` for maximum depth when you have time to wait.
-
-## Rate Limit Awareness
-
-Codex uses the user's ChatGPT subscription quota:
-- **Plus ($20/mo)**: ~30-150 messages per 5-hour window
-- **Pro ($200/mo)**: ~300-1,500 messages per 5-hour window
-- Each tool call = 1 message from quota
-- If rate-limited: tell the user, suggest waiting or using gpt-5-codex-mini
-
-## Example: Full Parallel Planning Session
-
-```
-User: "Add a webhook system to our Express API so clients can subscribe
-       to events like order.created, order.shipped, etc."
-
-YOU (internal):
-  1. **Immediately** dispatch to Codex with the raw user prompt:
-     Call codex_plan(
-       user_prompt="Add a webhook system to our Express API so clients can
-                    subscribe to events like order.created, order.shipped, etc.",
-       task="Express.js API on PostgreSQL, deployed on Railway, ~50 concurrent
-             users. Relevant dirs: src/routes/, src/models/, src/services/",
-       constraints="Express.js, PostgreSQL, deployed on Railway, ~50 concurrent users",
-       focus_files="src/routes/,src/models/,src/services/",
-       project_dir="/home/user/my-api"
-     )
-  2. **While waiting**, form YOUR plan: event registry, webhook model, async dispatch queue...
-  3. Compare plans → Codex suggested using pg LISTEN/NOTIFY for event
-     dispatch instead of your polling approach. Good catch.
-  4. Merge: adopt pg LISTEN/NOTIFY, keep your retry logic design.
-
-YOU (to user):
-  "Here's the plan. Both CC and Codex converged on a webhook_subscriptions
-   table with event filtering. For event dispatch, Codex suggested using
-   PostgreSQL LISTEN/NOTIFY instead of a polling queue — I'm adopting that
-   because it's lower latency and you're already on PostgreSQL. I'm keeping
-   my exponential backoff retry design since Codex's linear retry would be
-   less resilient for flaky endpoints."
-```
+Default: **gpt-5.3-codex** with **high** reasoning effort. Use `xhigh` for maximum depth.

@@ -1,35 +1,38 @@
 # Claudex — Claude Code Plugin
 
-Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, red-teaming, debugging, verification, and more.
+Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, red-teaming, debugging, verification, and decision support.
 
 ## How It Works
 
 ```
 You ask Claude Code to implement something
-        |
-        v
+        │
+        ▼
 CC formulates its own plan
-        |
-        v
-CC calls codex_plan via MCP -----------------+
-        |                                       |
-        v                                       v
+        │
+        ▼
+CC calls codex_plan via MCP ─────────────────┐
+        │                                      │
+        ▼                                      ▼
 CC has Plan A                          Codex reads your repo
                                        (read-only sandbox)
-                                               |
-                                               v
+                                       Forms its OWN understanding
+                                               │
+                                               ▼
                                        Codex produces Plan B
-                                               |
-        <--------------------------------------+
-        |
-        v
+                                               │
+        ◄──────────────────────────────────────┘
+        │
+        ▼
 CC compares Plan A vs Plan B
 Adopts best ideas from each
-        |
-        v
+        │
+        ▼
 Presents unified plan to you
 with clear CC/Codex attribution
 ```
+
+**Key design:** Codex explores the codebase directly — it reads files, understands patterns, and forms its own mental model. CC points it in the right direction with `focus_files`, it doesn't pre-summarize context.
 
 ## Prerequisites
 
@@ -106,34 +109,77 @@ claude --plugin-dir /path/to/Claudex
 /codex:collab I'm getting a race condition in the worker queue
 ```
 
-## MCP Tools Reference
+## MCP Tools
 
-| Tool | Purpose | Quota Cost |
-|------|---------|------------|
-| `codex_plan` | Codex makes its OWN plan, CC compares with its plan | 1 message |
-| `codex_review` | Codex critiques a specific plan you provide | 1 message |
-| `codex_brainstorm` | Open-ended exploration of a problem | 1 message |
-| `codex_collab` | Targeted collaboration — CC sends analysis, gets suggestions | 1 message |
-| `codex_review_files` | Targeted code review of specific files | 1 message |
-| `codex_ping` | Test that Codex is installed and working | 1 message |
+| Tool | Purpose | Codex Persona |
+|------|---------|---------------|
+| `codex_plan` | Codex makes its OWN plan, CC compares with its plan | Creative Architect |
+| `codex_review` | Codex critiques a specific plan you provide | Critical QA Engineer |
+| `codex_brainstorm` | Open-ended exploration of a problem | Innovation Consultant |
+| `codex_collab` | Targeted collaboration — CC sends analysis, gets suggestions | Varies by request type |
+| `codex_review_files` | Targeted code review of specific files | Senior Code Reviewer |
+| `codex_evaluate` | Analyze tradeoffs between options — user decides | Technical Advisor |
+| `codex_recap` | Generate decision record from a session | Technical Writer |
+| `codex_ping` | Test that Codex is installed and working | — |
 
 ## Collaboration Modes
 
-The `codex_collab` tool supports these request types:
+The `codex_collab` tool supports these request types, each activating a distinct Codex persona:
 
-| Type | Use When |
-|------|----------|
-| `feature_suggestion` | You need feature ideas or implementation approaches |
-| `bug_approach` | You need help debugging or identifying root causes |
-| `code_critique` | You want Codex to review your proposed solution |
-| `red_team` | You want Codex to challenge assumptions and find weaknesses |
-| `verification` | You want Codex to independently verify correctness |
-| `testing_strategy` | You want Codex to suggest what and how to test |
-| `general` | Open-ended analysis and suggestions |
+| Type | Codex Persona | Use When |
+|------|---------------|----------|
+| `bug_approach` | Diagnostic Specialist | Need help debugging or identifying root causes |
+| `red_team` | Adversarial Researcher | Want assumptions challenged and weaknesses found |
+| `verification` | Formal Methods Engineer | Want independent correctness verification |
+| `testing_strategy` | Test Architect | Need a comprehensive testing approach |
+| `code_critique` | Senior Developer | Want implementation quality reviewed |
+| `feature_suggestion` | Product Engineer | Need feature ideas or implementation approaches |
+| `general` | Collaborative Engineer | Open-ended analysis and suggestions |
+
+## Session Documents
+
+For iterative debugging and multi-round collaboration, Claudex maintains session documents in `.claudex/sessions/`. These serve as shared memory between CC and Codex across rounds.
+
+```markdown
+# Debug Session: fix-race-condition
+Started: 2026-02-18T10:30:00Z
+
+## Round 1
+### CC Analysis
+Found intermittent test failures in worker_queue.py...
+
+### Codex Response
+Hypothesis: The issue is in the task acknowledgment timing...
+
+### Test Results (added by CC)
+Tested Codex's hypothesis — confirmed partial match...
+
+## Round 2
+### CC Analysis (updated with Round 1 findings)
+...
+```
+
+CC manages the document. The server writes Codex's responses. Each `codex_collab` call with the same `session_id` appends to the existing session. After 4 rounds or resolution, use `codex_recap` to generate a formal decision record.
+
+## Decision Support with `codex_evaluate`
+
+Unlike other tools where CC arbitrates, `codex_evaluate` presents analysis for the **user** to decide:
+
+```
+You: "Should we use Redis or PostgreSQL pub/sub for real-time events?"
+
+CC calls codex_evaluate with both options + constraints + priorities
+
+Codex analyzes tradeoffs:
+  Redis: Lower latency, but adds infra dependency
+  PG pub/sub: No new infra, but higher latency at scale
+
+CC presents BOTH analyses → You decide
+```
 
 ## Artifact Scratchpad
 
-Codex can produce file artifacts — code snippets, test drafts, verification scripts, analysis docs — without ever having write access to your codebase.
+Codex can produce file artifacts — code snippets, test drafts, analysis docs — without ever having write access to your codebase.
 
 **How it works:**
 1. Codex runs in `--sandbox read-only` (enforced by Codex CLI — physically cannot write)
@@ -145,7 +191,7 @@ Codex can produce file artifacts — code snippets, test drafts, verification sc
 **Security model:**
 - Codex never has write access — the sandbox enforces it
 - Filenames are validated against path traversal (`Path.resolve()` + `is_relative_to()`)
-- Symlink writes are rejected; exclusive-create (`open('x')`) prevents overwrite races
+- Symlink writes are rejected; exclusive-create prevents overwrite races
 - Only the final-answer section is parsed (reasoning traces are ignored)
 - Artifacts > 100KB are skipped
 - Run directories are cleaned up after 1 hour
@@ -157,16 +203,17 @@ echo '.claudex' >> .gitignore
 
 ## Defaults
 
-- **Model**: `gpt-5.3-codex` — current best Codex model
-- **Reasoning effort**: `high` — deep analysis without timeouts (use `xhigh` for maximum depth)
+- **Model**: `gpt-5.3-codex`
+- **Reasoning effort**: `high` (use `xhigh` for maximum depth)
 - **Reasoning summary**: `detailed` — includes Codex's chain-of-thought
-- **Sandbox**: `read-only` — Codex can read your repo but never modify it
+- **Sandbox**: `read-only` — Codex reads your repo but never modifies it
+- **Timeout**: 600s (10 min)
 
 ## Rate Limits
 
 Codex uses your ChatGPT subscription quota:
-- **Plus ($20/mo)**: ~30-150 messages per 5-hour window
-- **Pro ($200/mo)**: ~300-1,500 messages per 5-hour window
+- **Plus ($20/mo)**: ~30–150 messages per 5-hour window
+- **Pro ($200/mo)**: ~300–1,500 messages per 5-hour window
 - Each tool call = 1 message from quota
 - If rate-limited: wait for window reset or use `gpt-5-codex-mini`
 
@@ -184,27 +231,29 @@ Claudex/
 │   ├── brainstorm.md        # /codex:brainstorm
 │   └── collab.md            # /codex:collab
 ├── skills/
-│   └── claudex/
+│   └── codex/
 │       └── SKILL.md         # Auto-triggers during plan mode
-├── .claudex/                # Artifact scratchpad (gitignored)
-│   └── run-<uuid>/          # Per-run artifact directories
+├── .claudex/                  # Scratchpad (gitignored)
+│   ├── run-<uuid>/          # Per-run artifact directories
+│   └── sessions/            # Iterative session documents
 ├── install.sh               # One-liner installer
 ├── docs/
 │   └── initial-plan.md      # Original design document
+├── CLAUDE.md
 ├── README.md
 └── LICENSE
 ```
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| "Codex CLI not found" | codex not installed or not in PATH | `npm i -g @openai/codex` |
-| "Not authenticated" | Not logged in to ChatGPT | `codex login` |
-| "Rate limit reached" | Hit subscription quota | Wait for 5-hour window reset |
-| Timeout (>5min) | Complex prompt + high reasoning | Use `gpt-5-codex-mini` or `medium` reasoning |
-| Empty response | Prompt too vague | Be more specific about the task |
-| Tools not showing | Plugin not loaded | Check with `/mcp`, restart CC session |
+| Symptom | Fix |
+|---------|-----|
+| "Codex CLI not found" | `npm i -g @openai/codex` |
+| "Not authenticated" | `codex login` |
+| "Rate limit reached" | Wait for 5-hour window reset |
+| Timeout (>5min) | Use `gpt-5-codex-mini` or `medium` reasoning |
+| Empty response | Be more specific about the task |
+| Tools not showing | Check `/mcp`, restart CC session |
 
 ## License
 

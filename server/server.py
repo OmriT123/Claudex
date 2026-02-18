@@ -37,6 +37,7 @@ import shutil
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -60,6 +61,33 @@ ARTIFACT_TAG_RE = re.compile(
 )
 ARTIFACT_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 RUN_DIR_MAX_AGE_SECONDS = 3600  # 1 hour
+
+# Session & retention constants
+SESSION_MAX_BYTES = 32_000          # Max session context passed to Codex (OS ARG_MAX guard)
+MAX_SESSION_ROUNDS = 4              # Terminate iterative sessions after this many rounds
+SESSION_MAX_AGE_SECONDS = 86_400    # 24 hours
+
+GIT_CONTEXT_MAX_LINES = 20         # Max lines from git diff --stat
+
+ERROR_PREFIX = "Error: "           # CC pattern-matches on this — single source of truth
+
+# ---------------------------------------------------------------------------
+# Codebase-first preambles
+# ---------------------------------------------------------------------------
+
+CODEBASE_FIRST_PREAMBLE = """\
+You have full read access to the project codebase. BEFORE addressing the task, \
+explore the relevant source files to build your own understanding. Read imports, \
+class hierarchies, and call sites — don't rely solely on the prompt description. \
+Ground every observation in specific files and line-level evidence.
+
+"""
+
+CODEBASE_FIRST_PREAMBLE_LIGHT = """\
+You have full read access to the project codebase. Read the files specified \
+below and their surrounding context before responding.
+
+"""
 
 # ---------------------------------------------------------------------------
 # Artifact instructions (appended to all system prompts)
@@ -91,97 +119,269 @@ Rules:
 """
 
 # ---------------------------------------------------------------------------
+# Enums (defined before system prompts so COLLAB_PERSONAS can use RequestType)
+# ---------------------------------------------------------------------------
+
+
+class CodexModel(str, Enum):
+    """Supported Codex models (current only, retired models removed)."""
+    GPT5_3_CODEX = "gpt-5.3-codex"       # Best. Default.
+    GPT5_2_CODEX = "gpt-5.2-codex"       # Previous flagship
+    GPT5_1_CODEX = "gpt-5.1-codex"       # Long-horizon tasks
+    GPT5_CODEX = "gpt-5-codex"           # Original Codex variant
+    GPT5_CODEX_MINI = "gpt-5-codex-mini" # Cost-effective
+
+
+class ReasoningEffort(str, Enum):
+    """Codex reasoning effort levels."""
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"                      # Extra High — max reasoning depth
+
+
+class RequestType(str, Enum):
+    """Collaboration request types for codex_collab."""
+    FEATURE_SUGGESTION = "feature_suggestion"
+    BUG_APPROACH = "bug_approach"
+    CODE_CRITIQUE = "code_critique"
+    RED_TEAM = "red_team"
+    VERIFICATION = "verification"
+    TESTING_STRATEGY = "testing_strategy"
+    GENERAL = "general"
+
+
+# ---------------------------------------------------------------------------
 # System prompts for each mode
 # ---------------------------------------------------------------------------
 
-SECOND_OPINION_SYSTEM = """\
-You are a senior engineer providing an independent second opinion on a proposed plan \
-or implementation approach. You have full read access to the codebase.
+SECOND_OPINION_SYSTEM = CODEBASE_FIRST_PREAMBLE + """\
+## Your Role: Critical QA Engineer
 
-Your job:
-1. Analyze the proposed plan critically — look for blind spots, edge cases, and risks.
-2. Suggest concrete alternatives where you see a better path.
-3. Flag any architectural concerns, dependency issues, or maintainability risks.
-4. Be direct and specific. No generic praise. If the plan is solid, say so briefly and \
-   focus on what could still go wrong.
+You are reviewing a plan or implementation created by another AI (Claude).
+Your job is NOT to agree — it's to find what's wrong, missing, or risky.
 
-Format your response as:
-## Assessment
-(1-2 sentence overall verdict)
+Behavioral instructions:
+- Look for bugs, edge cases, security vulnerabilities, and performance issues.
+- Check that the plan aligns with existing codebase patterns and conventions.
+- Identify implicit assumptions that could fail in production.
+- Focus on issues the author likely missed — don't repeat obvious checks.
+- Suggest concrete fixes, not just "this could be better."
 
-## What I'd Do Differently
-(numbered list of concrete alternatives or improvements)
-
-## Risks & Blind Spots
-(things the plan doesn't account for)
-
-## Verdict
-(adopt / adapt / rethink)
+Structure your review as:
+1. **Critical Issues** — Must fix before shipping (bugs, security, data loss risks)
+2. **Warnings** — Should fix (edge cases, performance, maintainability)
+3. **Suggestions** — Nice to have (style, alternative approaches, optimizations)
+4. **What's Good** — Explicitly acknowledge solid design decisions (prevents over-rotation)
 """ + ARTIFACT_INSTRUCTIONS
 
-PARALLEL_PLAN_SYSTEM = """\
-You are a senior engineer. You have full read access to the codebase. \
-Given a task description, produce YOUR OWN independent implementation plan. \
-Do NOT just critique — actually plan how YOU would implement this from scratch.
+PARALLEL_PLAN_SYSTEM = CODEBASE_FIRST_PREAMBLE + """\
+## Your Role: Creative Architect
 
-Read the relevant files in the codebase first, then produce a plan with:
+You are an independent technical architect creating your OWN implementation plan.
+Another AI (Claude) is simultaneously creating its own plan for the same task.
+Your plans will be compared — the best ideas from each will be synthesized.
 
-## Your Approach
-(describe your strategy in 2-3 sentences)
+Behavioral instructions:
+- Explore broadly. Challenge conventions. Consider non-obvious approaches.
+- Propose at least one approach the other AI is unlikely to think of.
+- Be specific: name files, functions, data structures, endpoints.
+- Flag risks and tradeoffs explicitly for each approach.
+- If you find existing patterns in the codebase that inform your plan, reference them.
 
-## Step-by-Step Plan
-(numbered steps with specific files, functions, and patterns you'd use)
-
-## Key Design Decisions
-(list the important choices you're making and why)
-
-## Dependencies & Risks
-(what could go wrong, what this depends on)
-
-Be concrete — reference actual files, existing patterns, and real constraints \
-from this codebase. No vague hand-waving.
-
-If an "Original User Request" section is provided, treat it as the primary input. \
-Form your OWN interpretation of what needs to be done — do not assume the "Task Context" \
-section below it is the correct or only framing. The task context provides useful \
-grounding (constraints, relevant files) but may reflect another engineer's interpretation.
+Structure your plan as:
+1. **Context** — What you found in the codebase that's relevant
+2. **Approach** — Your recommended implementation (specific, actionable)
+3. **Alternatives Considered** — Other approaches and why you didn't pick them
+4. **Risks & Mitigations** — What could go wrong and how to handle it
+5. **Files to Create/Modify** — Exact paths and what changes
 """ + ARTIFACT_INSTRUCTIONS
 
-BRAINSTORM_SYSTEM = """\
-You are a senior engineer brainstorming with a peer. You have full read access to the \
-codebase. Explore the problem space broadly — suggest creative approaches, weigh \
-trade-offs, and think about what the ideal solution looks like if there were no \
-constraints, then work backward to what's practical.
+BRAINSTORM_SYSTEM = CODEBASE_FIRST_PREAMBLE + """\
+## Your Role: Innovation Consultant
 
-Be concrete. Reference actual files and patterns in the codebase when relevant.
+You are brainstorming solutions for a technical challenge. Think divergently.
+Another AI (Claude) is brainstorming independently on the same topic.
 
-If an "Original User Request" section is provided, treat it as the primary input. \
-Form your OWN interpretation of the problem — do not assume the "Topic" section \
-below it is the correct or only framing. The topic provides useful grounding \
-but may reflect another engineer's interpretation. Think independently.
+Behavioral instructions:
+- Generate at least 3-5 distinct approaches, not variations of the same idea.
+- Draw from cross-domain patterns — what works in other contexts that applies here?
+- For each idea, give a quick feasibility gut-check (easy/medium/hard).
+- Don't self-censor — include bold ideas alongside safe ones.
+- Consider the existing codebase: what can you leverage that's already built?
+
+Structure your output as a list of approaches, each with:
+- **Idea** — One-line summary
+- **How It Works** — 2-3 sentence explanation
+- **Leverages** — What existing code/infra it builds on
+- **Tradeoff** — What you gain vs what it costs
+- **Feasibility** — Easy / Medium / Hard with brief justification
 """ + ARTIFACT_INSTRUCTIONS
 
-COLLABORATE_SYSTEM = """\
+# --- Dynamic collaboration system prompts ---
+
+_COLLAB_BASE = """\
 You are collaborating with another AI (Claude Code) to solve a problem together.
 Claude has already analyzed the codebase and is sharing its findings with you.
 
 Your job:
-1. Read the relevant code yourself — don't just trust Claude's analysis
-2. Based on request type:
-   - feature_suggestion: Propose concrete features with implementation sketches
-   - bug_approach: Suggest debugging strategies and potential root causes
-   - code_critique: Flag issues in Claude's proposed methods/code
-   - red_team: Challenge every assumption. Find weaknesses, edge cases, failure modes.
-     Act as an adversary trying to break the implementation.
-   - verification: Independently verify that the proposed implementation is correct.
-     Check logic, data flow, error handling, and boundary conditions.
-   - testing_strategy: Suggest a comprehensive testing approach — what to test,
-     edge cases to cover, integration points to validate, and test structure.
-   - general: Provide your independent analysis and suggestions
-3. Be specific — reference files, functions, line-level details
-4. Where you AGREE with Claude's analysis, say so briefly
-5. Where you DISAGREE or see something Claude missed, explain in detail
-6. End with 2-3 concrete next steps
+1. Read the relevant code yourself — don't just trust Claude's analysis.
+2. Respond according to your assigned role below.
+3. Be specific — reference files, functions, line-level details.
+4. Where you AGREE with Claude's analysis, say so briefly.
+5. Where you DISAGREE or see something Claude missed, explain in detail.
+6. End with 2-3 concrete next steps.
+"""
+
+COLLAB_PERSONAS: dict[RequestType, str] = {
+    RequestType.BUG_APPROACH: """
+## Your Role: Diagnostic Specialist
+You are a systematic debugger helping to identify root causes.
+
+Behavioral instructions:
+- Rank hypotheses by likelihood based on the symptoms described.
+- For each hypothesis, specify an exact test (command, assertion, file check).
+- Consider: race conditions, state corruption, timing issues, env differences.
+- If the other AI's analysis points in a direction, evaluate it critically.
+- Don't suggest "add logging" unless you specify exactly WHERE and WHAT to log.
+""",
+    RequestType.RED_TEAM: """
+## Your Role: Adversarial Security Researcher
+You are trying to BREAK this implementation. Assume everything can fail.
+
+Behavioral instructions:
+- Find failure modes: concurrency bugs, input edge cases, resource exhaustion.
+- Identify attack vectors: injection, privilege escalation, data leakage.
+- Check error handling: what happens when dependencies fail?
+- Look for implicit trust: unvalidated inputs, unchecked return values.
+- Rate each finding: Critical / High / Medium / Low with exploitation scenario.
+""",
+    RequestType.VERIFICATION: """
+## Your Role: Formal Methods Engineer
+You are independently verifying that this implementation is correct.
+
+Behavioral instructions:
+- Check logic: does the code do what it claims to do?
+- Trace data flow: from input to output, what transformations happen?
+- Verify error handling: are all error paths covered? Do they recover correctly?
+- Check boundary conditions: empty inputs, max values, null/undefined, concurrent access.
+- Validate invariants: what properties must ALWAYS hold? Do they?
+""",
+    RequestType.TESTING_STRATEGY: """
+## Your Role: Test Architect
+You are designing a comprehensive testing strategy.
+
+Behavioral instructions:
+- Categorize tests: unit, integration, end-to-end, performance, security.
+- Identify critical paths that MUST have test coverage.
+- Suggest boundary conditions and edge cases specific to this implementation.
+- Propose test structure: fixtures, mocks, test data setup/teardown.
+- Prioritize: which tests give the most confidence per effort invested?
+""",
+    RequestType.CODE_CRITIQUE: """
+## Your Role: Senior Developer (Code Reviewer)
+You are reviewing code for quality, maintainability, and correctness.
+
+Behavioral instructions:
+- Check: readability, naming, separation of concerns, DRY violations.
+- Look for: anti-patterns, tech debt, performance bottlenecks, fragile code.
+- Verify: error handling, input validation, resource cleanup.
+- Assess: is this idiomatic for the language/framework? Does it follow project conventions?
+- Prioritize your feedback — lead with what matters most.
+""",
+    RequestType.FEATURE_SUGGESTION: """
+## Your Role: Product Engineer
+You are suggesting features or implementation approaches.
+
+Behavioral instructions:
+- Evaluate feasibility given the existing codebase architecture.
+- Estimate complexity: what needs to change, what can be reused?
+- Consider user impact: what does this enable, what friction does it remove?
+- Identify integration risks: what existing functionality could break?
+- Suggest a phased approach if the feature is large.
+""",
+    RequestType.GENERAL: """
+## Your Role: Collaborative Engineer
+You are a knowledgeable colleague providing analysis and suggestions.
+
+Behavioral instructions:
+- Read the other AI's analysis carefully before responding.
+- Add perspectives they may have missed.
+- Be concrete: suggest specific code, files, approaches — not abstract advice.
+- If you disagree with their analysis, explain why with evidence from the codebase.
+""",
+}
+
+
+def _build_collaborate_system(request_type: RequestType) -> str:
+    """Build a complete collaboration system prompt for the given request type."""
+    persona = COLLAB_PERSONAS.get(request_type, COLLAB_PERSONAS[RequestType.GENERAL])
+    return CODEBASE_FIRST_PREAMBLE + _COLLAB_BASE + persona + ARTIFACT_INSTRUCTIONS
+
+
+REVIEW_FILES_SYSTEM = CODEBASE_FIRST_PREAMBLE_LIGHT + """\
+## Your Role: Senior Code Reviewer
+
+You are reviewing specific files for quality, correctness, and maintainability.
+Focus your analysis on the files listed — but read surrounding code for context.
+
+Behavioral instructions:
+- Check patterns and anti-patterns specific to the language/framework.
+- Look for: bugs, unhandled errors, resource leaks, race conditions.
+- Assess naming, structure, separation of concerns, DRY compliance.
+- Verify the code follows the project's existing conventions (check other files).
+- Prioritize: critical issues first, style suggestions last.
+- Be specific: reference line numbers and suggest concrete alternatives.
+
+Structure your review per file:
+1. **Summary** — What the file does and overall quality assessment
+2. **Issues** — Bugs, risks, or correctness problems (with line references)
+3. **Improvements** — Maintainability and performance suggestions
+4. **Conventions** — Does it match the project's patterns? Deviations noted.
+""" + ARTIFACT_INSTRUCTIONS
+
+EVALUATE_SYSTEM = CODEBASE_FIRST_PREAMBLE + """\
+## Your Role: Technical Advisor
+
+You are analyzing tradeoffs between multiple approaches so the USER can make
+an informed decision. You do NOT recommend — you illuminate.
+
+Behavioral instructions:
+- For each option, analyze: complexity, performance, maintainability, risk profile.
+- Make tradeoffs EXPLICIT: what you gain vs what you lose with each approach.
+- Consider the existing codebase: which option integrates most naturally?
+- Identify hidden costs: migration effort, learning curve, operational overhead.
+- Flag irreversible decisions: which choices are hard to undo later?
+- Present a comparison matrix if there are 3+ options.
+
+Structure your analysis as:
+1. **Context** — What you found in the codebase that's relevant to this decision
+2. **Option Analysis** — For each option: how it works, what it costs, what it risks
+3. **Comparison Matrix** — Side-by-side on key dimensions
+4. **Key Tradeoff** — The single most important thing the decision-maker should weigh
+5. **What I'd Want to Know** — Questions that could change the recommendation
+""" + ARTIFACT_INSTRUCTIONS
+
+RECAP_SYSTEM = CODEBASE_FIRST_PREAMBLE_LIGHT + """\
+## Your Role: Technical Writer
+
+You are generating a concise decision record from a collaboration session
+between two AIs (Claude and Codex). The audience is a developer who needs
+to understand what was discussed, what was decided, and why.
+
+Behavioral instructions:
+- Be concise. This is a reference document, not a narrative.
+- Attribute clearly: what did CC suggest vs what did Codex suggest?
+- Focus on DECISIONS and REASONING, not process.
+- Include: what was tried, what worked, what didn't, what was adopted.
+- End with open items or next steps if any remain.
+
+Structure the record as:
+1. **Summary** — One paragraph: what was the problem and what was decided
+2. **Key Findings** — Bullet list of important discoveries (attributed)
+3. **Decision** — What approach was chosen and why
+4. **Rejected Alternatives** — What was considered and why it was dropped
+5. **Open Items** — Anything unresolved or needing follow-up
 """ + ARTIFACT_INSTRUCTIONS
 
 # ---------------------------------------------------------------------------
@@ -221,6 +421,49 @@ def _find_codex_bin() -> str:
     return "codex"  # Let it fail with a clear FileNotFoundError
 
 
+def _validate_project_dir(project_dir: Optional[str]) -> str:
+    """Validate and return project directory. Returns cwd if None.
+
+    Raises ValueError if the directory does not exist — this produces a
+    distinct error from 'codex binary not found' (FileNotFoundError).
+    """
+    cwd = project_dir or os.getcwd()
+    if not Path(cwd).is_dir():
+        raise ValueError(f"Project directory does not exist: {cwd}")
+    return cwd
+
+
+def _safe_claudex_path(
+    project_dir: str, subdir: str, filename: str
+) -> Optional[Path]:
+    """Validate and return a safe path under .claudex/{subdir}/.
+
+    Sanitizes filename, rejects path traversal attempts and symlinks.
+    Returns None if the path is invalid.
+    """
+    if "\x00" in filename:
+        logger.warning("Null byte in filename rejected: %r", filename)
+        return None
+    # Sanitize: only allow alphanumeric, underscore, hyphen, dot
+    safe_name = re.sub(r'[^a-zA-Z0-9_\-.]', '_', filename)
+    if not safe_name or safe_name.startswith('.'):
+        logger.warning("Invalid filename rejected: %r", filename)
+        return None
+    claudex_dir = Path(project_dir) / ".claudex"
+    if claudex_dir.is_symlink():
+        logger.warning("Symlink rejected at .claudex/ directory: %s", claudex_dir)
+        return None
+    base_dir = (claudex_dir / subdir).resolve()
+    target = (base_dir / safe_name).resolve()
+    if not target.is_relative_to(base_dir):
+        logger.warning("Path traversal attempt rejected: %r -> %s", filename, target)
+        return None
+    if target.is_symlink():
+        logger.warning("Symlink rejected at target: %s", target)
+        return None
+    return target
+
+
 def _cleanup_old_run_dirs(claudex_dir: Path) -> None:
     """Best-effort removal of run directories older than RUN_DIR_MAX_AGE_SECONDS."""
     if not claudex_dir.is_dir():
@@ -238,18 +481,39 @@ def _cleanup_old_run_dirs(claudex_dir: Path) -> None:
                 pass  # best-effort
 
 
+def _cleanup_old_sessions(claudex_dir: Path) -> None:
+    """Best-effort removal of session/recap files older than SESSION_MAX_AGE_SECONDS."""
+    if not claudex_dir.is_dir():
+        return
+    for subdir_name in ("sessions", "recaps"):
+        subdir = claudex_dir / subdir_name
+        if not subdir.is_dir():
+            continue
+        cutoff = time.time() - SESSION_MAX_AGE_SECONDS
+        for entry in subdir.iterdir():
+            if entry.is_symlink():
+                continue
+            try:
+                if entry.is_file() and entry.stat().st_mtime < cutoff:
+                    entry.unlink()
+                    logger.info("Cleaned up stale %s: %s", subdir_name, entry.name)
+            except OSError:
+                pass  # best-effort
+
+
 def _prepare_run_dir(project_dir: str) -> Path:
     """Create an isolated per-run artifact directory under .claudex/.
 
     Returns the Path to the run directory (e.g. <project>/.claudex/run-<uuid>/).
-    Also performs best-effort cleanup of stale run dirs and warns if .claudex
-    is not in .gitignore.
+    Also performs best-effort cleanup of stale run dirs and sessions, and warns
+    if .claudex is not in .gitignore.
     """
     root = Path(project_dir)
     claudex_dir = root / ".claudex"
 
-    # Best-effort cleanup of old runs
+    # Best-effort cleanup of old runs and sessions
     _cleanup_old_run_dirs(claudex_dir)
+    _cleanup_old_sessions(claudex_dir)
 
     # Warn if .claudex not in .gitignore
     gitignore = root / ".gitignore"
@@ -381,37 +645,160 @@ def _extract_and_save_artifacts(
     return cleaned_text, artifacts
 
 
+# --- Session management ---
+
+
+def _init_session(session_path: Path, session_id: str) -> None:
+    """Create a new session document with structured header."""
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    session_path.write_text(
+        f"# Session: {session_id}\n"
+        f"Started: {timestamp}\n"
+        f"<!-- claudex:rounds=0 -->\n\n"
+    )
+
+
+def _append_to_session(
+    session_path: Path, round_num: int, cc_analysis: str, codex_response: str
+) -> None:
+    """Append a round to an existing session document and update round count."""
+    content = session_path.read_text()
+    # Update round count in structured header
+    content = re.sub(r'<!-- claudex:rounds=\d+ -->', f'<!-- claudex:rounds={round_num} -->', content)
+    content += (
+        f"\n---\n\n"
+        f"## Round {round_num}\n\n"
+        f"### CC Analysis\n{cc_analysis}\n\n"
+        f"### Codex Response\n{codex_response}\n"
+    )
+    session_path.write_text(content)
+
+
+def _read_session_rounds(session_path: Path) -> int:
+    """Parse round count from structured header line."""
+    if not session_path.exists():
+        return 0
+    content = session_path.read_text()
+    match = re.search(r'<!-- claudex:rounds=(\d+) -->', content)
+    return int(match.group(1)) if match else 0
+
+
+def _get_truncated_session(
+    session_path: Path, max_bytes: int = SESSION_MAX_BYTES
+) -> str:
+    """Read session content, truncating oldest rounds first if over max_bytes."""
+    if not session_path.exists():
+        return ""
+    content = session_path.read_text()
+    if len(content.encode("utf-8")) <= max_bytes:
+        return content
+    # Split into header + rounds and drop oldest rounds first.
+    # _append_to_session writes "\n---\n\n## Round N\n\n..." so we split on
+    # the "---" + round heading boundary to preserve delimiters on reassembly.
+    parts = re.split(r'(\n---\n\n## Round \d+)', content)
+    # parts[0] is header, then alternating [delimiter+heading, content] pairs
+    header = parts[0]
+    rounds = []
+    for i in range(1, len(parts), 2):
+        if i + 1 < len(parts):
+            rounds.append(parts[i] + parts[i + 1])
+        else:
+            rounds.append(parts[i])
+    # Drop oldest rounds until within limit
+    while rounds and len((header + "".join(rounds)).encode("utf-8")) > max_bytes:
+        rounds.pop(0)
+    if not rounds:
+        return header[:max_bytes]
+    return header + "[Earlier rounds truncated]\n" + "".join(rounds)
+
+
+# --- File list normalization ---
+
+
+def _normalize_file_list(files_csv: str, project_dir: str) -> list[str]:
+    """Parse comma-separated file paths, resolve relative to project_dir.
+
+    Drops non-existent paths (logs warning), rejects paths outside project root.
+    Returns empty list if all invalid.
+    """
+    if not files_csv or not files_csv.strip():
+        return []
+    root = Path(project_dir).resolve()
+    result = []
+    for raw in files_csv.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        path = (root / raw).resolve()
+        if not path.is_relative_to(root):
+            logger.warning("File path outside project root rejected: %s", raw)
+            continue
+        if not path.exists():
+            logger.warning("File path does not exist, skipping: %s", raw)
+            continue
+        # Return relative path from project root
+        result.append(str(path.relative_to(root)))
+    return result
+
+
+# --- Git context ---
+
+
+async def _get_git_context(project_dir: str) -> Optional[str]:
+    """Get lightweight git state (branch + diff stat, max 20 lines).
+
+    Returns None if not a git repo or git fails. Graceful — never raises.
+    """
+    try:
+        # Check if it's a git repo
+        proc = await asyncio.create_subprocess_exec(
+            "git", "rev-parse", "--is-inside-work-tree",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=project_dir,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=2)
+        if proc.returncode != 0:
+            return None
+
+        # Get branch name
+        proc = await asyncio.create_subprocess_exec(
+            "git", "branch", "--show-current",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=project_dir,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+        branch = stdout.decode().strip() or "detached HEAD"
+
+        # Get diff stat
+        proc = await asyncio.create_subprocess_exec(
+            "git", "diff", "--stat", "HEAD",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=project_dir,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+        diff_stat = stdout.decode().strip()
+
+        lines = [f"## Recent Changes\nBranch: `{branch}`"]
+        if diff_stat:
+            diff_lines = diff_stat.split("\n")
+            if len(diff_lines) > GIT_CONTEXT_MAX_LINES:
+                remaining = len(diff_lines) - GIT_CONTEXT_MAX_LINES
+                diff_lines = diff_lines[:GIT_CONTEXT_MAX_LINES]
+                diff_lines.append(f"... ({remaining} more files)")
+            lines.append("```\n" + "\n".join(diff_lines) + "\n```")
+
+        return "\n".join(lines)
+    except (asyncio.TimeoutError, OSError):
+        return None
+
+
 # ---------------------------------------------------------------------------
-# Enums & Input Models
+# Input Models
 # ---------------------------------------------------------------------------
-
-
-class CodexModel(str, Enum):
-    """Supported Codex models (current only, retired models removed)."""
-    GPT5_3_CODEX = "gpt-5.3-codex"       # Best. Default.
-    GPT5_2_CODEX = "gpt-5.2-codex"       # Previous flagship
-    GPT5_1_CODEX = "gpt-5.1-codex"       # Long-horizon tasks
-    GPT5_CODEX = "gpt-5-codex"           # Original Codex variant
-    GPT5_CODEX_MINI = "gpt-5-codex-mini" # Cost-effective
-
-
-class ReasoningEffort(str, Enum):
-    """Codex reasoning effort levels."""
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    XHIGH = "xhigh"                      # Extra High — max reasoning depth
-
-
-class RequestType(str, Enum):
-    """Collaboration request types for codex_collab."""
-    FEATURE_SUGGESTION = "feature_suggestion"
-    BUG_APPROACH = "bug_approach"
-    CODE_CRITIQUE = "code_critique"
-    RED_TEAM = "red_team"
-    VERIFICATION = "verification"
-    TESTING_STRATEGY = "testing_strategy"
-    GENERAL = "general"
 
 
 class SecondOpinionInput(BaseModel):
@@ -425,6 +812,13 @@ class SecondOpinionInput(BaseModel):
             "Include what you're trying to accomplish and how you intend to do it."
         ),
         min_length=10,
+    )
+    user_prompt: Optional[str] = Field(
+        default=None,
+        description=(
+            "The user's original request, verbatim. Ensures Codex responds "
+            "to user intent, not just CC's interpretation."
+        ),
     )
     context: Optional[str] = Field(
         default=None,
@@ -564,6 +958,20 @@ class CollaborateInput(BaseModel):
             "'code_critique', 'red_team', 'verification', 'testing_strategy', or 'general'."
         ),
     )
+    user_prompt: Optional[str] = Field(
+        default=None,
+        description=(
+            "The user's original request, verbatim. Ensures Codex responds "
+            "to user intent, not just CC's interpretation."
+        ),
+    )
+    session_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Session ID for iterative workflows. Creates/continues a session "
+            "document in .claudex/sessions/ for shared memory across rounds."
+        ),
+    )
     files_involved: Optional[str] = Field(
         default=None,
         description="Comma-separated list of files relevant to this problem.",
@@ -594,6 +1002,13 @@ class QuickReviewInput(BaseModel):
         ),
         min_length=1,
     )
+    user_prompt: Optional[str] = Field(
+        default=None,
+        description=(
+            "The user's original request, verbatim. Ensures Codex responds "
+            "to user intent, not just CC's interpretation."
+        ),
+    )
     focus: Optional[str] = Field(
         default=None,
         description=(
@@ -612,6 +1027,78 @@ class QuickReviewInput(BaseModel):
     reasoning_effort: ReasoningEffort = Field(
         default=ReasoningEffort.MEDIUM,
         description="Reasoning depth. 'medium' is usually fine for reviews.",
+    )
+
+
+class EvaluateInput(BaseModel):
+    """Input for codex_evaluate — tradeoff analysis for user decision-making."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    options: str = Field(
+        ...,
+        description=(
+            "The options being evaluated. Describe each approach with enough detail "
+            "for analysis. Separate with clear labels (Option A, Option B, etc.)."
+        ),
+        min_length=20,
+    )
+    constraints: Optional[str] = Field(
+        default=None,
+        description="Non-negotiable requirements that any option must satisfy.",
+    )
+    priorities: Optional[str] = Field(
+        default=None,
+        description=(
+            "What the user is optimizing for (performance, maintainability, "
+            "speed to ship, cost, etc.)."
+        ),
+    )
+    context: Optional[str] = Field(
+        default=None,
+        description="Additional context about why this decision matters or what's driving it.",
+    )
+    focus_files: Optional[str] = Field(
+        default=None,
+        description="Comma-separated file/directory paths for Codex to read for codebase context.",
+    )
+    project_dir: Optional[str] = Field(
+        default=None,
+        description="Absolute path to the project directory. Defaults to cwd.",
+    )
+    model: CodexModel = Field(
+        default=CodexModel.GPT5_3_CODEX,
+        description="Codex model to use.",
+    )
+    reasoning_effort: ReasoningEffort = Field(
+        default=ReasoningEffort.HIGH,
+        description="How deeply Codex should reason.",
+    )
+
+
+class RecapInput(BaseModel):
+    """Input for codex_recap — generate a decision record from a session."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    session_id: str = Field(
+        ...,
+        description="Session ID corresponding to a document in .claudex/sessions/.",
+        min_length=1,
+    )
+    additional_context: Optional[str] = Field(
+        default=None,
+        description="Additional context about what was decided or any final outcomes.",
+    )
+    project_dir: Optional[str] = Field(
+        default=None,
+        description="Absolute path to the project directory. Defaults to cwd.",
+    )
+    model: CodexModel = Field(
+        default=CodexModel.GPT5_3_CODEX,
+        description="Codex model to use.",
+    )
+    reasoning_effort: ReasoningEffort = Field(
+        default=ReasoningEffort.MEDIUM,
+        description="Reasoning depth. 'medium' is usually fine for recaps.",
     )
 
 
@@ -640,8 +1127,14 @@ async def _run_codex(
       -c model_reasoning_summary  -> Gets chain-of-thought reasoning
       --cd <dir>                  -> Working directory (project root)
     """
-    cwd = project_dir or os.getcwd()
+    # Validate project directory (distinct error from codex binary not found)
+    try:
+        cwd = _validate_project_dir(project_dir)
+    except ValueError as e:
+        return f"{ERROR_PREFIX}{e}"
+
     codex_bin = _find_codex_bin()
+    start_time = time.monotonic()
 
     cmd = [
         codex_bin, "exec",
@@ -671,14 +1164,19 @@ async def _run_codex(
             proc.communicate(), timeout=timeout
         )
     except asyncio.TimeoutError:
-        proc.kill()
+        try:
+            proc.kill()
+            await proc.communicate()  # Drain pipes to avoid zombies
+        except (ProcessLookupError, OSError):
+            pass  # Process already exited
         return (
-            f"Error: Codex timed out after {timeout}s. "
-            "Try simplifying the prompt or reducing reasoning_effort."
+            f"{ERROR_PREFIX}Codex timed out after {timeout}s. "
+            "Try: (1) focus_files to narrow scope, (2) simpler prompt, "
+            "(3) lower reasoning_effort to 'medium'."
         )
     except FileNotFoundError:
         return (
-            "Error: Codex CLI not found. Install it with:\n"
+            f"{ERROR_PREFIX}Codex CLI not found. Install it with:\n"
             "  npm i -g @openai/codex\n"
             "Then authenticate:\n"
             "  codex login"
@@ -688,24 +1186,27 @@ async def _run_codex(
         err_msg = stderr.decode(errors="replace").strip()
         if "not authenticated" in err_msg.lower() or "login" in err_msg.lower():
             return (
-                "Error: Codex is not authenticated. Run:\n"
+                f"{ERROR_PREFIX}Codex is not authenticated. Run:\n"
                 "  codex login\n"
                 "to sign in with your ChatGPT subscription."
             )
-        if "rate limit" in err_msg.lower():
+        if "rate limit" in err_msg.lower() or "429" in err_msg:
             return (
-                "Error: Codex rate limit reached. Your ChatGPT subscription has "
-                "per-window message limits. Wait a few minutes and try again, "
-                "or consider using a lighter model (gpt-5-codex-mini)."
+                f"{ERROR_PREFIX}Codex rate limit reached. Your ChatGPT subscription has "
+                "per-window message limits (resets every ~5 hours). "
+                "Try a lighter model: gpt-5-codex-mini."
             )
-        return f"Error: Codex exited with code {proc.returncode}.\nStderr: {err_msg}"
+        return f"{ERROR_PREFIX}Codex exited with code {proc.returncode}.\nStderr: {err_msg}"
 
     output = stdout.decode(errors="replace").strip()
     if not output:
         fallback = stderr.decode(errors="replace").strip()
         if fallback:
             return fallback
-        return "Codex returned no output. The prompt may need to be more specific."
+        return (
+            f"{ERROR_PREFIX}Codex returned no output. "
+            "Try being more specific or provide focus_files to direct attention."
+        )
 
     # --- Artifact extraction ---
     # Create a per-run directory and extract any artifact blocks from the
@@ -734,6 +1235,10 @@ async def _run_codex(
     except OSError as exc:
         logger.warning("Artifact directory setup failed: %s", exc)
         cleaned_output = output  # Fall back to raw output
+
+    # Append metadata footer AFTER artifact extraction (Enhancement D+G)
+    elapsed = time.monotonic() - start_time
+    cleaned_output += f"\n\n---\n_Codex: {model}, {reasoning_effort}, {elapsed:.0f}s_"
 
     return cleaned_output
 
@@ -768,16 +1273,33 @@ async def codex_review(params: SecondOpinionInput) -> str:
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     Read them when referenced in the output.
     """
-    parts = [SECOND_OPINION_SYSTEM, "\n---\n", f"## Proposed Plan\n{params.plan}"]
+    cwd = params.project_dir or os.getcwd()
+    parts = [SECOND_OPINION_SYSTEM, "\n---\n"]
+
+    if params.user_prompt:
+        parts.append(
+            "## Original User Request (verbatim)\n"
+            "```\n"
+            f"{params.user_prompt}\n"
+            "```\n"
+        )
+
+    parts.append(f"## Proposed Plan\n{params.plan}")
 
     if params.context:
         parts.append(f"\n## Additional Context\n{params.context}")
 
     if params.focus_files:
-        parts.append(
-            f"\n## Key Files to Examine\n"
-            f"Pay special attention to: {params.focus_files}"
-        )
+        normalized = _normalize_file_list(params.focus_files, cwd)
+        if normalized:
+            parts.append(
+                f"\n## Key Files to Examine\n"
+                f"Pay special attention to: {', '.join(normalized)}"
+            )
+
+    git_ctx = await _get_git_context(cwd)
+    if git_ctx:
+        parts.append(f"\n{git_ctx}")
 
     parts.append(
         "\nNow read the codebase and provide your second opinion on this plan."
@@ -785,7 +1307,7 @@ async def codex_review(params: SecondOpinionInput) -> str:
 
     return await _run_codex(
         "\n".join(parts),
-        project_dir=params.project_dir,
+        project_dir=cwd,
         model=params.model.value,
         reasoning_effort=params.reasoning_effort.value,
     )
@@ -814,6 +1336,7 @@ async def codex_plan(params: ParallelPlanInput) -> str:
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     Read them when referenced in the output.
     """
+    cwd = params.project_dir or os.getcwd()
     parts = [PARALLEL_PLAN_SYSTEM, "\n---\n"]
 
     if params.user_prompt:
@@ -830,10 +1353,16 @@ async def codex_plan(params: ParallelPlanInput) -> str:
         parts.append(f"\n## Constraints\n{params.constraints}")
 
     if params.focus_files:
-        parts.append(
-            f"\n## Relevant Files\n"
-            f"Start by reading: {params.focus_files}"
-        )
+        normalized = _normalize_file_list(params.focus_files, cwd)
+        if normalized:
+            parts.append(
+                f"\n## Relevant Files\n"
+                f"Start by reading: {', '.join(normalized)}"
+            )
+
+    git_ctx = await _get_git_context(cwd)
+    if git_ctx:
+        parts.append(f"\n{git_ctx}")
 
     parts.append(
         "\nRead the codebase, then produce YOUR independent plan. "
@@ -842,7 +1371,7 @@ async def codex_plan(params: ParallelPlanInput) -> str:
 
     return await _run_codex(
         "\n".join(parts),
-        project_dir=params.project_dir,
+        project_dir=cwd,
         model=params.model.value,
         reasoning_effort=params.reasoning_effort.value,
     )
@@ -870,6 +1399,7 @@ async def codex_brainstorm(params: BrainstormInput) -> str:
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     Read them when referenced in the output.
     """
+    cwd = params.project_dir or os.getcwd()
     parts = [BRAINSTORM_SYSTEM, "\n---\n"]
 
     if params.user_prompt:
@@ -885,6 +1415,10 @@ async def codex_brainstorm(params: BrainstormInput) -> str:
     if params.context:
         parts.append(f"\n## Context & Constraints\n{params.context}")
 
+    git_ctx = await _get_git_context(cwd)
+    if git_ctx:
+        parts.append(f"\n{git_ctx}")
+
     parts.append(
         "\nExplore this broadly. Suggest multiple approaches with trade-offs. "
         "Reference specific files and patterns in the codebase."
@@ -892,7 +1426,7 @@ async def codex_brainstorm(params: BrainstormInput) -> str:
 
     return await _run_codex(
         "\n".join(parts),
-        project_dir=params.project_dir,
+        project_dir=cwd,
         model=params.model.value,
         reasoning_effort=params.reasoning_effort.value,
     )
@@ -924,22 +1458,62 @@ async def codex_collab(params: CollaborateInput) -> str:
     - testing_strategy: Suggest what to test, edge cases, and test structure
     - general: Provide independent analysis and suggestions
 
+    Pass session_id for iterative workflows — creates/continues a session
+    document in .claudex/sessions/ for shared memory across rounds.
+    Sessions terminate after 4 rounds.
+
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     Read them when referenced in the output.
     """
-    parts = [
-        COLLABORATE_SYSTEM,
-        "\n---\n",
-        f"## Request Type\n{params.request_type.value}",
-        f"\n## Problem\n{params.problem}",
-        f"\n## Claude Code's Analysis\n{params.cc_analysis}",
-    ]
+    cwd = params.project_dir or os.getcwd()
+
+    # --- Session management: check round cap ---
+    session_path = None
+    session_context = ""
+    if params.session_id:
+        session_path = _safe_claudex_path(cwd, "sessions", f"{params.session_id}.md")
+        if session_path is None:
+            return f"{ERROR_PREFIX}Invalid session_id — contains unsafe characters."
+        if session_path.exists():
+            rounds = _read_session_rounds(session_path)
+            if rounds >= MAX_SESSION_ROUNDS:
+                return (
+                    f"{ERROR_PREFIX}Session '{params.session_id}' has reached the maximum "
+                    f"of {MAX_SESSION_ROUNDS} rounds. Start a new session or use "
+                    "codex_recap to generate a summary of this one."
+                )
+            session_context = _get_truncated_session(session_path)
+
+    # --- Build prompt ---
+    system_prompt = _build_collaborate_system(params.request_type)
+    parts = [system_prompt, "\n---\n"]
+
+    if params.user_prompt:
+        parts.append(
+            "## Original User Request (verbatim)\n"
+            "```\n"
+            f"{params.user_prompt}\n"
+            "```\n"
+        )
+
+    parts.append(f"## Request Type\n{params.request_type.value}")
+    parts.append(f"\n## Problem\n{params.problem}")
+    parts.append(f"\n## Claude Code's Analysis\n{params.cc_analysis}")
 
     if params.files_involved:
-        parts.append(
-            f"\n## Files Involved\n"
-            f"Read these files for context: {params.files_involved}"
-        )
+        normalized = _normalize_file_list(params.files_involved, cwd)
+        if normalized:
+            parts.append(
+                f"\n## Files Involved\n"
+                f"Read these files for context: {', '.join(normalized)}"
+            )
+
+    if session_context:
+        parts.append(f"\n## Previous Rounds\n{session_context}")
+
+    git_ctx = await _get_git_context(cwd)
+    if git_ctx:
+        parts.append(f"\n{git_ctx}")
 
     parts.append(
         "\nRead the relevant code yourself, then respond based on the request type. "
@@ -947,12 +1521,33 @@ async def codex_collab(params: CollaborateInput) -> str:
         "End with 2-3 concrete next steps."
     )
 
-    return await _run_codex(
+    result = await _run_codex(
         "\n".join(parts),
-        project_dir=params.project_dir,
+        project_dir=cwd,
         model=params.model.value,
         reasoning_effort=params.reasoning_effort.value,
     )
+
+    # --- Update session document ---
+    if params.session_id and session_path is not None and not result.startswith(ERROR_PREFIX):
+        try:
+            if not session_path.exists():
+                _init_session(session_path, params.session_id)
+            # Strip metadata footer before writing to session (avoid polluting context)
+            session_result = result
+            if "\n\n---\n_Codex:" in session_result:
+                session_result = session_result.rsplit("\n\n---\n_Codex:", 1)[0]
+            rounds = _read_session_rounds(session_path) + 1
+            _append_to_session(session_path, rounds, params.cc_analysis, session_result)
+            result += (
+                f"\n\nSession document updated: "
+                f".claudex/sessions/{session_path.name} "
+                f"(Round {rounds}/{MAX_SESSION_ROUNDS})"
+            )
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning("Session update failed: %s", exc)
+
+    return result
 
 
 @mcp.tool(
@@ -975,24 +1570,166 @@ async def codex_review_files(params: QuickReviewInput) -> str:
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     Read them when referenced in the output.
     """
-    focus_instruction = ""
-    if params.focus:
-        focus_instruction = f"Focus specifically on: {params.focus}\n"
+    cwd = params.project_dir or os.getcwd()
 
-    prompt = (
-        f"Review the following files in this codebase: {params.files}\n"
-        f"{focus_instruction}"
-        "Provide specific, actionable feedback. Reference line numbers where possible. "
-        "Don't list things that are fine — focus on what needs attention."
-        + ARTIFACT_INSTRUCTIONS
+    normalized = _normalize_file_list(params.files, cwd)
+    if not normalized:
+        return f"{ERROR_PREFIX}No valid files to review. Check the file paths and try again."
+
+    parts = [REVIEW_FILES_SYSTEM, "\n---\n"]
+
+    if params.user_prompt:
+        parts.append(
+            "## Original User Request (verbatim)\n"
+            "```\n"
+            f"{params.user_prompt}\n"
+            "```\n"
+        )
+
+    parts.append(f"## Files to Review\n{', '.join(normalized)}")
+
+    if params.focus:
+        parts.append(f"\n## Review Focus\n{params.focus}")
+
+    git_ctx = await _get_git_context(cwd)
+    if git_ctx:
+        parts.append(f"\n{git_ctx}")
+
+    parts.append(
+        "\nReview these files. Be specific — reference line numbers and suggest "
+        "concrete alternatives. Don't list things that are fine — focus on what needs attention."
     )
 
     return await _run_codex(
-        prompt,
-        project_dir=params.project_dir,
+        "\n".join(parts),
+        project_dir=cwd,
         model=params.model.value,
         reasoning_effort=params.reasoning_effort.value,
     )
+
+
+@mcp.tool(
+    name="codex_evaluate",
+    annotations={
+        "title": "Codex Evaluate — Tradeoff Analysis",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def codex_evaluate(params: EvaluateInput) -> str:
+    """Codex analyzes tradeoffs between approaches so the USER can decide.
+
+    Unlike other tools, this does NOT recommend — it illuminates tradeoffs.
+    CC should present both its own analysis AND Codex's analysis to the user,
+    who makes the final call. Never arbitrate on the user's behalf.
+
+    Use this when there are 2+ viable approaches and the choice depends on
+    priorities, constraints, or preferences that only the user knows.
+
+    Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
+    Read them when referenced in the output.
+    """
+    cwd = params.project_dir or os.getcwd()
+    parts = [EVALUATE_SYSTEM, "\n---\n"]
+
+    parts.append(f"## Decision to Evaluate\n{params.options}")
+
+    if params.constraints:
+        parts.append(f"\n## Constraints\n{params.constraints}")
+
+    if params.priorities:
+        parts.append(f"\n## Priorities\n{params.priorities}")
+
+    if params.context:
+        parts.append(f"\n## Context\n{params.context}")
+
+    if params.focus_files:
+        normalized = _normalize_file_list(params.focus_files, cwd)
+        if normalized:
+            parts.append(f"\n## Relevant Files\n{', '.join(normalized)}")
+
+    git_ctx = await _get_git_context(cwd)
+    if git_ctx:
+        parts.append(f"\n{git_ctx}")
+
+    parts.append(
+        "\nAnalyze each option's tradeoffs. Do NOT recommend — "
+        "illuminate the decision so the user can choose."
+    )
+
+    return await _run_codex(
+        "\n".join(parts),
+        project_dir=cwd,
+        model=params.model.value,
+        reasoning_effort=params.reasoning_effort.value,
+    )
+
+
+@mcp.tool(
+    name="codex_recap",
+    annotations={
+        "title": "Codex Recap — Decision Record",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def codex_recap(params: RecapInput) -> str:
+    """Generate a concise decision record from a collaboration session.
+
+    Use after multi-round debugging, planning, or evaluation sessions to
+    capture what was discussed, what was decided, and why. The record
+    attributes findings to each model (CC vs Codex) for accountability.
+
+    Requires a session_id that corresponds to an existing session document
+    in .claudex/sessions/. The generated recap is saved to .claudex/recaps/.
+    """
+    cwd = params.project_dir or os.getcwd()
+
+    # Read session document
+    session_path = _safe_claudex_path(cwd, "sessions", f"{params.session_id}.md")
+    if session_path is None:
+        return f"{ERROR_PREFIX}Invalid session_id — contains unsafe characters."
+    if not session_path.exists():
+        return f"{ERROR_PREFIX}Session '{params.session_id}' not found in .claudex/sessions/."
+
+    session_content = _get_truncated_session(session_path)
+    if not session_content:
+        return f"{ERROR_PREFIX}Session '{params.session_id}' exists but is empty or unreadable."
+
+    parts = [RECAP_SYSTEM, "\n---\n"]
+    parts.append(f"## Session Log\n{session_content}")
+
+    if params.additional_context:
+        parts.append(f"\n## Additional Context\n{params.additional_context}")
+
+    parts.append(
+        "\nGenerate a concise decision record. Attribute findings clearly "
+        "(CC vs Codex). Focus on decisions and reasoning, not process."
+    )
+
+    result = await _run_codex(
+        "\n".join(parts),
+        project_dir=cwd,
+        model=params.model.value,
+        reasoning_effort=params.reasoning_effort.value,
+    )
+
+    # Save recap to .claudex/recaps/
+    if not result.startswith(ERROR_PREFIX):
+        recap_path = _safe_claudex_path(cwd, "recaps", f"{params.session_id}_recap.md")
+        if recap_path:
+            try:
+                recap_path.parent.mkdir(parents=True, exist_ok=True)
+                recap_path.write_text(result)
+                result += f"\n\nDecision record saved to: .claudex/recaps/{recap_path.name}"
+            except OSError as exc:
+                logger.warning("Recap save failed: %s", exc)
+
+    return result
 
 
 @mcp.tool(
@@ -1007,8 +1744,8 @@ async def codex_review_files(params: QuickReviewInput) -> str:
 )
 async def codex_ping() -> str:
     """Test that Codex CLI is installed, authenticated, and working."""
-    codex_path = shutil.which("codex")
-    if not codex_path:
+    codex_path = _find_codex_bin()
+    if codex_path == "codex" and not shutil.which("codex"):
         return (
             "Codex CLI not found in PATH.\n"
             "Install: npm i -g @openai/codex\n"
@@ -1021,6 +1758,7 @@ async def codex_ping() -> str:
             "--sandbox", "read-only",
             "--skip-git-repo-check",
             "--color", "never",
+            "-m", "gpt-5-codex-mini",
             "Say 'pong' and nothing else.",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -1028,7 +1766,7 @@ async def codex_ping() -> str:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
     except asyncio.TimeoutError:
         return "Codex CLI found but timed out. Check your internet connection."
-    except Exception as e:
+    except (OSError, asyncio.TimeoutError) as e:
         return f"Codex CLI found at {codex_path} but failed to run: {e}"
 
     if proc.returncode == 0:
