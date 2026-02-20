@@ -278,6 +278,10 @@ Claudex/
 | Empty response | Be more specific about the task |
 | Tools not showing | Check `/mcp`, restart CC session |
 
+## Author
+
+Created by **Omri Tal** — [GitHub](https://github.com/OmriT123)
+
 ## License
 
 MIT

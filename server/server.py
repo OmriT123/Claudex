@@ -2408,6 +2408,7 @@ async def codex_status(params: StatusInput) -> str:
         except (OSError, ValueError):
             pass
     lines.append(f"Plugin:        v{plugin_version}")
+    lines.append(f"Author:        Omri Tal (github.com/OmriT123)")
 
     # --- Sessions ---
     claudex_dir = Path(cwd) / ".claudex"
