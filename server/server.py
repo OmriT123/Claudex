@@ -51,7 +51,15 @@ from pydantic import BaseModel, Field, ConfigDict
 
 DEFAULT_MODEL = "gpt-5.3-codex"
 DEFAULT_REASONING_EFFORT = "high"
-EXEC_TIMEOUT_SECONDS = 600  # 10 min max per Codex call
+EXEC_TIMEOUT_SECONDS = 1200  # 20 min max per Codex call
+
+DEFAULT_REASONING_SUMMARY = "detailed"
+EFFORT_DOWNGRADE = {"xhigh": "high", "high": "medium"}
+TOOL_TIMEOUTS = {
+    "codex_review": 1200, "codex_plan": 1200, "codex_brainstorm": 900,
+    "codex_collab": 1200, "codex_review_files": 300, "codex_evaluate": 1200,
+    "codex_recap": 600, "codex_review_diff": 600,
+}
 
 FINAL_ANSWER_DELIMITER = "---FINAL-ANSWER---"
 ARTIFACT_MAX_BYTES = 100 * 1024  # 100 KB per artifact
@@ -375,12 +383,78 @@ Structure the record as:
 5. **Open Items** — Anything unresolved or needing follow-up
 """ + ARTIFACT_INSTRUCTIONS
 
+REVIEW_DIFF_SYSTEM = CODEBASE_FIRST_PREAMBLE_LIGHT + """\
+## Your Role: Diff Reviewer
+
+You are reviewing a git diff — the actual changes about to be committed or recently made.
+Focus on what CHANGED, not the entire file.
+
+Behavioral instructions:
+- Look for bugs INTRODUCED by the diff, not pre-existing issues.
+- Check: logic errors, missing error handling, incomplete refactors, broken imports.
+- Verify: are all changed code paths tested? Are there edge cases in the new logic?
+- Assess: does the diff maintain consistency with surrounding code patterns?
+- Flag: any security implications of the changes (new inputs, auth changes, etc.).
+
+Structure your review as:
+1. **Overview** — What this diff does (1-2 sentences)
+2. **Critical Issues** — Bugs or risks introduced by these changes
+3. **Warnings** — Things that might cause problems later
+4. **Suggestions** — Improvements to the changed code
+5. **Verdict** — Ship / Fix first / Needs discussion
+""" + ARTIFACT_INSTRUCTIONS
+
+# Diff review constants
+DIFF_MAX_BYTES = 50_000
+DIFF_MAX_FILES = 50
+GIT_CONTEXT_STAGED_DIFF_MAX = 5_000
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("claudex")
+
+# ---------------------------------------------------------------------------
+# In-memory metrics (reset on server restart)
+# ---------------------------------------------------------------------------
+
+_metrics: dict[str, dict] = {}
+
+
+def _record_metric(tool_name: str, *, success: bool, elapsed: float, timed_out: bool = False) -> None:
+    """Record a metric for a tool invocation."""
+    if not tool_name:
+        return
+    if tool_name not in _metrics:
+        _metrics[tool_name] = {"calls": 0, "successes": 0, "timeouts": 0, "errors": 0, "total_elapsed": 0.0}
+    m = _metrics[tool_name]
+    m["calls"] += 1
+    m["total_elapsed"] += elapsed
+    if timed_out:
+        m["timeouts"] += 1
+    elif success:
+        m["successes"] += 1
+    else:
+        m["errors"] += 1
+
+
+def _get_metrics_summary() -> str:
+    """Format metrics as a readable table for codex_status."""
+    if not _metrics:
+        return "No tool invocations recorded yet."
+    lines = [f"{'Tool':<22s} {'Calls':>5s} {'OK':>4s} {'Err':>4s} {'T/O':>4s} {'Avg(s)':>7s}"]
+    lines.append("-" * 50)
+    for tool_name in sorted(_metrics):
+        m = _metrics[tool_name]
+        avg = m["total_elapsed"] / m["calls"] if m["calls"] else 0
+        lines.append(
+            f"{tool_name:<22s} {m['calls']:>5d} {m['successes']:>4d} "
+            f"{m['errors']:>4d} {m['timeouts']:>4d} {avg:>7.1f}"
+        )
+    return "\n".join(lines)
+
 
 # ---------------------------------------------------------------------------
 # Server
@@ -714,6 +788,15 @@ def _get_truncated_session(
     return header + "[Earlier rounds truncated]\n" + "".join(rounds)
 
 
+def _chain_session_id(session_id: str) -> str:
+    """Chain a session ID: 'my-session' -> 'my-session-p2' -> 'my-session-p3'."""
+    match = re.match(r'^(.*)-p(\d+)$', session_id)
+    if match:
+        base, num = match.group(1), int(match.group(2))
+        return f"{base}-p{num + 1}"
+    return f"{session_id}-p2"
+
+
 # --- File list normalization ---
 
 
@@ -792,6 +875,33 @@ async def _get_git_context(project_dir: str) -> Optional[str]:
                 diff_lines.append(f"... ({remaining} more files)")
             lines.append("```\n" + "\n".join(diff_lines) + "\n```")
 
+        # Recent commit messages
+        proc = await asyncio.create_subprocess_exec(
+            "git", "log", "--oneline", "-5",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=project_dir,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+        recent_commits = stdout.decode().strip()
+        if recent_commits:
+            lines.append(f"Recent commits:\n```\n{recent_commits}\n```")
+
+        # Staged changes stat
+        proc = await asyncio.create_subprocess_exec(
+            "git", "diff", "--staged", "--stat",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=project_dir,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+        staged_stat = stdout.decode().strip()
+        if staged_stat:
+            # Cap staged stat output
+            if len(staged_stat.encode("utf-8")) > GIT_CONTEXT_STAGED_DIFF_MAX:
+                staged_stat = staged_stat.encode("utf-8")[:GIT_CONTEXT_STAGED_DIFF_MAX].decode("utf-8", errors="ignore") + "\n... [truncated]"
+            lines.append(f"Staged changes:\n```\n{staged_stat}\n```")
+
         return "\n".join(lines)
     except (asyncio.TimeoutError, OSError):
         return None
@@ -846,6 +956,22 @@ class SecondOpinionInput(BaseModel):
         default=ReasoningEffort.HIGH,
         description="How deeply Codex should reason. Use 'xhigh' for maximum depth (slower).",
     )
+    model: Optional[str] = Field(
+        default=None,
+        description="Override the default Codex model for this call.",
+        pattern=r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$',
+    )
+    timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=30,
+        le=1800,
+        description="Override timeout in seconds (30-1800). Defaults to per-tool setting.",
+    )
+    reasoning_summary: Optional[str] = Field(
+        default=None,
+        description="Override reasoning summary mode (e.g. 'detailed', 'concise', 'none').",
+        pattern=r'^[a-z]{2,20}$',
+    )
 
 
 class ParallelPlanInput(BaseModel):
@@ -890,6 +1016,22 @@ class ParallelPlanInput(BaseModel):
         default=ReasoningEffort.HIGH,
         description="How deeply Codex should reason. Use 'xhigh' for maximum depth (slower).",
     )
+    model: Optional[str] = Field(
+        default=None,
+        description="Override the default Codex model for this call.",
+        pattern=r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$',
+    )
+    timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=30,
+        le=1800,
+        description="Override timeout in seconds (30-1800). Defaults to per-tool setting.",
+    )
+    reasoning_summary: Optional[str] = Field(
+        default=None,
+        description="Override reasoning summary mode (e.g. 'detailed', 'concise', 'none').",
+        pattern=r'^[a-z]{2,20}$',
+    )
 
 
 class BrainstormInput(BaseModel):
@@ -923,6 +1065,22 @@ class BrainstormInput(BaseModel):
     reasoning_effort: ReasoningEffort = Field(
         default=ReasoningEffort.HIGH,
         description="How deeply Codex should reason. Use 'xhigh' for maximum depth (slower).",
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Override the default Codex model for this call.",
+        pattern=r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$',
+    )
+    timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=30,
+        le=1800,
+        description="Override timeout in seconds (30-1800). Defaults to per-tool setting.",
+    )
+    reasoning_summary: Optional[str] = Field(
+        default=None,
+        description="Override reasoning summary mode (e.g. 'detailed', 'concise', 'none').",
+        pattern=r'^[a-z]{2,20}$',
     )
 
 
@@ -974,6 +1132,22 @@ class CollaborateInput(BaseModel):
         default=ReasoningEffort.HIGH,
         description="How deeply Codex should reason. Use 'xhigh' for maximum depth (slower).",
     )
+    model: Optional[str] = Field(
+        default=None,
+        description="Override the default Codex model for this call.",
+        pattern=r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$',
+    )
+    timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=30,
+        le=1800,
+        description="Override timeout in seconds (30-1800). Defaults to per-tool setting.",
+    )
+    reasoning_summary: Optional[str] = Field(
+        default=None,
+        description="Override reasoning summary mode (e.g. 'detailed', 'concise', 'none').",
+        pattern=r'^[a-z]{2,20}$',
+    )
 
 
 class QuickReviewInput(BaseModel):
@@ -1009,6 +1183,22 @@ class QuickReviewInput(BaseModel):
     reasoning_effort: ReasoningEffort = Field(
         default=ReasoningEffort.MEDIUM,
         description="Reasoning depth. 'medium' is usually fine for reviews.",
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Override the default Codex model for this call.",
+        pattern=r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$',
+    )
+    timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=30,
+        le=1800,
+        description="Override timeout in seconds (30-1800). Defaults to per-tool setting.",
+    )
+    reasoning_summary: Optional[str] = Field(
+        default=None,
+        description="Override reasoning summary mode (e.g. 'detailed', 'concise', 'none').",
+        pattern=r'^[a-z]{2,20}$',
     )
 
 
@@ -1051,6 +1241,22 @@ class EvaluateInput(BaseModel):
         default=ReasoningEffort.HIGH,
         description="How deeply Codex should reason.",
     )
+    model: Optional[str] = Field(
+        default=None,
+        description="Override the default Codex model for this call.",
+        pattern=r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$',
+    )
+    timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=30,
+        le=1800,
+        description="Override timeout in seconds (30-1800). Defaults to per-tool setting.",
+    )
+    reasoning_summary: Optional[str] = Field(
+        default=None,
+        description="Override reasoning summary mode (e.g. 'detailed', 'concise', 'none').",
+        pattern=r'^[a-z]{2,20}$',
+    )
 
 
 class RecapInput(BaseModel):
@@ -1073,6 +1279,63 @@ class RecapInput(BaseModel):
     reasoning_effort: ReasoningEffort = Field(
         default=ReasoningEffort.MEDIUM,
         description="Reasoning depth. 'medium' is usually fine for recaps.",
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Override the default Codex model for this call.",
+        pattern=r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$',
+    )
+    timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=30,
+        le=1800,
+        description="Override timeout in seconds (30-1800). Defaults to per-tool setting.",
+    )
+    reasoning_summary: Optional[str] = Field(
+        default=None,
+        description="Override reasoning summary mode (e.g. 'detailed', 'concise', 'none').",
+        pattern=r'^[a-z]{2,20}$',
+    )
+
+
+class ReviewDiffInput(BaseModel):
+    """Input for codex_review_diff — review git diff changes."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    focus: Optional[str] = Field(
+        default=None,
+        description="What to focus the review on: 'security', 'performance', 'correctness', or a custom area.",
+    )
+    staged: bool = Field(
+        default=False,
+        description="If True, review only staged changes (git diff --staged). If False, review all unstaged changes.",
+    )
+    context: Optional[str] = Field(
+        default=None,
+        description="Additional context about what these changes are for.",
+    )
+    user_prompt: Optional[str] = Field(
+        default=None,
+        description="The user's original request, verbatim.",
+    )
+    project_dir: Optional[str] = Field(
+        default=None,
+        description="Absolute path to the project directory. Defaults to cwd.",
+    )
+    reasoning_effort: ReasoningEffort = Field(
+        default=ReasoningEffort.MEDIUM,
+        description="Reasoning depth. 'medium' is usually fine for diff reviews.",
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Override the default Codex model.",
+        pattern=r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$',
+    )
+    timeout_seconds: Optional[int] = Field(default=None, ge=30, le=1800, description="Override timeout.")
+    reasoning_summary: Optional[str] = Field(
+        default=None,
+        description="Override reasoning summary mode.",
+        pattern=r'^[a-z]{2,20}$',
     )
 
 
@@ -1180,16 +1443,21 @@ class StatusInput(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-async def _run_codex(
+async def _run_codex_once(
     prompt: str,
     *,
     project_dir: Optional[str] = None,
     model: str = DEFAULT_MODEL,
     reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+    reasoning_summary: str = DEFAULT_REASONING_SUMMARY,
     timeout: int = EXEC_TIMEOUT_SECONDS,
+    tool_name: str = "",
 ) -> str:
     """
     Run Codex CLI in non-interactive, read-only mode and return the output.
+
+    This is the low-level runner. Use ``_run_codex`` for the wrapper with
+    metrics, auto-retry on timeout, and version check.
 
     Uses ``codex`` with:
       --sandbox read-only         -> Codex can read the repo but cannot edit or run commands
@@ -1207,7 +1475,6 @@ async def _run_codex(
         return f"{ERROR_PREFIX}{e}"
 
     codex_bin = _find_codex_bin()
-    start_time = time.monotonic()
 
     cmd = [
         codex_bin, "exec",
@@ -1216,14 +1483,14 @@ async def _run_codex(
         "--color", "never",
         "-m", model,
         "-c", f"model_reasoning_effort={reasoning_effort}",
-        "-c", "model_reasoning_summary=detailed",
+        "-c", f"model_reasoning_summary={reasoning_summary}",
         "--cd", cwd,
         prompt,
     ]
 
     logger.info(
-        "Running Codex: model=%s effort=%s cwd=%s",
-        model, reasoning_effort, cwd,
+        "Running Codex: model=%s effort=%s summary=%s tool=%s cwd=%s",
+        model, reasoning_effort, reasoning_summary, tool_name, cwd,
     )
 
     try:
@@ -1309,16 +1576,87 @@ async def _run_codex(
         logger.warning("Artifact directory setup failed: %s", exc)
         cleaned_output = output  # Fall back to raw output
 
-    # Append metadata footer AFTER artifact extraction (Enhancement D+G)
+    return cleaned_output
+
+
+async def _run_codex(
+    prompt: str,
+    *,
+    project_dir: Optional[str] = None,
+    model: str = DEFAULT_MODEL,
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+    reasoning_summary: str = DEFAULT_REASONING_SUMMARY,
+    timeout: int = EXEC_TIMEOUT_SECONDS,
+    tool_name: str = "",
+) -> str:
+    """
+    High-level Codex runner with metrics, auto-retry on timeout, and version check.
+
+    Wraps ``_run_codex_once`` and adds:
+      - Metrics recording (success/timeout/error + elapsed time)
+      - Auto-downgrade on timeout (xhigh->high, high->medium) with one retry
+      - Version check warning on first invocation
+    """
+    start_time = time.monotonic()
+
+    result = await _run_codex_once(
+        prompt,
+        project_dir=project_dir,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        reasoning_summary=reasoning_summary,
+        timeout=timeout,
+        tool_name=tool_name,
+    )
+
     elapsed = time.monotonic() - start_time
-    cleaned_output += f"\n\n---\n_Codex: {model}, {reasoning_effort}, {elapsed:.0f}s_"
+    timed_out = result.startswith(ERROR_PREFIX) and "timed out" in result
+    success = not result.startswith(ERROR_PREFIX)
+
+    _record_metric(tool_name, success=success, elapsed=elapsed, timed_out=timed_out)
+
+    # Auto-retry with downgraded effort on timeout
+    if timed_out and reasoning_effort in EFFORT_DOWNGRADE:
+        downgraded = EFFORT_DOWNGRADE[reasoning_effort]
+        logger.info(
+            "Timeout at effort=%s, retrying with effort=%s for tool=%s",
+            reasoning_effort, downgraded, tool_name,
+        )
+        retry_start = time.monotonic()
+        result = await _run_codex_once(
+            prompt,
+            project_dir=project_dir,
+            model=model,
+            reasoning_effort=downgraded,
+            reasoning_summary=reasoning_summary,
+            timeout=timeout,
+            tool_name=tool_name,
+        )
+        retry_elapsed = time.monotonic() - retry_start
+        retry_timed_out = result.startswith(ERROR_PREFIX) and "timed out" in result
+        retry_success = not result.startswith(ERROR_PREFIX)
+
+        _record_metric(tool_name, success=retry_success, elapsed=retry_elapsed, timed_out=retry_timed_out)
+
+        if retry_success:
+            result = (
+                f"**Note:** Original call timed out at {reasoning_effort}. "
+                f"Auto-retried with {downgraded}.\n\n"
+            ) + result
+            # Update for metadata footer
+            elapsed = time.monotonic() - start_time
+            reasoning_effort = downgraded
+
+    # Append metadata footer
+    if not result.startswith(ERROR_PREFIX):
+        result += f"\n\n---\n_Codex: {model}, {reasoning_effort}, {elapsed:.0f}s_"
 
     # Version check — prepend warning on first invocation only
     version_warning = await _check_codex_version(consume=True)
     if version_warning:
-        cleaned_output = version_warning + "\n" + cleaned_output
+        result = version_warning + "\n" + result
 
-    return cleaned_output
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1383,11 +1721,18 @@ async def codex_review(params: SecondOpinionInput) -> str:
         "\nNow read the codebase and provide your second opinion on this plan."
     )
 
+    effective_model = params.model or DEFAULT_MODEL
+    effective_timeout = params.timeout_seconds or TOOL_TIMEOUTS.get("codex_review", EXEC_TIMEOUT_SECONDS)
+    effective_summary = params.reasoning_summary or DEFAULT_REASONING_SUMMARY
+
     return await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
-
+        model=effective_model,
         reasoning_effort=params.reasoning_effort.value,
+        reasoning_summary=effective_summary,
+        timeout=effective_timeout,
+        tool_name="codex_review",
     )
 
 
@@ -1447,11 +1792,18 @@ async def codex_plan(params: ParallelPlanInput) -> str:
         "Be specific — reference real files, functions, and patterns."
     )
 
+    effective_model = params.model or DEFAULT_MODEL
+    effective_timeout = params.timeout_seconds or TOOL_TIMEOUTS.get("codex_plan", EXEC_TIMEOUT_SECONDS)
+    effective_summary = params.reasoning_summary or DEFAULT_REASONING_SUMMARY
+
     return await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
-
+        model=effective_model,
         reasoning_effort=params.reasoning_effort.value,
+        reasoning_summary=effective_summary,
+        timeout=effective_timeout,
+        tool_name="codex_plan",
     )
 
 
@@ -1502,11 +1854,18 @@ async def codex_brainstorm(params: BrainstormInput) -> str:
         "Reference specific files and patterns in the codebase."
     )
 
+    effective_model = params.model or DEFAULT_MODEL
+    effective_timeout = params.timeout_seconds or TOOL_TIMEOUTS.get("codex_brainstorm", EXEC_TIMEOUT_SECONDS)
+    effective_summary = params.reasoning_summary or DEFAULT_REASONING_SUMMARY
+
     return await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
-
+        model=effective_model,
         reasoning_effort=params.reasoning_effort.value,
+        reasoning_summary=effective_summary,
+        timeout=effective_timeout,
+        tool_name="codex_brainstorm",
     )
 
 
@@ -1561,12 +1920,42 @@ async def codex_collab(params: CollaborateInput) -> str:
         if session_path.exists():
             rounds = _read_session_rounds(session_path)
             if rounds >= MAX_SESSION_ROUNDS:
-                return (
-                    f"{ERROR_PREFIX}Session '{params.session_id}' has reached the maximum "
-                    f"of {MAX_SESSION_ROUNDS} rounds. Start a new session or use "
-                    "codex_recap to generate a summary of this one."
+                # Auto-rollover: generate recap, then start chained session
+                logger.info(
+                    "Session '%s' hit round cap (%d). Auto-rolling over.",
+                    params.session_id, MAX_SESSION_ROUNDS,
                 )
-            session_context = _get_truncated_session(session_path)
+                old_session_content = _get_truncated_session(session_path)
+                recap_result = await _run_codex_once(
+                    RECAP_SYSTEM + "\n---\n"
+                    f"## Session Log\n{old_session_content}\n\n"
+                    "Generate a concise decision record. Attribute findings clearly "
+                    "(CC vs Codex). Focus on decisions and reasoning, not process.",
+                    project_dir=cwd,
+                    reasoning_effort="medium",
+                    timeout=300,
+                    tool_name="codex_collab_recap",
+                )
+                # Save recap
+                recap_path = _safe_claudex_path(cwd, "recaps", f"{params.session_id}_recap.md")
+                if recap_path and not recap_result.startswith(ERROR_PREFIX):
+                    try:
+                        recap_path.parent.mkdir(parents=True, exist_ok=True)
+                        recap_path.write_text(recap_result)
+                        logger.info("Auto-recap saved: %s", recap_path.name)
+                    except OSError as exc:
+                        logger.warning("Auto-recap save failed: %s", exc)
+
+                # Chain session
+                new_session_id = _chain_session_id(params.session_id)
+                params.session_id = new_session_id
+                session_path = _safe_claudex_path(cwd, "sessions", f"{new_session_id}.md")
+                if session_path is None:
+                    return f"{ERROR_PREFIX}Invalid chained session_id — contains unsafe characters."
+                session_context = ""
+                logger.info("Session rolled over to '%s'.", new_session_id)
+            else:
+                session_context = _get_truncated_session(session_path)
 
     # --- Build prompt ---
     system_prompt = _build_collaborate_system(params.request_type)
@@ -1605,11 +1994,18 @@ async def codex_collab(params: CollaborateInput) -> str:
         "End with 2-3 concrete next steps."
     )
 
+    effective_model = params.model or DEFAULT_MODEL
+    effective_timeout = params.timeout_seconds or TOOL_TIMEOUTS.get("codex_collab", EXEC_TIMEOUT_SECONDS)
+    effective_summary = params.reasoning_summary or DEFAULT_REASONING_SUMMARY
+
     result = await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
-
+        model=effective_model,
         reasoning_effort=params.reasoning_effort.value,
+        reasoning_summary=effective_summary,
+        timeout=effective_timeout,
+        tool_name="codex_collab",
     )
 
     # --- Update session document ---
@@ -1623,6 +2019,24 @@ async def codex_collab(params: CollaborateInput) -> str:
                 session_result = session_result.rsplit("\n\n---\n_Codex:", 1)[0]
             rounds = _read_session_rounds(session_path) + 1
             _append_to_session(session_path, rounds, params.cc_analysis, session_result)
+
+            # --- Artifact-session linking ---
+            if "## Artifacts Created" in result:
+                try:
+                    artifact_idx = result.index("## Artifacts Created")
+                    # Find end of artifacts section (next double-newline or metadata footer)
+                    artifact_end = result.find("\n\n---\n_Codex:", artifact_idx)
+                    if artifact_end == -1:
+                        artifact_section = result[artifact_idx:]
+                    else:
+                        artifact_section = result[artifact_idx:artifact_end]
+                    # Append to session document
+                    session_content = session_path.read_text()
+                    session_content += f"\n\n### Artifacts (Round {rounds})\n{artifact_section}\n"
+                    session_path.write_text(session_content)
+                except (ValueError, OSError) as exc:
+                    logger.warning("Artifact-session linking failed: %s", exc)
+
             session_line = (
                 f"\n\nSession: {params.session_id} "
                 f"(Round {rounds}/{MAX_SESSION_ROUNDS})"
@@ -1687,11 +2101,18 @@ async def codex_review_files(params: QuickReviewInput) -> str:
         "concrete alternatives. Don't list things that are fine — focus on what needs attention."
     )
 
+    effective_model = params.model or DEFAULT_MODEL
+    effective_timeout = params.timeout_seconds or TOOL_TIMEOUTS.get("codex_review_files", EXEC_TIMEOUT_SECONDS)
+    effective_summary = params.reasoning_summary or DEFAULT_REASONING_SUMMARY
+
     return await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
-
+        model=effective_model,
         reasoning_effort=params.reasoning_effort.value,
+        reasoning_summary=effective_summary,
+        timeout=effective_timeout,
+        tool_name="codex_review_files",
     )
 
 
@@ -1746,11 +2167,18 @@ async def codex_evaluate(params: EvaluateInput) -> str:
         "illuminate the decision so the user can choose."
     )
 
+    effective_model = params.model or DEFAULT_MODEL
+    effective_timeout = params.timeout_seconds or TOOL_TIMEOUTS.get("codex_evaluate", EXEC_TIMEOUT_SECONDS)
+    effective_summary = params.reasoning_summary or DEFAULT_REASONING_SUMMARY
+
     return await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
-
+        model=effective_model,
         reasoning_effort=params.reasoning_effort.value,
+        reasoning_summary=effective_summary,
+        timeout=effective_timeout,
+        tool_name="codex_evaluate",
     )
 
 
@@ -1798,11 +2226,18 @@ async def codex_recap(params: RecapInput) -> str:
         "(CC vs Codex). Focus on decisions and reasoning, not process."
     )
 
+    effective_model = params.model or DEFAULT_MODEL
+    effective_timeout = params.timeout_seconds or TOOL_TIMEOUTS.get("codex_recap", EXEC_TIMEOUT_SECONDS)
+    effective_summary = params.reasoning_summary or DEFAULT_REASONING_SUMMARY
+
     result = await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
-
+        model=effective_model,
         reasoning_effort=params.reasoning_effort.value,
+        reasoning_summary=effective_summary,
+        timeout=effective_timeout,
+        tool_name="codex_recap",
     )
 
     # Save recap to .claudex/recaps/
@@ -1817,6 +2252,102 @@ async def codex_recap(params: RecapInput) -> str:
                 logger.warning("Recap save failed: %s", exc)
 
     return result
+
+
+async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]:
+    """Get git diff content, filtering binary files, capped at DIFF_MAX_BYTES."""
+    try:
+        cmd = ["git", "diff"]
+        if staged:
+            cmd.append("--staged")
+        cmd.extend(["--no-color", "--diff-filter=ACMRT"])  # exclude deleted-only
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=project_dir,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode != 0:
+            return None
+
+        diff_text = stdout.decode(errors="replace")
+        if not diff_text.strip():
+            return None
+
+        # Cap size
+        if len(diff_text.encode("utf-8")) > DIFF_MAX_BYTES:
+            diff_text = diff_text.encode("utf-8")[:DIFF_MAX_BYTES].decode("utf-8", errors="ignore") + "\n... [diff truncated at 50KB]"
+
+        return diff_text
+    except (asyncio.TimeoutError, OSError):
+        return None
+
+
+@mcp.tool(
+    name="codex_review_diff",
+    annotations={
+        "title": "Codex Diff Review",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def codex_review_diff(params: ReviewDiffInput) -> str:
+    """Get Codex to review your git diff — staged or unstaged changes.
+
+    Codex reads the actual diff and surrounding codebase context to find
+    bugs, risks, and issues introduced by the changes. Use before committing
+    or as a pre-PR sanity check.
+
+    Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
+    """
+    cwd = params.project_dir or os.getcwd()
+
+    diff_text = await _get_git_diff(cwd, staged=params.staged)
+    if not diff_text:
+        diff_type = "staged" if params.staged else "unstaged"
+        return f"{ERROR_PREFIX}No {diff_type} changes found. Nothing to review."
+
+    parts = [REVIEW_DIFF_SYSTEM, "\n---\n"]
+
+    if params.user_prompt:
+        parts.append(
+            "## Original User Request (verbatim)\n"
+            "```\n"
+            f"{params.user_prompt}\n"
+            "```\n"
+        )
+
+    diff_type = "Staged" if params.staged else "Unstaged"
+    parts.append(f"## {diff_type} Changes\n```diff\n{diff_text}\n```")
+
+    if params.focus:
+        parts.append(f"\n## Review Focus\n{params.focus}")
+
+    if params.context:
+        parts.append(f"\n## Context\n{params.context}")
+
+    parts.append(
+        "\nReview these changes. Focus on what the diff INTRODUCES — "
+        "don't critique pre-existing code unless the changes make it worse."
+    )
+
+    effective_model = params.model or DEFAULT_MODEL
+    effective_timeout = params.timeout_seconds or TOOL_TIMEOUTS.get("codex_review_diff", EXEC_TIMEOUT_SECONDS)
+    effective_summary = params.reasoning_summary or DEFAULT_REASONING_SUMMARY
+
+    return await _run_codex(
+        "\n".join(parts),
+        project_dir=cwd,
+        model=effective_model,
+        reasoning_effort=params.reasoning_effort.value,
+        reasoning_summary=effective_summary,
+        timeout=effective_timeout,
+        tool_name="codex_review_diff",
+    )
 
 
 @mcp.tool(
@@ -1864,7 +2395,8 @@ async def codex_status(params: StatusInput) -> str:
         lines.append(f"Codex CLI:     {codex_location} ({codex_version})")
     lines.append(f"Default Model: {DEFAULT_MODEL}")
     lines.append(f"Effort:        {DEFAULT_REASONING_EFFORT}")
-    lines.append(f"Timeout:       {EXEC_TIMEOUT_SECONDS}s")
+    lines.append(f"Timeout:       {EXEC_TIMEOUT_SECONDS}s (default, per-tool overrides available)")
+    lines.append(f"Tools:         10 (8 Codex-calling + codex_status + codex_ping)")
 
     # Plugin version
     plugin_json = Path(cwd) / ".claude-plugin" / "plugin.json"
@@ -1952,6 +2484,10 @@ async def codex_status(params: StatusInput) -> str:
                 except OSError:
                     pass
         lines.append(f"\n.claudex/ total: {total_bytes / 1024:.1f} KB")
+
+    # --- Metrics ---
+    metrics_summary = _get_metrics_summary()
+    lines.append(f"\nMetrics (this session):\n{metrics_summary}")
 
     return "\n".join(lines)
 

@@ -24,7 +24,8 @@ What's your situation?
 │
 ├─ "I have a plan or code already"
 │   ├─ Want it stress-tested/critiqued    → codex_review
-│   └─ Want specific files reviewed       → codex_review_files
+│   ├─ Want specific files reviewed       → codex_review_files
+│   └─ Want my git diff reviewed          → codex_review_diff
 │
 ├─ "I have a specific problem"
 │   ├─ Need debugging help               → codex_collab (bug_approach)
@@ -60,6 +61,7 @@ What's your situation?
 | `codex_brainstorm` | Open-ended exploration of a problem space. | **Innovation Consultant** — divergent thinking, cross-domain connections |
 | `codex_collab` | Targeted collaboration on a specific problem. Persona varies by `request_type`. | See Collab Personas below |
 | `codex_review_files` | Targeted code review of specific files. | **Senior Code Reviewer** — patterns, anti-patterns, maintainability, correctness |
+| `codex_review_diff` | Review git diff (staged or unstaged) for bugs and risks. | **Diff Reviewer** — focus on what changed, not pre-existing issues |
 | `codex_evaluate` | Codex analyzes tradeoffs between options. User makes the final call. | **Technical Advisor** — balanced analysis, explicit tradeoffs, no recommendation bias |
 | `codex_recap` | Generate a decision record summarizing a session. | **Technical Writer** — clear, concise, decision-focused documentation |
 | `codex_status` | Show Claudex diagnostics (no Codex call, zero subscription cost). | N/A |
@@ -79,13 +81,13 @@ What's your situation?
 
 ---
 
-## Server-Side Features (v1.3)
+## Server-Side Features (v1.4)
 
 These are handled automatically by the server. Understand them so you use them correctly.
 
 ### `user_prompt` — Preserve the User's Voice
 
-`codex_plan`, `codex_review`, `codex_brainstorm`, `codex_collab`, and `codex_review_files` accept an optional `user_prompt` field. **Always pass it** — it ensures Codex responds to the user's actual intent, not just your interpretation.
+`codex_plan`, `codex_review`, `codex_brainstorm`, `codex_collab`, `codex_review_files`, and `codex_review_diff` accept an optional `user_prompt` field. **Always pass it** — it ensures Codex responds to the user's actual intent, not just your interpretation.
 
 | Context | What to pass as `user_prompt` |
 |---------|-------------------------------|
@@ -99,7 +101,7 @@ These are handled automatically by the server. Understand them so you use them c
 
 ### Git Context Injection
 
-All analysis tools (`codex_plan`, `codex_review`, `codex_brainstorm`, `codex_collab`, `codex_review_files`, `codex_evaluate`) automatically include the current git branch and `git diff --stat` (capped at 20 lines) in the prompt sent to Codex. **You do NOT need to manually include git state** — it's injected server-side. `codex_recap` and `codex_ping` skip this (recap summarizes a session, ping is a connectivity test). If the project isn't a git repo, this is silently skipped.
+All analysis tools (`codex_plan`, `codex_review`, `codex_brainstorm`, `codex_collab`, `codex_review_files`, `codex_evaluate`) automatically include the current git branch, `git diff --stat` (capped at 20 lines), recent commit log (`git log --oneline -5`), and staged diff summary in the prompt sent to Codex. **You do NOT need to manually include git state** — it's injected server-side. `codex_recap`, `codex_review_diff`, and `codex_ping` skip this (`codex_review_diff` gets its own full diff; recap summarizes a session; ping is a connectivity test). If the project isn't a git repo, this is silently skipped.
 
 ### Response Metadata Footer
 
@@ -173,8 +175,9 @@ Use when debugging tricky issues or solving complex problems. Uses session docum
 5. IF another round is needed, call codex_collab again:
    - Update cc_analysis with: what Codex suggested + what you tried + results
    - Same session_id (accumulates context across rounds)
-6. TERMINATION: Max 4 rounds. After that, summarize findings for the user.
-   Call codex_recap to generate a decision record if the session was substantive.
+6. TERMINATION: After 4 rounds, the server auto-rolls over — generates a recap,
+   creates a chained session (e.g. my-session → my-session-p2), and continues.
+   The rollover is transparent; you'll see a note in the response.
 ```
 
 **Key principle:** The session document IS the shared memory. Each round builds on all previous findings. CC stays the arbitrator — you decide which hypotheses to test.
@@ -227,6 +230,26 @@ Use when choosing between approaches. This is the ONLY tool where CC does NOT ar
 
 **Key principle:** `codex_evaluate` presents options. It does NOT recommend. The user has context you and Codex don't (business priorities, team skills, timeline pressure).
 
+## Workflow 5: Pre-Commit Review
+
+Use before committing to catch issues in your changes.
+
+```
+1. Make your changes (staged or unstaged)
+2. Call codex_review_diff with:
+   - staged: true if reviewing staged changes, false for all working tree changes
+   - focus: 'security', 'correctness', 'performance', or leave empty for general review
+   - context: Brief description of what the changes are for
+   - user_prompt: The user's request if applicable
+3. Evaluate Codex's findings:
+   - Critical issues → fix before committing
+   - Warnings → assess if they need fixing now
+   - Suggestions → defer to post-commit if minor
+4. Present verdict to user: ship / fix first / needs discussion
+```
+
+**Key principle:** `codex_review_diff` focuses on what CHANGED — it doesn't critique pre-existing code. Fast and targeted.
+
 ---
 
 ## Reading Codex Artifacts
@@ -252,7 +275,7 @@ If Codex fails (timeout, rate limit, empty response, error):
 
 ### ALWAYS:
 - Pass `project_dir` so Codex reads the correct codebase
-- Pass `user_prompt` on every tool that accepts it (see v1.3 features above)
+- Pass `user_prompt` on every tool that accepts it (see v1.4 features above)
 - Use `focus_files` to direct Codex's exploration — paths are auto-normalized, no need to verify existence
 - Let Codex read the codebase directly — don't pre-summarize context for it
 - Critically evaluate Codex's output — it's a perspective, not authority
@@ -279,9 +302,18 @@ When Codex disagrees with your approach:
 
 ## Model & Reasoning
 
-**Model:** `gpt-5.3-codex` (hardcoded — all tools use this).
+**Model:** `gpt-5.3-codex` by default. Overridable per-call via `model` parameter on any tool.
 
 **Reasoning effort:** `high` by default. Override with `reasoning_effort` parameter:
+- `low` — minimal reasoning, fast
 - `medium` — faster, good for reviews and recaps
 - `high` — default, good for most analysis
 - `xhigh` — maximum depth, slower but more thorough
+
+**Auto-retry on timeout:** If a call times out and the effort level is `xhigh` or `high`, the server automatically retries once with a lower effort (`xhigh` → `high`, `high` → `medium`). A note is prepended to the response when this happens.
+
+**Reasoning summary:** `detailed` by default. Overridable per-call (`detailed`, `concise`, `none`).
+
+**Per-tool timeouts:** Each tool has a default timeout (e.g. `codex_review`: 1200s, `codex_review_files`: 300s). Overridable per-call via `timeout_seconds` (30-1800s).
+
+**Metrics:** The server tracks per-tool stats (calls, successes, timeouts, errors, avg latency) in memory. View via `codex_status`.

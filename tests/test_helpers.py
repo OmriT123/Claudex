@@ -40,16 +40,30 @@ from server import (
     _auto_session_id,
     _check_codex_version,
     _version_cache,
+    _metrics,
+    _record_metric,
+    _get_metrics_summary,
+    _chain_session_id,
     RequestType,
     COLLAB_PERSONAS,
     MAX_SESSION_ROUNDS,
     SESSION_MAX_BYTES,
+    EFFORT_DOWNGRADE,
+    DEFAULT_MODEL,
+    DEFAULT_REASONING_SUMMARY,
+    TOOL_TIMEOUTS,
+    EXEC_TIMEOUT_SECONDS,
 )
 from pydantic import ValidationError
 from server import (
     SecondOpinionInput,
     ParallelPlanInput,
+    BrainstormInput,
     CollaborateInput,
+    QuickReviewInput,
+    EvaluateInput,
+    RecapInput,
+    ReviewDiffInput,
     StatusInput,
 )
 
@@ -342,6 +356,261 @@ class TestCheckCodexVersion:
         assert result == ""
         # Failed check should NOT set resolved — allows retry
         assert _version_cache["resolved"] is False
+
+
+# =========================================================================
+# Per-tool timeout
+# =========================================================================
+
+
+class TestPerToolTimeout:
+    """Validate timeout_seconds field on input models."""
+
+    def test_none_is_valid(self):
+        """Default None means use per-tool default."""
+        inp = SecondOpinionInput(plan="x" * 20, timeout_seconds=None)
+        assert inp.timeout_seconds is None
+
+    def test_valid_timeout(self):
+        inp = SecondOpinionInput(plan="x" * 20, timeout_seconds=300)
+        assert inp.timeout_seconds == 300
+
+    def test_below_minimum_rejected(self):
+        with pytest.raises(ValidationError):
+            SecondOpinionInput(plan="x" * 20, timeout_seconds=10)
+
+    def test_above_maximum_rejected(self):
+        with pytest.raises(ValidationError):
+            SecondOpinionInput(plan="x" * 20, timeout_seconds=2000)
+
+    def test_tool_timeouts_dict_populated(self):
+        """TOOL_TIMEOUTS should have entries for all Codex-calling tools."""
+        assert len(TOOL_TIMEOUTS) >= 8
+        assert "codex_review" in TOOL_TIMEOUTS
+        assert "codex_review_diff" in TOOL_TIMEOUTS
+
+
+# =========================================================================
+# Model override
+# =========================================================================
+
+
+class TestModelOverride:
+    """Validate model field on input models."""
+
+    def test_none_is_default(self):
+        inp = SecondOpinionInput(plan="x" * 20, model=None)
+        assert inp.model is None
+
+    def test_custom_model(self):
+        inp = SecondOpinionInput(plan="x" * 20, model="gpt-5-codex-mini")
+        assert inp.model == "gpt-5-codex-mini"
+
+    def test_all_models_have_field(self):
+        """Every input model that calls Codex should accept model override."""
+        for cls in [SecondOpinionInput, ParallelPlanInput, BrainstormInput,
+                     CollaborateInput, QuickReviewInput, EvaluateInput,
+                     RecapInput, ReviewDiffInput]:
+            assert "model" in cls.model_fields, f"{cls.__name__} missing model field"
+
+
+# =========================================================================
+# Reasoning summary
+# =========================================================================
+
+
+class TestReasoningSummary:
+    """Validate reasoning_summary field."""
+
+    def test_none_is_default(self):
+        inp = SecondOpinionInput(plan="x" * 20, reasoning_summary=None)
+        assert inp.reasoning_summary is None
+
+    def test_custom_summary(self):
+        inp = SecondOpinionInput(plan="x" * 20, reasoning_summary="concise")
+        assert inp.reasoning_summary == "concise"
+
+    def test_default_constant(self):
+        assert DEFAULT_REASONING_SUMMARY == "detailed"
+
+
+# =========================================================================
+# Effort downgrade
+# =========================================================================
+
+
+class TestEffortDowngrade:
+    """Verify EFFORT_DOWNGRADE mapping for auto-retry."""
+
+    def test_xhigh_downgrades_to_high(self):
+        assert EFFORT_DOWNGRADE["xhigh"] == "high"
+
+    def test_high_downgrades_to_medium(self):
+        assert EFFORT_DOWNGRADE["high"] == "medium"
+
+    def test_medium_not_downgradeable(self):
+        assert "medium" not in EFFORT_DOWNGRADE
+
+    def test_low_not_downgradeable(self):
+        assert "low" not in EFFORT_DOWNGRADE
+
+
+# =========================================================================
+# Metrics
+# =========================================================================
+
+
+class TestMetrics:
+    """In-memory metrics tracking."""
+
+    def setup_method(self):
+        """Clear metrics before each test."""
+        _metrics.clear()
+
+    def test_record_success(self):
+        _record_metric("codex_plan", success=True, elapsed=10.5)
+        assert _metrics["codex_plan"]["calls"] == 1
+        assert _metrics["codex_plan"]["successes"] == 1
+        assert _metrics["codex_plan"]["total_elapsed"] == 10.5
+
+    def test_record_timeout(self):
+        _record_metric("codex_plan", success=False, elapsed=600.0, timed_out=True)
+        assert _metrics["codex_plan"]["timeouts"] == 1
+        assert _metrics["codex_plan"]["successes"] == 0
+
+    def test_record_error(self):
+        _record_metric("codex_plan", success=False, elapsed=5.0)
+        assert _metrics["codex_plan"]["errors"] == 1
+
+    def test_accumulation(self):
+        _record_metric("codex_plan", success=True, elapsed=10.0)
+        _record_metric("codex_plan", success=True, elapsed=20.0)
+        _record_metric("codex_plan", success=False, elapsed=5.0, timed_out=True)
+        assert _metrics["codex_plan"]["calls"] == 3
+        assert _metrics["codex_plan"]["successes"] == 2
+        assert _metrics["codex_plan"]["timeouts"] == 1
+        assert _metrics["codex_plan"]["total_elapsed"] == 35.0
+
+    def test_empty_tool_name_skipped(self):
+        _record_metric("", success=True, elapsed=1.0)
+        assert "" not in _metrics
+
+    def test_summary_formatting(self):
+        _record_metric("codex_plan", success=True, elapsed=10.0)
+        summary = _get_metrics_summary()
+        assert "codex_plan" in summary
+        assert "Calls" in summary
+
+    def test_summary_empty(self):
+        summary = _get_metrics_summary()
+        assert "No tool invocations" in summary
+
+
+# =========================================================================
+# Chain session ID
+# =========================================================================
+
+
+class TestChainSessionId:
+    """Session ID chaining for auto-rollover."""
+
+    def test_first_chain(self):
+        assert _chain_session_id("my-session") == "my-session-p2"
+
+    def test_second_chain(self):
+        assert _chain_session_id("my-session-p2") == "my-session-p3"
+
+    def test_third_chain(self):
+        assert _chain_session_id("my-session-p3") == "my-session-p4"
+
+    def test_numeric_suffix_not_confused(self):
+        """Session ID ending in a number shouldn't be confused with -pN."""
+        assert _chain_session_id("debug-issue-42") == "debug-issue-42-p2"
+
+    def test_hyphenated_name(self):
+        assert _chain_session_id("fix-race-condition") == "fix-race-condition-p2"
+
+
+# =========================================================================
+# ReviewDiffInput
+# =========================================================================
+
+
+class TestReviewDiffInput:
+    """Pydantic validation for the new codex_review_diff tool."""
+
+    def test_minimal_valid(self):
+        inp = ReviewDiffInput()
+        assert inp.staged is False
+        assert inp.focus is None
+
+    def test_staged_flag(self):
+        inp = ReviewDiffInput(staged=True)
+        assert inp.staged is True
+
+    def test_extra_fields_rejected(self):
+        with pytest.raises(ValidationError):
+            ReviewDiffInput(unknown_field="bad")
+
+    def test_all_v14_fields_present(self):
+        """ReviewDiffInput should have all v1.4 shared fields."""
+        fields = ReviewDiffInput.model_fields
+        assert "model" in fields
+        assert "timeout_seconds" in fields
+        assert "reasoning_summary" in fields
+
+    def test_full_construction(self):
+        inp = ReviewDiffInput(
+            focus="security",
+            staged=True,
+            context="Pre-commit review",
+            user_prompt="Review my changes",
+            model="gpt-5-codex-mini",
+            timeout_seconds=300,
+            reasoning_summary="concise",
+        )
+        assert inp.focus == "security"
+        assert inp.model == "gpt-5-codex-mini"
+
+
+# =========================================================================
+# Backward compatibility
+# =========================================================================
+
+
+class TestBackwardCompatibility:
+    """Existing calls without new v1.4 optional fields still work."""
+
+    def test_second_opinion_no_new_fields(self):
+        inp = SecondOpinionInput(plan="x" * 20)
+        assert inp.model is None
+        assert inp.timeout_seconds is None
+        assert inp.reasoning_summary is None
+
+    def test_parallel_plan_no_new_fields(self):
+        inp = ParallelPlanInput(task="x" * 20)
+        assert inp.model is None
+        assert inp.timeout_seconds is None
+
+    def test_collaborate_no_new_fields(self):
+        inp = CollaborateInput(problem="x" * 20, cc_analysis="x" * 20)
+        assert inp.model is None
+
+    def test_quick_review_no_new_fields(self):
+        inp = QuickReviewInput(files="test.py")
+        assert inp.model is None
+
+    def test_evaluate_no_new_fields(self):
+        inp = EvaluateInput(options="x" * 20)
+        assert inp.model is None
+
+    def test_recap_no_new_fields(self):
+        inp = RecapInput(session_id="test")
+        assert inp.model is None
+
+    def test_review_diff_no_new_fields(self):
+        inp = ReviewDiffInput()
+        assert inp.model is None
 
 
 # =========================================================================

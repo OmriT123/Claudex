@@ -98,6 +98,10 @@ claude --plugin-dir /path/to/Claudex
 | `/codex:plan [task]` | CC and Codex independently plan the same task, then CC synthesizes |
 | `/codex:brainstorm [topic]` | Explore approaches from two AI perspectives |
 | `/codex:collab [problem]` | CC shares its analysis, Codex provides targeted suggestions |
+| `/codex:evaluate [options]` | Codex analyzes tradeoffs between approaches — user decides |
+| `/codex:recap [session_id]` | Generate a decision record from a collaboration session |
+| `/codex:review-files [files]` | Get a focused code review from Codex on specific files |
+| `/codex:review-diff [focus]` | Get Codex to review your git diff before committing |
 | `/codex:status` | Show Claudex diagnostics (zero Codex cost) |
 
 ### Examples
@@ -108,6 +112,10 @@ claude --plugin-dir /path/to/Claudex
 /codex:brainstorm How should we handle caching for the dashboard?
 
 /codex:collab I'm getting a race condition in the worker queue
+
+/codex:evaluate Redis vs PostgreSQL pub/sub for real-time events
+
+/codex:review-diff security
 ```
 
 ## MCP Tools
@@ -119,6 +127,7 @@ claude --plugin-dir /path/to/Claudex
 | `codex_brainstorm` | Open-ended exploration of a problem | Innovation Consultant |
 | `codex_collab` | Targeted collaboration — CC sends analysis, gets suggestions | Varies by request type |
 | `codex_review_files` | Targeted code review of specific files | Senior Code Reviewer |
+| `codex_review_diff` | Review git diff (staged or unstaged) for issues | Diff Reviewer |
 | `codex_evaluate` | Analyze tradeoffs between options — user decides | Technical Advisor |
 | `codex_recap` | Generate decision record from a session | Technical Writer |
 | `codex_status` | Show Claudex diagnostics (no Codex call, zero cost) | — |
@@ -205,12 +214,15 @@ echo '.claudex' >> .gitignore
 
 ## Defaults
 
-- **Model**: `gpt-5.3-codex` (hardcoded)
-- **Reasoning effort**: `high` (override per-call: `medium`, `high`, `xhigh`)
-- **Reasoning summary**: `detailed` — includes Codex's chain-of-thought
+- **Model**: `gpt-5.3-codex` (overridable per-call via `model` parameter)
+- **Reasoning effort**: `high` (override per-call: `low`, `medium`, `high`, `xhigh`)
+- **Reasoning summary**: `detailed` (overridable: `detailed`, `concise`, `none`)
 - **Sandbox**: `read-only` — Codex reads your repo but never modifies it
-- **Timeout**: 600s (10 min)
+- **Timeout**: 1200s (20 min) global default, per-tool overrides (e.g. `codex_review_files`: 300s, `codex_brainstorm`: 900s)
+- **Auto-retry**: On timeout, `xhigh` → `high` and `high` → `medium` are retried once automatically
+- **Session rollover**: After 4 rounds, sessions auto-rollover (recap generated, new chained session)
 - **Version check**: Auto-checks for Codex CLI updates on first invocation
+- **Metrics**: In-memory per-tool stats (calls, successes, timeouts, errors, avg latency) — visible in `codex_status`
 
 ## Rate Limits
 
@@ -233,11 +245,17 @@ Claudex/
 │   ├── plan.md              # /codex:plan
 │   ├── brainstorm.md        # /codex:brainstorm
 │   ├── collab.md            # /codex:collab
+│   ├── evaluate.md          # /codex:evaluate
+│   ├── recap.md             # /codex:recap
+│   ├── review-files.md      # /codex:review-files
+│   ├── review-diff.md       # /codex:review-diff
 │   └── status.md            # /codex:status
 ├── skills/
-│   └── codex/
+│   └── claudex/
 │       └── SKILL.md         # Auto-triggers during plan mode
-├── .claudex/                  # Scratchpad (gitignored)
+├── tests/
+│   └── test_helpers.py      # Test suite (uv run --script)
+├── .claudex/                # Scratchpad (gitignored)
 │   ├── run-<uuid>/          # Per-run artifact directories
 │   ├── sessions/            # Iterative session documents
 │   └── recaps/              # Decision records from codex_recap
