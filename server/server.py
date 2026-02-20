@@ -2398,8 +2398,8 @@ async def codex_status(params: StatusInput) -> str:
     lines.append(f"Timeout:       {EXEC_TIMEOUT_SECONDS}s (default, per-tool overrides available)")
     lines.append(f"Tools:         10 (8 Codex-calling + codex_status + codex_ping)")
 
-    # Plugin version
-    plugin_json = Path(cwd) / ".claude-plugin" / "plugin.json"
+    # Plugin version — resolve relative to server.py, not project dir
+    plugin_json = Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"
     plugin_version = "unknown"
     if plugin_json.is_file():
         try:
