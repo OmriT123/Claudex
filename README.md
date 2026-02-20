@@ -126,8 +126,8 @@ claude --plugin-dir /path/to/Claudex
 | `codex_review` | Codex critiques a specific plan you provide | Critical QA Engineer |
 | `codex_brainstorm` | Open-ended exploration of a problem | Innovation Consultant |
 | `codex_collab` | Targeted collaboration — CC sends analysis, gets suggestions | Varies by request type |
-| `codex_review_files` | Targeted code review of specific files | Senior Code Reviewer |
-| `codex_review_diff` | Review git diff (staged or unstaged) for issues | Diff Reviewer |
+| `codex_review_files` | Targeted code review of specific files (structured JSON by default) | Senior Code Reviewer |
+| `codex_review_diff` | Review git diff with structured findings (severity, confidence, line refs) | Diff Reviewer |
 | `codex_evaluate` | Analyze tradeoffs between options — user decides | Technical Advisor |
 | `codex_recap` | Generate decision record from a session | Technical Writer |
 | `codex_status` | Show Claudex diagnostics (no Codex call, zero cost) | — |
@@ -221,6 +221,7 @@ echo '.claudex' >> .gitignore
 - **Timeout**: 1200s (20 min) global default, per-tool overrides (e.g. `codex_review_files`: 300s, `codex_brainstorm`: 900s)
 - **Auto-retry**: On timeout, `xhigh` → `high` and `high` → `medium` are retried once automatically
 - **Session rollover**: After 4 rounds, sessions auto-rollover (recap generated, new chained session)
+- **Structured output**: `codex_review_files` and `codex_review_diff` return structured JSON findings (severity, confidence, file:line) by default. Set `structured_output=False` for legacy text mode
 - **Version check**: Auto-checks for Codex CLI updates on first invocation
 - **Metrics**: In-memory per-tool stats (calls, successes, timeouts, errors, avg latency) — visible in `codex_status`
 

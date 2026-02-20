@@ -1843,7 +1843,11 @@ _VERDICT_LABEL = {
 
 def _format_finding(finding: dict, index: int) -> str:
     """Render a single finding as markdown."""
+    if not isinstance(finding, dict):
+        return f"### {index}. [WARNING] (malformed finding)\n"
     severity = finding.get("severity", "warning")
+    if not isinstance(severity, str):
+        severity = "warning"
     badge = _SEVERITY_BADGE.get(severity, severity.upper())
     title = finding.get("title", "Untitled")
     category = finding.get("category", "other")
@@ -1854,13 +1858,15 @@ def _format_finding(finding: dict, index: int) -> str:
     except (ValueError, TypeError):
         confidence = 0.0
     priority = finding.get("priority", 2)
-    body = finding.get("body", "")
+    body = str(finding.get("body", ""))
 
     # Location
     loc = finding.get("code_location", {})
+    if not isinstance(loc, dict):
+        loc = {}
     file_path = loc.get("file_path", "unknown")
     line_range = loc.get("line_range")
-    if line_range:
+    if line_range and isinstance(line_range, dict):
         start = line_range.get("start", 0)
         end = line_range.get("end", 0)
         if start == end:
@@ -1890,17 +1896,21 @@ def _format_review_files_json(data: dict) -> str:
 
     # File summaries
     file_summaries = data.get("file_summaries", [])
-    if file_summaries:
+    if file_summaries and isinstance(file_summaries, list):
         parts.append("## File Summaries\n")
         for fs in file_summaries:
+            if not isinstance(fs, dict):
+                continue
             parts.append(f"**`{fs.get('file_path', 'unknown')}`** — {fs.get('summary', '')}")
             parts.append(f"Quality: {fs.get('quality_assessment', 'N/A')}\n")
 
     # Findings sorted by priority (critical first)
     findings = data.get("findings", [])
+    if not isinstance(findings, list):
+        findings = []
     if findings:
         severity_order = {"critical": 0, "warning": 1, "suggestion": 2, "positive": 3}
-        sorted_findings = sorted(findings, key=lambda f: severity_order.get(f.get("severity", "other"), 99))
+        sorted_findings = sorted(findings, key=lambda f: severity_order.get(f.get("severity", "other") if isinstance(f, dict) else "other", 99))
         parts.append("## Findings\n")
         for i, finding in enumerate(sorted_findings, 1):
             parts.append(_format_finding(finding, i))
@@ -1916,7 +1926,7 @@ def _format_review_files_json(data: dict) -> str:
         overall_conf = 0.0
     if overall:
         parts.append(f"## Overall Assessment (confidence: {int(overall_conf * 100)}%)\n")
-        parts.append(overall)
+        parts.append(str(overall))
 
     return "\n".join(parts)
 
@@ -1932,14 +1942,18 @@ def _format_review_diff_json(data: dict) -> str:
 
     # Verdict
     verdict = data.get("verdict", "needs_discussion")
+    if not isinstance(verdict, str):
+        verdict = "needs_discussion"
     verdict_label = _VERDICT_LABEL.get(verdict, verdict)
     parts.append(f"## Verdict: {verdict_label}\n")
 
     # Findings sorted by priority
     findings = data.get("findings", [])
+    if not isinstance(findings, list):
+        findings = []
     if findings:
         severity_order = {"critical": 0, "warning": 1, "suggestion": 2, "positive": 3}
-        sorted_findings = sorted(findings, key=lambda f: severity_order.get(f.get("severity", "other"), 99))
+        sorted_findings = sorted(findings, key=lambda f: severity_order.get(f.get("severity", "other") if isinstance(f, dict) else "other", 99))
         parts.append("## Findings\n")
         for i, finding in enumerate(sorted_findings, 1):
             parts.append(_format_finding(finding, i))
@@ -1955,7 +1969,7 @@ def _format_review_diff_json(data: dict) -> str:
         overall_conf = 0.0
     if explanation:
         parts.append(f"## Explanation (confidence: {int(overall_conf * 100)}%)\n")
-        parts.append(explanation)
+        parts.append(str(explanation))
 
     return "\n".join(parts)
 

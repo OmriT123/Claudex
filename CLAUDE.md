@@ -31,7 +31,7 @@ There is no build system, no linter configured. Dependencies are declared inline
 uv run --script tests/test_helpers.py
 ```
 
-Tests (115 total) cover security-critical helpers (`_safe_claudex_path`, `_normalize_file_list`), session management, Pydantic model validation, auto-session-ID generation, per-tool timeouts, model/reasoning_summary validation, effort downgrade, metrics, session chaining, `ReviewDiffInput`, backward compatibility, structured output schemas, review formatters, `_build_review_system` toggle, `structured_output` field validation, structured output integration (mock-based), temp file lifecycle, and formatter edge cases. Test file uses PEP 723 inline metadata (same pattern as `server.py`).
+Tests (117 total, 111 methods + 6 parametrized) cover security-critical helpers (`_safe_claudex_path`, `_normalize_file_list`), session management, Pydantic model validation, auto-session-ID generation, per-tool timeouts, model/reasoning_summary validation, effort downgrade, metrics, session chaining, `ReviewDiffInput`, backward compatibility, structured output schemas, review formatters, `_build_review_system` toggle, `structured_output` field validation, structured output integration (mock-based), temp file lifecycle, and formatter edge cases. Test file uses PEP 723 inline metadata (same pattern as `server.py`).
 
 ## Architecture
 
@@ -69,7 +69,7 @@ Tests (115 total) cover security-critical helpers (`_safe_claudex_path`, `_norma
 
 **Slash commands** (`commands/*.md`): Define multi-step workflows for `/codex:plan`, `/codex:brainstorm`, `/codex:collab`, `/codex:status`, `/codex:evaluate`, `/codex:recap`, `/codex:review-files`, `/codex:review-diff`. Each has YAML frontmatter with `allowed-tools`.
 
-**Skill** (`skills/codex/SKILL.md`): Auto-triggers during plan mode for non-trivial tasks. Contains the tool router decision tree and workflow patterns (Divergent, Convergent, Iterative, Evaluate).
+**Skill** (`skills/claudex/SKILL.md`): Auto-triggers during plan mode for non-trivial tasks. Contains the tool router decision tree and workflow patterns (Divergent, Convergent, Iterative, Evaluate).
 
 ## Naming Convention
 
