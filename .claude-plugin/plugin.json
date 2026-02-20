@@ -3,7 +3,9 @@
   "description": "Claudex — Claude Code's Codex teammate. Two different AI architectures collaborate on planning, red-teaming, debugging, verification, and more.",
   "version": "1.4.0",
   "author": {
-    "name": "Omri Tal"
+    "name": "Omri Tal",
+    "url": "https://www.botique.co.il",
+    "email": "hello@botique.co.il"
   },
   "repository": "https://github.com/OmriT123/Claudex",
   "license": "MIT",

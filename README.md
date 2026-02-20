@@ -280,7 +280,7 @@ Claudex/
 
 ## Author
 
-Created by **Omri Tal** — [GitHub](https://github.com/OmriT123)
+Created by **Omri Tal** — [GitHub](https://github.com/OmriT123) | [botique.co.il](https://www.botique.co.il) | hello@botique.co.il
 
 ## License
 
