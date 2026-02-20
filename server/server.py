@@ -1195,7 +1195,7 @@ class BrainstormInput(BaseModel):
 
 
 class CollaborateInput(BaseModel):
-    """Input for interactive CC+Codex problem-solving collaboration."""
+    """Input for interactive CC+Codex collaboration."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     problem: str = Field(
@@ -2187,7 +2187,7 @@ async def codex_brainstorm(params: BrainstormInput) -> str:
 @mcp.tool(
     name="codex_collab",
     annotations={
-        "title": "Collaborate with Codex on a Problem",
+        "title": "Collaborate with Codex",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": False,
@@ -2195,10 +2195,10 @@ async def codex_brainstorm(params: BrainstormInput) -> str:
     },
 )
 async def codex_collab(params: CollaborateInput) -> str:
-    """Collaborate with Codex to solve a problem together.
+    """Collaborate with Codex.
 
     Unlike other tools which are one-shot consultations, this is designed for
-    CC to send a specific problem along with its own analysis, and get
+    CC to send its analysis along with a specific task, and get
     actionable suggestions back. Codex reads the code independently and
     responds based on the request type:
 

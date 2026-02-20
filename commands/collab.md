@@ -1,6 +1,6 @@
 ---
 name: collab
-description: "Collaborate with Codex to solve a problem — red-team, debug, verify, review code, suggest features, or get an independent analysis"
+description: "Collaborate with Codex — red-team, debug, verify, review code, suggest features, or get an independent analysis"
 argument-hint: "[problem description]"
 allowed-tools: Read, Glob, Grep
 ---
