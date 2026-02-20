@@ -31,11 +31,11 @@ There is no build system, no linter configured. Dependencies are declared inline
 uv run --script tests/test_helpers.py
 ```
 
-Tests (76 total) cover security-critical helpers (`_safe_claudex_path`, `_normalize_file_list`), session management, Pydantic model validation, auto-session-ID generation, per-tool timeouts, model/reasoning_summary validation, effort downgrade, metrics, session chaining, `ReviewDiffInput`, and backward compatibility. Test file uses PEP 723 inline metadata (same pattern as `server.py`).
+Tests (115 total) cover security-critical helpers (`_safe_claudex_path`, `_normalize_file_list`), session management, Pydantic model validation, auto-session-ID generation, per-tool timeouts, model/reasoning_summary validation, effort downgrade, metrics, session chaining, `ReviewDiffInput`, backward compatibility, structured output schemas, review formatters, `_build_review_system` toggle, `structured_output` field validation, structured output integration (mock-based), temp file lifecycle, and formatter edge cases. Test file uses PEP 723 inline metadata (same pattern as `server.py`).
 
 ## Architecture
 
-**Single-file server** — all logic lives in `server/server.py` (~2500 lines). It's a FastMCP server (`FastMCP("codex")`) that exposes 10 tools:
+**Single-file server** — all logic lives in `server/server.py` (~2900 lines). It's a FastMCP server (`FastMCP("codex")`) that exposes 10 tools:
 
 | Tool | Purpose | Codex Persona |
 |------|---------|---------------|
@@ -43,14 +43,14 @@ Tests (76 total) cover security-critical helpers (`_safe_claudex_path`, `_normal
 | `codex_review` | Codex critiques a provided plan (second opinion) | Critical QA Engineer |
 | `codex_brainstorm` | Open-ended exploration of a problem | Innovation Consultant |
 | `codex_collab` | CC sends its analysis + request type, gets targeted suggestions | Varies by request_type |
-| `codex_review_files` | Targeted code review of specific files | Senior Code Reviewer |
-| `codex_review_diff` | Review git diff (staged or unstaged) for issues | Diff Reviewer |
+| `codex_review_files` | Targeted code review of specific files (structured JSON by default) | Senior Code Reviewer |
+| `codex_review_diff` | Review git diff (staged or unstaged) with structured findings | Diff Reviewer |
 | `codex_evaluate` | Tradeoff analysis between options (user decides) | Technical Advisor |
 | `codex_recap` | Decision record generation from a session | Technical Writer |
 | `codex_status` | Diagnostics dashboard (no Codex call, zero cost) | N/A |
 | `codex_ping` | Connectivity test | N/A |
 
-**Execution flow:** Tool call → construct persona-specific system prompt (with codebase-first preamble) → append artifact instructions → shell out to `codex exec --sandbox read-only` → capture stdout → parse `<claudex-artifact>` blocks from after `---FINAL-ANSWER---` delimiter → write artifacts to `.claudex/run-<uuid>/` with security validation → return cleaned text + artifact listing.
+**Execution flow:** Tool call → construct persona-specific system prompt (with codebase-first preamble) → append artifact or structured-output instructions → shell out to `codex exec --sandbox read-only` (with optional `--output-schema`) → capture stdout → for text mode: parse `<claudex-artifact>` blocks from after `---FINAL-ANSWER---` delimiter → write artifacts to `.claudex/run-<uuid>/` with security validation → return cleaned text + artifact listing. For structured mode (review tools): return raw JSON → parse and format as rich markdown with collapsed raw JSON details block.
 
 **Key components in server.py:**
 - **Codebase-first preamble** — prepended to ALL system prompts, instructs Codex to read project files before addressing the task
@@ -58,7 +58,8 @@ Tests (76 total) cover security-critical helpers (`_safe_claudex_path`, `_normal
 - **Dynamic collab personas** — `COLLAB_PERSONAS` dict maps request_type → persona instructions
 - **Pydantic input models** — typed inputs for each tool with validation (regex patterns on `model` and `reasoning_summary` to prevent injection)
 - **Enums** — `ReasoningEffort` (4 levels), `RequestType` (7 collab modes)
-- **`_run_codex()` / `_run_codex_once()`** — core async subprocess runner with auto-retry on timeout (effort downgrade), metrics, artifact extraction
+- **`_run_codex()` / `_run_codex_once()`** — core async subprocess runner with auto-retry on timeout (effort downgrade), metrics, artifact extraction, and optional `--output-schema` for structured JSON output
+- **Structured output** — `REVIEW_FILES_SCHEMA` / `REVIEW_DIFF_SCHEMA` define JSON schemas for review tools. `_build_review_system()` toggles between artifact and structured-output instructions. Formatters (`_format_finding`, `_format_review_files_json`, `_format_review_diff_json`) render JSON as rich markdown. Auto-fallback to text mode on JSON parse failure.
 - **Session management** — `_safe_claudex_path()`, `_init_session()`, `_append_to_session()` for iterative debugging
 - **Artifact security** — `_extract_and_save_artifacts()` — path traversal prevention, symlink rejection, size limits
 
@@ -86,6 +87,7 @@ Tests (76 total) cover security-critical helpers (`_safe_claudex_path`, `_normal
 - Run directory cleanup: 1 hour
 - Session termination: 4 rounds max, then auto-rollover (recap + chained session)
 - Diff review max: 50KB diff size, 50 files
+- Structured output: enabled by default for `codex_review_files` and `codex_review_diff` (set `structured_output=False` for legacy text mode)
 
 ## Key Constraints
 

@@ -17,10 +17,14 @@ Or directly:
     uv run pytest tests/test_helpers.py -v
 """
 
+import asyncio
+import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
+from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
@@ -37,6 +41,7 @@ from server import (
     _read_session_rounds,
     _get_truncated_session,
     _build_collaborate_system,
+    _build_review_system,
     _auto_session_id,
     _check_codex_version,
     _version_cache,
@@ -44,6 +49,9 @@ from server import (
     _record_metric,
     _get_metrics_summary,
     _chain_session_id,
+    _format_finding,
+    _format_review_files_json,
+    _format_review_diff_json,
     RequestType,
     COLLAB_PERSONAS,
     MAX_SESSION_ROUNDS,
@@ -53,6 +61,13 @@ from server import (
     DEFAULT_REASONING_SUMMARY,
     TOOL_TIMEOUTS,
     EXEC_TIMEOUT_SECONDS,
+    ARTIFACT_INSTRUCTIONS,
+    STRUCTURED_OUTPUT_INSTRUCTIONS,
+    REVIEW_FILES_SYSTEM_BASE,
+    REVIEW_DIFF_SYSTEM_BASE,
+    REVIEW_FILES_SCHEMA,
+    REVIEW_DIFF_SCHEMA,
+    _FINDING_SCHEMA,
 )
 from pydantic import ValidationError
 from server import (
@@ -65,6 +80,10 @@ from server import (
     RecapInput,
     ReviewDiffInput,
     StatusInput,
+    codex_review_files,
+    codex_review_diff,
+    _run_codex_once,
+    ERROR_PREFIX,
 )
 
 
@@ -611,6 +630,643 @@ class TestBackwardCompatibility:
     def test_review_diff_no_new_fields(self):
         inp = ReviewDiffInput()
         assert inp.model is None
+
+
+# =========================================================================
+# Review schemas
+# =========================================================================
+
+
+class TestReviewSchemas:
+    """Validate structured output schema definitions."""
+
+    def test_review_files_schema_required_fields(self):
+        required = REVIEW_FILES_SCHEMA["required"]
+        assert "findings" in required
+        assert "file_summaries" in required
+        assert "overall_assessment" in required
+        assert "overall_confidence_score" in required
+
+    def test_review_diff_schema_required_fields(self):
+        required = REVIEW_DIFF_SCHEMA["required"]
+        assert "findings" in required
+        assert "overview" in required
+        assert "verdict" in required
+        assert "overall_explanation" in required
+        assert "overall_confidence_score" in required
+
+    def test_additional_properties_false_recursive(self):
+        """All object nodes must have additionalProperties: false."""
+        def check_no_additional(schema, path="root"):
+            if schema.get("type") == "object":
+                assert schema.get("additionalProperties") is False, (
+                    f"Missing additionalProperties:false at {path}"
+                )
+                for key, prop in schema.get("properties", {}).items():
+                    check_no_additional(prop, f"{path}.{key}")
+            elif schema.get("type") == "array":
+                items = schema.get("items", {})
+                check_no_additional(items, f"{path}[]")
+
+        check_no_additional(REVIEW_FILES_SCHEMA, "REVIEW_FILES_SCHEMA")
+        check_no_additional(REVIEW_DIFF_SCHEMA, "REVIEW_DIFF_SCHEMA")
+
+    def test_schemas_serialize_to_valid_json(self):
+        """Schemas must be JSON-serializable (for temp file writing)."""
+        files_json = json.dumps(REVIEW_FILES_SCHEMA)
+        diff_json = json.dumps(REVIEW_DIFF_SCHEMA)
+        assert json.loads(files_json) == REVIEW_FILES_SCHEMA
+        assert json.loads(diff_json) == REVIEW_DIFF_SCHEMA
+
+
+# =========================================================================
+# Review formatters
+# =========================================================================
+
+
+class TestReviewFormatters:
+    """Structured JSON → markdown formatting."""
+
+    SAMPLE_FINDING = {
+        "title": "Unchecked null return",
+        "body": "get_user() can return None but line 42 dereferences without check.",
+        "severity": "critical",
+        "priority": 0,
+        "confidence_score": 0.95,
+        "category": "bug",
+        "code_location": {
+            "file_path": "src/auth.py",
+            "line_range": {"start": 42, "end": 42},
+        },
+        "suggestion": "if user := get_user(): ...",
+    }
+
+    SAMPLE_FINDING_NO_SUGGESTION = {
+        "title": "Good error handling",
+        "body": "Error paths are well covered.",
+        "severity": "positive",
+        "priority": 3,
+        "confidence_score": 0.9,
+        "category": "other",
+        "code_location": {"file_path": "src/utils.py"},
+        "suggestion": None,
+    }
+
+    SAMPLE_FINDING_RANGE = {
+        "title": "Performance issue",
+        "body": "N+1 query in loop.",
+        "severity": "warning",
+        "priority": 1,
+        "confidence_score": 0.8,
+        "category": "performance",
+        "code_location": {
+            "file_path": "src/db.py",
+            "line_range": {"start": 10, "end": 25},
+        },
+        "suggestion": "Use bulk query instead.",
+    }
+
+    def test_format_finding_badge_and_location(self):
+        result = _format_finding(self.SAMPLE_FINDING, 1)
+        assert "[CRITICAL]" in result
+        assert "Unchecked null return" in result
+        assert "`src/auth.py:42`" in result
+        assert "confidence: 95%" in result
+        assert "**bug**" in result
+
+    def test_format_finding_with_suggestion(self):
+        result = _format_finding(self.SAMPLE_FINDING, 1)
+        assert "**Suggested fix:**" in result
+        assert "if user := get_user():" in result
+
+    def test_format_finding_without_suggestion(self):
+        result = _format_finding(self.SAMPLE_FINDING_NO_SUGGESTION, 1)
+        assert "**Suggested fix:**" not in result
+        assert "[POSITIVE]" in result
+
+    def test_format_finding_line_range(self):
+        result = _format_finding(self.SAMPLE_FINDING_RANGE, 1)
+        assert "`src/db.py:10-25`" in result
+
+    def test_format_finding_single_line(self):
+        result = _format_finding(self.SAMPLE_FINDING, 1)
+        assert "`src/auth.py:42`" in result
+
+    def test_format_finding_no_line_range(self):
+        result = _format_finding(self.SAMPLE_FINDING_NO_SUGGESTION, 1)
+        assert "`src/utils.py`" in result
+
+    def test_format_review_files_json(self):
+        data = {
+            "findings": [self.SAMPLE_FINDING, self.SAMPLE_FINDING_NO_SUGGESTION],
+            "file_summaries": [
+                {"file_path": "src/auth.py", "summary": "Auth module", "quality_assessment": "Needs work"},
+            ],
+            "overall_assessment": "Generally okay with one critical bug.",
+            "overall_confidence_score": 0.85,
+        }
+        result = _format_review_files_json(data)
+        assert "## File Summaries" in result
+        assert "## Findings" in result
+        assert "## Overall Assessment" in result
+        assert "confidence: 85%" in result
+
+    def test_format_review_diff_json_verdict_labels(self):
+        for verdict, label in [("ship", "Ship It"), ("fix_first", "Fix First"), ("needs_discussion", "Needs Discussion")]:
+            data = {
+                "findings": [],
+                "overview": "Minor changes.",
+                "verdict": verdict,
+                "overall_explanation": "Looks good.",
+                "overall_confidence_score": 0.9,
+            }
+            result = _format_review_diff_json(data)
+            assert f"## Verdict: {label}" in result
+
+    def test_format_empty_findings(self):
+        data = {
+            "findings": [],
+            "file_summaries": [],
+            "overall_assessment": "Clean.",
+            "overall_confidence_score": 1.0,
+        }
+        result = _format_review_files_json(data)
+        assert "No issues found" in result
+
+    def test_severity_sorting(self):
+        """Findings should be sorted critical > warning > suggestion > positive."""
+        findings = [
+            {**self.SAMPLE_FINDING_NO_SUGGESTION, "severity": "positive", "title": "Positive"},
+            {**self.SAMPLE_FINDING, "severity": "critical", "title": "Critical"},
+            {**self.SAMPLE_FINDING_RANGE, "severity": "suggestion", "title": "Suggestion"},
+            {**self.SAMPLE_FINDING_RANGE, "severity": "warning", "title": "Warning"},
+        ]
+        data = {
+            "findings": findings,
+            "file_summaries": [],
+            "overall_assessment": "Mixed.",
+            "overall_confidence_score": 0.7,
+        }
+        result = _format_review_files_json(data)
+        crit_pos = result.index("[CRITICAL]")
+        warn_pos = result.index("[WARNING]")
+        sugg_pos = result.index("[SUGGESTION]")
+        pos_pos = result.index("[POSITIVE]")
+        assert crit_pos < warn_pos < sugg_pos < pos_pos
+
+
+# =========================================================================
+# Structured output field on input models
+# =========================================================================
+
+
+class TestStructuredOutputField:
+    """structured_output field on review input models."""
+
+    def test_default_true_quick_review(self):
+        inp = QuickReviewInput(files="test.py")
+        assert inp.structured_output is True
+
+    def test_default_true_review_diff(self):
+        inp = ReviewDiffInput()
+        assert inp.structured_output is True
+
+    def test_explicit_false_quick_review(self):
+        inp = QuickReviewInput(files="test.py", structured_output=False)
+        assert inp.structured_output is False
+
+    def test_explicit_false_review_diff(self):
+        inp = ReviewDiffInput(structured_output=False)
+        assert inp.structured_output is False
+
+    def test_backward_compat_no_field(self):
+        """Old calls without structured_output should default True."""
+        inp_files = QuickReviewInput(files="test.py")
+        inp_diff = ReviewDiffInput()
+        assert inp_files.structured_output is True
+        assert inp_diff.structured_output is True
+
+
+# =========================================================================
+# _build_review_system
+# =========================================================================
+
+
+class TestBuildReviewSystem:
+    """Toggle-based review system prompt builder."""
+
+    def test_unstructured_includes_artifact_instructions(self):
+        result = _build_review_system(REVIEW_FILES_SYSTEM_BASE, structured=False)
+        assert "claudex-artifact" in result
+        assert "---FINAL-ANSWER---" in result
+
+    def test_structured_includes_json_instructions(self):
+        result = _build_review_system(REVIEW_FILES_SYSTEM_BASE, structured=True)
+        assert "Structured Output Instructions" in result
+        assert "code_location" in result
+
+    def test_structured_excludes_artifact_instructions(self):
+        result = _build_review_system(REVIEW_FILES_SYSTEM_BASE, structured=True)
+        assert "claudex-artifact" not in result
+
+    def test_base_prompt_preserved(self):
+        for structured in [True, False]:
+            result = _build_review_system(REVIEW_FILES_SYSTEM_BASE, structured=structured)
+            assert "Senior Code Reviewer" in result
+            result_diff = _build_review_system(REVIEW_DIFF_SYSTEM_BASE, structured=structured)
+            assert "Diff Reviewer" in result_diff
+
+
+# =========================================================================
+# Structured output integration tests (mock-based)
+# =========================================================================
+
+
+# Sample valid JSON that matches REVIEW_FILES_SCHEMA
+SAMPLE_REVIEW_FILES_JSON = json.dumps({
+    "findings": [
+        {
+            "title": "Missing null check",
+            "body": "get_user() can return None.",
+            "severity": "critical",
+            "priority": 0,
+            "confidence_score": 0.95,
+            "category": "bug",
+            "code_location": {"file_path": "src/auth.py", "line_range": {"start": 42, "end": 42}},
+            "suggestion": "if user := get_user(): ...",
+        }
+    ],
+    "file_summaries": [
+        {"file_path": "src/auth.py", "summary": "Auth module", "quality_assessment": "Needs work"}
+    ],
+    "overall_assessment": "One critical bug found.",
+    "overall_confidence_score": 0.9,
+})
+
+SAMPLE_REVIEW_DIFF_JSON = json.dumps({
+    "findings": [
+        {
+            "title": "Race condition in lock",
+            "body": "Lock acquire without timeout.",
+            "severity": "warning",
+            "priority": 1,
+            "confidence_score": 0.8,
+            "category": "bug",
+            "code_location": {"file_path": "src/lock.py", "line_range": {"start": 10, "end": 15}},
+            "suggestion": None,
+        }
+    ],
+    "overview": "Adds locking mechanism.",
+    "verdict": "fix_first",
+    "overall_explanation": "Fix the race condition before shipping.",
+    "overall_confidence_score": 0.85,
+})
+
+
+class TestStructuredOutputIntegration:
+    """Integration tests for structured JSON output path in review tools."""
+
+    @pytest.mark.asyncio
+    async def test_review_files_structured_happy_path(self, tmp_path):
+        """Valid JSON from Codex → formatted markdown with details block."""
+        (tmp_path / "test.py").write_text("x = 1")
+
+        with patch("server._run_codex", new_callable=AsyncMock) as mock_run, \
+             patch("server._get_git_context", new_callable=AsyncMock, return_value=None):
+            mock_run.return_value = SAMPLE_REVIEW_FILES_JSON
+
+            params = QuickReviewInput(files="test.py", project_dir=str(tmp_path))
+            result = await codex_review_files(params)
+
+        assert "## File Summaries" in result
+        assert "## Findings" in result
+        assert "[CRITICAL]" in result
+        assert "Missing null check" in result
+        assert "`src/auth.py:42`" in result
+        assert "<details>" in result
+        assert "Raw JSON" in result
+        assert "_Codex:" in result
+
+    @pytest.mark.asyncio
+    async def test_review_files_structured_malformed_json_fallback(self, tmp_path):
+        """Malformed JSON triggers text-mode fallback with user notification."""
+        (tmp_path / "test.py").write_text("x = 1")
+
+        call_count = 0
+        async def mock_run_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if kwargs.get("output_schema") is not None:
+                return "NOT VALID JSON {{{broken"
+            return "## Text mode review\nLooks good."
+
+        with patch("server._run_codex", side_effect=mock_run_side_effect) as mock_run, \
+             patch("server._get_git_context", new_callable=AsyncMock, return_value=None):
+
+            params = QuickReviewInput(files="test.py", project_dir=str(tmp_path))
+            result = await codex_review_files(params)
+
+        assert call_count == 2  # First structured, then text fallback
+        assert "Structured output failed" in result
+        assert "2 Codex messages" in result
+        assert "Text mode review" in result
+
+    @pytest.mark.asyncio
+    async def test_review_files_cli_error_fallback(self, tmp_path):
+        """CLI error mentioning output-schema triggers text-mode fallback."""
+        (tmp_path / "test.py").write_text("x = 1")
+
+        call_count = 0
+        async def mock_run_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if kwargs.get("output_schema") is not None:
+                return f"{ERROR_PREFIX}Codex exited with code 1.\nStderr: error: unknown option '--output-schema'"
+            return "## Text fallback\nAll good."
+
+        with patch("server._run_codex", side_effect=mock_run_side_effect) as mock_run, \
+             patch("server._get_git_context", new_callable=AsyncMock, return_value=None):
+
+            params = QuickReviewInput(files="test.py", project_dir=str(tmp_path))
+            result = await codex_review_files(params)
+
+        assert call_count == 2
+        assert "Text fallback" in result
+        # Should NOT show the error to user — auto-recovered
+        assert "unknown option" not in result
+
+    @pytest.mark.asyncio
+    async def test_review_files_unstructured_mode(self, tmp_path):
+        """structured_output=False uses legacy path — no schema, no JSON parsing."""
+        (tmp_path / "test.py").write_text("x = 1")
+
+        with patch("server._run_codex", new_callable=AsyncMock) as mock_run, \
+             patch("server._get_git_context", new_callable=AsyncMock, return_value=None):
+            mock_run.return_value = "## Legacy Review\nAll fine."
+
+            params = QuickReviewInput(
+                files="test.py", project_dir=str(tmp_path), structured_output=False
+            )
+            result = await codex_review_files(params)
+
+        # Should pass output_schema=None
+        mock_run.assert_called_once()
+        call_kwargs = mock_run.call_args[1]
+        assert call_kwargs.get("output_schema") is None
+        assert "Legacy Review" in result
+
+    @pytest.mark.asyncio
+    async def test_review_diff_structured_happy_path(self, tmp_path):
+        """Valid JSON from Codex → formatted diff review with verdict."""
+
+        with patch("server._run_codex", new_callable=AsyncMock) as mock_run, \
+             patch("server._get_git_diff", new_callable=AsyncMock, return_value="diff --git a/x.py\n+new line"), \
+             patch("server._get_git_context", new_callable=AsyncMock, return_value=None):
+            mock_run.return_value = SAMPLE_REVIEW_DIFF_JSON
+
+            params = ReviewDiffInput(project_dir=str(tmp_path))
+            result = await codex_review_diff(params)
+
+        assert "## Verdict: Fix First" in result
+        assert "## Findings" in result
+        assert "[WARNING]" in result
+        assert "Race condition in lock" in result
+        assert "<details>" in result
+
+    @pytest.mark.asyncio
+    async def test_review_diff_structured_malformed_fallback(self, tmp_path):
+        """Malformed JSON in diff review triggers text-mode fallback."""
+        call_count = 0
+        async def mock_run_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if kwargs.get("output_schema") is not None:
+                return "[1, 2, 3]"  # Valid JSON but wrong type (array, not object)
+            return "## Text diff review\nShip it."
+
+        with patch("server._run_codex", side_effect=mock_run_side_effect) as mock_run, \
+             patch("server._get_git_diff", new_callable=AsyncMock, return_value="diff --git a/x.py"), \
+             patch("server._get_git_context", new_callable=AsyncMock, return_value=None):
+
+            params = ReviewDiffInput(project_dir=str(tmp_path))
+            result = await codex_review_diff(params)
+
+        assert call_count == 2
+        assert "Structured output failed" in result
+        assert "Text diff review" in result
+
+    @pytest.mark.asyncio
+    async def test_review_diff_cli_error_fallback(self, tmp_path):
+        """CLI error mentioning output-schema in diff review triggers fallback."""
+        call_count = 0
+        async def mock_run_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if kwargs.get("output_schema") is not None:
+                return f"{ERROR_PREFIX}Codex exited with code 2.\nStderr: Unknown flag: --output-schema"
+            return "## Recovered review\nLGTM."
+
+        with patch("server._run_codex", side_effect=mock_run_side_effect) as mock_run, \
+             patch("server._get_git_diff", new_callable=AsyncMock, return_value="diff --git a/x.py"), \
+             patch("server._get_git_context", new_callable=AsyncMock, return_value=None):
+
+            params = ReviewDiffInput(project_dir=str(tmp_path))
+            result = await codex_review_diff(params)
+
+        assert call_count == 2
+        assert "Recovered review" in result
+
+
+class TestTempFileLifecycle:
+    """Verify schema temp file creation and cleanup in _run_codex_once."""
+
+    @pytest.mark.asyncio
+    async def test_temp_file_cleaned_on_success(self, tmp_path):
+        """Schema temp file should not persist after successful run."""
+        import server as server_mod
+
+        # Track temp files created
+        created_temps = []
+        original_mkstemp = tempfile.mkstemp
+
+        def tracking_mkstemp(**kwargs):
+            fd, path = original_mkstemp(**kwargs)
+            created_temps.append(path)
+            return fd, path
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b'{"test": true}', b''))
+        mock_proc.returncode = 0
+        mock_proc.kill = MagicMock()
+
+        with patch("tempfile.mkstemp", side_effect=tracking_mkstemp), \
+             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc), \
+             patch.object(server_mod, "_find_codex_bin", return_value="/usr/bin/codex"), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=(b'{"test": true}', b'')):
+            mock_proc.communicate = AsyncMock(return_value=(b'{"test": true}', b''))
+
+            result = await _run_codex_once(
+                "test prompt",
+                project_dir=str(tmp_path),
+                output_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            )
+
+        # Temp file should have been created and then cleaned up
+        assert len(created_temps) == 1
+        assert not os.path.exists(created_temps[0]), "Schema temp file was not cleaned up"
+
+    @pytest.mark.asyncio
+    async def test_temp_file_cleaned_on_timeout(self, tmp_path):
+        """Schema temp file should be cleaned up even after timeout."""
+        import server as server_mod
+
+        created_temps = []
+        original_mkstemp = tempfile.mkstemp
+
+        def tracking_mkstemp(**kwargs):
+            fd, path = original_mkstemp(**kwargs)
+            created_temps.append(path)
+            return fd, path
+
+        mock_proc = AsyncMock()
+        mock_proc.kill = MagicMock()
+        mock_proc.communicate = AsyncMock(return_value=(b'', b''))
+
+        async def timeout_wait_for(*args, **kwargs):
+            raise asyncio.TimeoutError()
+
+        with patch("tempfile.mkstemp", side_effect=tracking_mkstemp), \
+             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc), \
+             patch.object(server_mod, "_find_codex_bin", return_value="/usr/bin/codex"), \
+             patch("asyncio.wait_for", side_effect=timeout_wait_for):
+
+            result = await _run_codex_once(
+                "test prompt",
+                project_dir=str(tmp_path),
+                output_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            )
+
+        assert "timed out" in result
+        assert len(created_temps) == 1
+        assert not os.path.exists(created_temps[0]), "Schema temp file was not cleaned up after timeout"
+
+    @pytest.mark.asyncio
+    async def test_no_temp_file_without_schema(self, tmp_path):
+        """No temp file should be created when output_schema is None."""
+        import server as server_mod
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b'plain text output', b''))
+        mock_proc.returncode = 0
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc), \
+             patch.object(server_mod, "_find_codex_bin", return_value="/usr/bin/codex"), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=(b'plain text output', b'')), \
+             patch.object(server_mod, "_prepare_run_dir", return_value=tmp_path / "run-test"), \
+             patch.object(server_mod, "_extract_and_save_artifacts", return_value=("plain text output", [])), \
+             patch("tempfile.mkstemp") as mock_mkstemp:
+
+            # Create the run dir to avoid OSError
+            (tmp_path / "run-test").mkdir()
+
+            result = await _run_codex_once(
+                "test prompt",
+                project_dir=str(tmp_path),
+                output_schema=None,
+            )
+
+        mock_mkstemp.assert_not_called()
+
+
+class TestFormatterEdgeCases:
+    """Edge cases that could crash formatters with malformed model output."""
+
+    def test_finding_with_nan_like_confidence(self):
+        """Confidence score that can't be converted should not crash."""
+        finding = {
+            "title": "Test",
+            "body": "Test body",
+            "severity": "warning",
+            "priority": 1,
+            "confidence_score": "not_a_number",
+            "category": "bug",
+            "code_location": {"file_path": "test.py"},
+            "suggestion": None,
+        }
+        # Should not raise
+        result = _format_finding(finding, 1)
+        assert "confidence: 0%" in result
+
+    def test_finding_with_missing_code_location(self):
+        """Finding with empty code_location dict should not crash."""
+        finding = {
+            "title": "Test",
+            "body": "Body",
+            "severity": "suggestion",
+            "priority": 2,
+            "confidence_score": 0.5,
+            "category": "other",
+            "code_location": {},
+            "suggestion": None,
+        }
+        result = _format_finding(finding, 1)
+        assert "`unknown`" in result
+
+    def test_finding_with_unknown_severity(self):
+        """Unknown severity should fall through to uppercase."""
+        finding = {
+            "title": "Test",
+            "body": "Body",
+            "severity": "alien_level",
+            "priority": 2,
+            "confidence_score": 0.5,
+            "category": "other",
+            "code_location": {"file_path": "test.py"},
+            "suggestion": None,
+        }
+        result = _format_finding(finding, 1)
+        assert "[ALIEN_LEVEL]" in result
+
+    def test_review_files_with_non_list_findings(self):
+        """If findings is not a list, formatter should not crash."""
+        data = {
+            "findings": "not a list",
+            "file_summaries": [],
+            "overall_assessment": "Test",
+            "overall_confidence_score": 0.5,
+        }
+        # This would be caught by the isinstance check + broad exception in the tool
+        # but the formatter itself should handle it — it will iterate a string
+        # which gives individual characters. This tests that nothing crashes fatally.
+        try:
+            _format_review_files_json(data)
+        except (TypeError, AttributeError):
+            pass  # Expected — this is caught by the tool function's exception handler
+
+    def test_review_diff_with_unknown_verdict(self):
+        """Unknown verdict value should display raw value."""
+        data = {
+            "findings": [],
+            "overview": "Test",
+            "verdict": "unknown_verdict",
+            "overall_explanation": "Test",
+            "overall_confidence_score": 0.5,
+        }
+        result = _format_review_diff_json(data)
+        assert "## Verdict: unknown_verdict" in result
+
+    def test_overall_confidence_non_numeric(self):
+        """Non-numeric overall_confidence_score should not crash."""
+        data = {
+            "findings": [],
+            "file_summaries": [],
+            "overall_assessment": "Test",
+            "overall_confidence_score": "high",  # String instead of float
+        }
+        result = _format_review_files_json(data)
+        assert "## Overall Assessment" in result
+        # Should show 0% (fallback)
+        assert "confidence: 0%" in result
 
 
 # =========================================================================

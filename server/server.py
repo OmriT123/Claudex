@@ -31,10 +31,12 @@ Requires:
 """
 
 import asyncio
+import json
 import os
 import re
 import shutil
 import logging
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -318,7 +320,7 @@ def _build_collaborate_system(request_type: RequestType) -> str:
     return CODEBASE_FIRST_PREAMBLE + _COLLAB_BASE + persona + ARTIFACT_INSTRUCTIONS
 
 
-REVIEW_FILES_SYSTEM = CODEBASE_FIRST_PREAMBLE_LIGHT + """\
+REVIEW_FILES_SYSTEM_BASE = CODEBASE_FIRST_PREAMBLE_LIGHT + """\
 ## Your Role: Senior Code Reviewer
 
 You are reviewing specific files for quality, correctness, and maintainability.
@@ -337,7 +339,9 @@ Structure your review per file:
 2. **Issues** — Bugs, risks, or correctness problems (with line references)
 3. **Improvements** — Maintainability and performance suggestions
 4. **Conventions** — Does it match the project's patterns? Deviations noted.
-""" + ARTIFACT_INSTRUCTIONS
+"""
+# Legacy alias for backward compatibility (text mode uses artifact instructions)
+REVIEW_FILES_SYSTEM = REVIEW_FILES_SYSTEM_BASE + ARTIFACT_INSTRUCTIONS
 
 EVALUATE_SYSTEM = CODEBASE_FIRST_PREAMBLE + """\
 ## Your Role: Technical Advisor
@@ -383,7 +387,7 @@ Structure the record as:
 5. **Open Items** — Anything unresolved or needing follow-up
 """ + ARTIFACT_INSTRUCTIONS
 
-REVIEW_DIFF_SYSTEM = CODEBASE_FIRST_PREAMBLE_LIGHT + """\
+REVIEW_DIFF_SYSTEM_BASE = CODEBASE_FIRST_PREAMBLE_LIGHT + """\
 ## Your Role: Diff Reviewer
 
 You are reviewing a git diff — the actual changes about to be committed or recently made.
@@ -402,12 +406,113 @@ Structure your review as:
 3. **Warnings** — Things that might cause problems later
 4. **Suggestions** — Improvements to the changed code
 5. **Verdict** — Ship / Fix first / Needs discussion
-""" + ARTIFACT_INSTRUCTIONS
+"""
+# Legacy alias for backward compatibility (text mode uses artifact instructions)
+REVIEW_DIFF_SYSTEM = REVIEW_DIFF_SYSTEM_BASE + ARTIFACT_INSTRUCTIONS
+
+STRUCTURED_OUTPUT_INSTRUCTIONS = """
+
+## Structured Output Instructions
+
+You MUST return valid JSON matching the provided schema. Key rules:
+- Every finding MUST include `file_path` in `code_location` — use the actual file path from the codebase.
+- Include `line_range` (start/end) whenever you can identify specific lines. Omit it only for architectural or file-level findings.
+- Put concrete code fix suggestions in the `suggestion` field as plain text (not markdown code blocks). Set to null if no fix applies.
+- `confidence_score` is 0.0-1.0 representing how confident you are in this finding.
+- `priority` is 0=critical, 1=high, 2=medium, 3=low.
+- Do NOT include the `---FINAL-ANSWER---` delimiter or artifact blocks — return only the JSON object.
+"""
+
+
+def _build_review_system(base_prompt: str, structured: bool) -> str:
+    """Build a review system prompt with either artifact or structured-output instructions.
+
+    Args:
+        base_prompt: The base system prompt text (without ARTIFACT_INSTRUCTIONS).
+        structured: If True, append structured-output instructions. If False, append artifact instructions.
+    """
+    if structured:
+        return base_prompt + STRUCTURED_OUTPUT_INSTRUCTIONS
+    return base_prompt + ARTIFACT_INSTRUCTIONS
 
 # Diff review constants
 DIFF_MAX_BYTES = 50_000
 DIFF_MAX_FILES = 50
 GIT_CONTEXT_STAGED_DIFF_MAX = 5_000
+
+# ---------------------------------------------------------------------------
+# Structured output schemas for review tools
+# ---------------------------------------------------------------------------
+
+_FINDING_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "body": {"type": "string"},
+        "severity": {"type": "string", "enum": ["critical", "warning", "suggestion", "positive"]},
+        "priority": {"type": "integer"},
+        "confidence_score": {"type": "number"},
+        "category": {
+            "type": "string",
+            "enum": ["bug", "security", "performance", "error_handling",
+                     "maintainability", "convention", "logic", "other"],
+        },
+        "code_location": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "line_range": {
+                    "type": "object",
+                    "properties": {"start": {"type": "integer"}, "end": {"type": "integer"}},
+                    "required": ["start", "end"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["file_path"],
+            "additionalProperties": False,
+        },
+        "suggestion": {"type": ["string", "null"]},
+    },
+    "required": ["title", "body", "severity", "priority", "confidence_score", "category", "code_location"],
+    "additionalProperties": False,
+}
+
+REVIEW_FILES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "findings": {"type": "array", "items": _FINDING_SCHEMA},
+        "file_summaries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "quality_assessment": {"type": "string"},
+                },
+                "required": ["file_path", "summary", "quality_assessment"],
+                "additionalProperties": False,
+            },
+        },
+        "overall_assessment": {"type": "string"},
+        "overall_confidence_score": {"type": "number"},
+    },
+    "required": ["findings", "file_summaries", "overall_assessment", "overall_confidence_score"],
+    "additionalProperties": False,
+}
+
+REVIEW_DIFF_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "findings": {"type": "array", "items": _FINDING_SCHEMA},
+        "overview": {"type": "string"},
+        "verdict": {"type": "string", "enum": ["ship", "fix_first", "needs_discussion"]},
+        "overall_explanation": {"type": "string"},
+        "overall_confidence_score": {"type": "number"},
+    },
+    "required": ["findings", "overview", "verdict", "overall_explanation", "overall_confidence_score"],
+    "additionalProperties": False,
+}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1176,6 +1281,10 @@ class QuickReviewInput(BaseModel):
             "'maintainability', or a custom focus area."
         ),
     )
+    structured_output: bool = Field(
+        default=True,
+        description="Return structured JSON findings. Set False for free-text output.",
+    )
     project_dir: Optional[str] = Field(
         default=None,
         description="Absolute path to the project directory. Defaults to cwd.",
@@ -1309,6 +1418,10 @@ class ReviewDiffInput(BaseModel):
     staged: bool = Field(
         default=False,
         description="If True, review only staged changes (git diff --staged). If False, review all unstaged changes.",
+    )
+    structured_output: bool = Field(
+        default=True,
+        description="Return structured JSON findings. Set False for free-text output.",
     )
     context: Optional[str] = Field(
         default=None,
@@ -1452,12 +1565,20 @@ async def _run_codex_once(
     reasoning_summary: str = DEFAULT_REASONING_SUMMARY,
     timeout: int = EXEC_TIMEOUT_SECONDS,
     tool_name: str = "",
+    output_schema: Optional[dict] = None,
 ) -> str:
     """
     Run Codex CLI in non-interactive, read-only mode and return the output.
 
     This is the low-level runner. Use ``_run_codex`` for the wrapper with
     metrics, auto-retry on timeout, and version check.
+
+    When ``output_schema`` is provided, Codex is instructed to return structured
+    JSON matching the schema via ``--output-schema``. Artifact extraction is
+    skipped in this mode (structured output replaces artifacts for review tools).
+
+    Return type is always ``str`` — even when output_schema is set, the JSON is
+    returned as a string. Parsing happens in the tool functions.
 
     Uses ``codex`` with:
       --sandbox read-only         -> Codex can read the repo but cannot edit or run commands
@@ -1467,6 +1588,7 @@ async def _run_codex_once(
       -c model_reasoning_effort   -> Reasoning depth
       -c model_reasoning_summary  -> Gets chain-of-thought reasoning
       --cd <dir>                  -> Working directory (project root)
+      --output-schema <file>      -> (optional) Constrain output to JSON schema
     """
     # Validate project directory (distinct error from codex binary not found)
     try:
@@ -1485,12 +1607,27 @@ async def _run_codex_once(
         "-c", f"model_reasoning_effort={reasoning_effort}",
         "-c", f"model_reasoning_summary={reasoning_summary}",
         "--cd", cwd,
-        prompt,
     ]
 
+    # Write schema to temp file if structured output requested
+    schema_tmp_path = None
+    if output_schema is not None:
+        try:
+            schema_fd, schema_tmp_path = tempfile.mkstemp(suffix=".json")
+            with os.fdopen(schema_fd, "w", encoding="utf-8") as f:
+                json.dump(output_schema, f)
+            cmd.extend(["--output-schema", schema_tmp_path])
+        except OSError as exc:
+            logger.warning("Failed to write schema temp file: %s", exc)
+            schema_tmp_path = None
+            output_schema = None  # Disable structured path entirely
+
+    cmd.append(prompt)
+
     logger.info(
-        "Running Codex: model=%s effort=%s summary=%s tool=%s cwd=%s",
+        "Running Codex: model=%s effort=%s summary=%s tool=%s cwd=%s schema=%s",
         model, reasoning_effort, reasoning_summary, tool_name, cwd,
+        "yes" if output_schema else "no",
     )
 
     try:
@@ -1521,6 +1658,13 @@ async def _run_codex_once(
             "Then authenticate:\n"
             "  codex login"
         )
+    finally:
+        # Clean up schema temp file
+        if schema_tmp_path:
+            try:
+                os.unlink(schema_tmp_path)
+            except OSError:
+                pass
 
     if proc.returncode != 0:
         err_msg = stderr.decode(errors="replace").strip()
@@ -1547,6 +1691,10 @@ async def _run_codex_once(
             f"{ERROR_PREFIX}Codex returned no output. "
             "Try being more specific or provide focus_files to direct attention."
         )
+
+    # When using structured output, skip artifact extraction — return raw JSON string
+    if output_schema is not None:
+        return output
 
     # --- Artifact extraction ---
     # Create a per-run directory and extract any artifact blocks from the
@@ -1588,6 +1736,7 @@ async def _run_codex(
     reasoning_summary: str = DEFAULT_REASONING_SUMMARY,
     timeout: int = EXEC_TIMEOUT_SECONDS,
     tool_name: str = "",
+    output_schema: Optional[dict] = None,
 ) -> str:
     """
     High-level Codex runner with metrics, auto-retry on timeout, and version check.
@@ -1596,6 +1745,10 @@ async def _run_codex(
       - Metrics recording (success/timeout/error + elapsed time)
       - Auto-downgrade on timeout (xhigh->high, high->medium) with one retry
       - Version check warning on first invocation
+
+    When ``output_schema`` is set, ALL text mutations (version warning, retry note,
+    metadata footer) are suppressed to keep the JSON output clean. Metrics recording
+    still happens.
     """
     start_time = time.monotonic()
 
@@ -1607,6 +1760,7 @@ async def _run_codex(
         reasoning_summary=reasoning_summary,
         timeout=timeout,
         tool_name=tool_name,
+        output_schema=output_schema,
     )
 
     elapsed = time.monotonic() - start_time
@@ -1631,6 +1785,7 @@ async def _run_codex(
             reasoning_summary=reasoning_summary,
             timeout=timeout,
             tool_name=tool_name,
+            output_schema=output_schema,
         )
         retry_elapsed = time.monotonic() - retry_start
         retry_timed_out = result.startswith(ERROR_PREFIX) and "timed out" in result
@@ -1638,7 +1793,7 @@ async def _run_codex(
 
         _record_metric(tool_name, success=retry_success, elapsed=retry_elapsed, timed_out=retry_timed_out)
 
-        if retry_success:
+        if retry_success and output_schema is None:
             result = (
                 f"**Note:** Original call timed out at {reasoning_effort}. "
                 f"Auto-retried with {downgraded}.\n\n"
@@ -1646,6 +1801,10 @@ async def _run_codex(
             # Update for metadata footer
             elapsed = time.monotonic() - start_time
             reasoning_effort = downgraded
+
+    # When output_schema is set, suppress ALL text mutations to keep JSON clean
+    if output_schema is not None:
+        return result
 
     # Append metadata footer
     if not result.startswith(ERROR_PREFIX):
@@ -1657,6 +1816,143 @@ async def _run_codex(
         result = version_warning + "\n" + result
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Structured output formatters
+# ---------------------------------------------------------------------------
+
+_SEVERITY_BADGE = {
+    "critical": "CRITICAL",
+    "warning": "WARNING",
+    "suggestion": "SUGGESTION",
+    "positive": "POSITIVE",
+}
+
+_VERDICT_LABEL = {
+    "ship": "Ship It",
+    "fix_first": "Fix First",
+    "needs_discussion": "Needs Discussion",
+}
+
+
+def _format_finding(finding: dict, index: int) -> str:
+    """Render a single finding as markdown."""
+    severity = finding.get("severity", "warning")
+    badge = _SEVERITY_BADGE.get(severity, severity.upper())
+    title = finding.get("title", "Untitled")
+    category = finding.get("category", "other")
+    raw_confidence = finding.get("confidence_score", 0)
+    # Guard against NaN/Infinity from malformed model output
+    try:
+        confidence = max(0.0, min(1.0, float(raw_confidence)))
+    except (ValueError, TypeError):
+        confidence = 0.0
+    priority = finding.get("priority", 2)
+    body = finding.get("body", "")
+
+    # Location
+    loc = finding.get("code_location", {})
+    file_path = loc.get("file_path", "unknown")
+    line_range = loc.get("line_range")
+    if line_range:
+        start = line_range.get("start", 0)
+        end = line_range.get("end", 0)
+        if start == end:
+            location_str = f"`{file_path}:{start}`"
+        else:
+            location_str = f"`{file_path}:{start}-{end}`"
+    else:
+        location_str = f"`{file_path}`"
+
+    lines = [
+        f"### {index}. [{badge}] {title}",
+        f"**{category}** | {location_str} | confidence: {int(confidence * 100)}% | priority: {priority}",
+        "",
+        body,
+    ]
+
+    suggestion = finding.get("suggestion")
+    if suggestion:
+        lines.extend(["", "**Suggested fix:**", f"```\n{suggestion}\n```"])
+
+    return "\n".join(lines)
+
+
+def _format_review_files_json(data: dict) -> str:
+    """Format structured review_files JSON as rich markdown."""
+    parts = []
+
+    # File summaries
+    file_summaries = data.get("file_summaries", [])
+    if file_summaries:
+        parts.append("## File Summaries\n")
+        for fs in file_summaries:
+            parts.append(f"**`{fs.get('file_path', 'unknown')}`** — {fs.get('summary', '')}")
+            parts.append(f"Quality: {fs.get('quality_assessment', 'N/A')}\n")
+
+    # Findings sorted by priority (critical first)
+    findings = data.get("findings", [])
+    if findings:
+        severity_order = {"critical": 0, "warning": 1, "suggestion": 2, "positive": 3}
+        sorted_findings = sorted(findings, key=lambda f: severity_order.get(f.get("severity", "other"), 99))
+        parts.append("## Findings\n")
+        for i, finding in enumerate(sorted_findings, 1):
+            parts.append(_format_finding(finding, i))
+            parts.append("")
+    else:
+        parts.append("## Findings\n\nNo issues found.\n")
+
+    # Overall assessment
+    overall = data.get("overall_assessment", "")
+    try:
+        overall_conf = max(0.0, min(1.0, float(data.get("overall_confidence_score", 0))))
+    except (ValueError, TypeError):
+        overall_conf = 0.0
+    if overall:
+        parts.append(f"## Overall Assessment (confidence: {int(overall_conf * 100)}%)\n")
+        parts.append(overall)
+
+    return "\n".join(parts)
+
+
+def _format_review_diff_json(data: dict) -> str:
+    """Format structured review_diff JSON as rich markdown."""
+    parts = []
+
+    # Overview
+    overview = data.get("overview", "")
+    if overview:
+        parts.append(f"## Overview\n\n{overview}\n")
+
+    # Verdict
+    verdict = data.get("verdict", "needs_discussion")
+    verdict_label = _VERDICT_LABEL.get(verdict, verdict)
+    parts.append(f"## Verdict: {verdict_label}\n")
+
+    # Findings sorted by priority
+    findings = data.get("findings", [])
+    if findings:
+        severity_order = {"critical": 0, "warning": 1, "suggestion": 2, "positive": 3}
+        sorted_findings = sorted(findings, key=lambda f: severity_order.get(f.get("severity", "other"), 99))
+        parts.append("## Findings\n")
+        for i, finding in enumerate(sorted_findings, 1):
+            parts.append(_format_finding(finding, i))
+            parts.append("")
+    else:
+        parts.append("## Findings\n\nNo issues found.\n")
+
+    # Explanation
+    explanation = data.get("overall_explanation", "")
+    try:
+        overall_conf = max(0.0, min(1.0, float(data.get("overall_confidence_score", 0))))
+    except (ValueError, TypeError):
+        overall_conf = 0.0
+    if explanation:
+        parts.append(f"## Explanation (confidence: {int(overall_conf * 100)}%)\n")
+        parts.append(explanation)
+
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -2065,8 +2361,9 @@ async def codex_review_files(params: QuickReviewInput) -> str:
     """Get a focused code review from Codex on specific files.
 
     Codex reads the specified files (and surrounding codebase for context)
-    and provides targeted feedback. Useful for getting a different perspective
-    on code you've just written or are about to refactor.
+    and provides targeted feedback. Returns structured JSON findings by default
+    (severity, file paths, line numbers, confidence scores, code suggestions)
+    formatted as rich markdown. Set structured_output=False for free-text output.
 
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     Read them when referenced in the output.
@@ -2077,7 +2374,9 @@ async def codex_review_files(params: QuickReviewInput) -> str:
     if not normalized:
         return f"{ERROR_PREFIX}No valid files to review. Check the file paths and try again."
 
-    parts = [REVIEW_FILES_SYSTEM, "\n---\n"]
+    use_structured = params.structured_output
+    system_prompt = _build_review_system(REVIEW_FILES_SYSTEM_BASE, structured=use_structured)
+    parts = [system_prompt, "\n---\n"]
 
     if params.user_prompt:
         parts.append(
@@ -2105,7 +2404,13 @@ async def codex_review_files(params: QuickReviewInput) -> str:
     effective_timeout = params.timeout_seconds or TOOL_TIMEOUTS.get("codex_review_files", EXEC_TIMEOUT_SECONDS)
     effective_summary = params.reasoning_summary or DEFAULT_REASONING_SUMMARY
 
-    return await _run_codex(
+    schema = REVIEW_FILES_SCHEMA if use_structured else None
+
+    # Build content parts separately (for clean fallback reconstruction)
+    content_parts = parts[2:]  # Everything after [system_prompt, separator]
+
+    start_time = time.monotonic()
+    result = await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
         model=effective_model,
@@ -2113,7 +2418,60 @@ async def codex_review_files(params: QuickReviewInput) -> str:
         reasoning_summary=effective_summary,
         timeout=effective_timeout,
         tool_name="codex_review_files",
+        output_schema=schema,
     )
+    elapsed = time.monotonic() - start_time
+
+    # Auto-fallback on CLI error when structured mode is on (e.g., old Codex CLI
+    # that doesn't support --output-schema). Errors hit ERROR_PREFIX, not JSON parse.
+    if use_structured and result.startswith(ERROR_PREFIX) and "output-schema" in result.lower():
+        logger.warning("Codex CLI may not support --output-schema, retrying in text mode")
+        fallback_parts = [_build_review_system(REVIEW_FILES_SYSTEM_BASE, structured=False), "\n---\n"]
+        fallback_parts.extend(content_parts)
+        return await _run_codex(
+            "\n".join(fallback_parts),
+            project_dir=cwd,
+            model=effective_model,
+            reasoning_effort=params.reasoning_effort.value,
+            reasoning_summary=effective_summary,
+            timeout=effective_timeout,
+            tool_name="codex_review_files",
+        )
+
+    # If structured output, parse JSON and format as markdown
+    if use_structured and not result.startswith(ERROR_PREFIX):
+        try:
+            data = json.loads(result)
+            if not isinstance(data, dict):
+                raise TypeError(f"Expected JSON object, got {type(data).__name__}")
+            formatted = _format_review_files_json(data)
+            # Append raw JSON in collapsed details block
+            formatted += f"\n\n<details>\n<summary>Raw JSON</summary>\n\n```json\n{result}\n```\n</details>"
+            formatted += f"\n\n---\n_Codex: {effective_model}, {params.reasoning_effort.value}, {elapsed:.0f}s_"
+            return formatted
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError) as exc:
+            logger.warning(
+                "Structured output parse failed for codex_review_files, "
+                "retrying in text mode: %s", exc,
+            )
+            # Auto-fallback: retry in text mode (costs 1 additional Codex call)
+            fallback_parts = [_build_review_system(REVIEW_FILES_SYSTEM_BASE, structured=False), "\n---\n"]
+            fallback_parts.extend(content_parts)
+            fallback_result = await _run_codex(
+                "\n".join(fallback_parts),
+                project_dir=cwd,
+                model=effective_model,
+                reasoning_effort=params.reasoning_effort.value,
+                reasoning_summary=effective_summary,
+                timeout=effective_timeout,
+                tool_name="codex_review_files",
+            )
+            return (
+                "**Note:** Structured output failed; auto-retried in text mode "
+                "(2 Codex messages used this call).\n\n"
+            ) + fallback_result
+
+    return result
 
 
 @mcp.tool(
@@ -2299,8 +2657,10 @@ async def codex_review_diff(params: ReviewDiffInput) -> str:
     """Get Codex to review your git diff — staged or unstaged changes.
 
     Codex reads the actual diff and surrounding codebase context to find
-    bugs, risks, and issues introduced by the changes. Use before committing
-    or as a pre-PR sanity check.
+    bugs, risks, and issues introduced by the changes. Returns structured JSON
+    findings by default with verdict (ship/fix_first/needs_discussion), severity,
+    confidence scores, and code suggestions. Set structured_output=False for
+    free-text output.
 
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     """
@@ -2311,7 +2671,9 @@ async def codex_review_diff(params: ReviewDiffInput) -> str:
         diff_type = "staged" if params.staged else "unstaged"
         return f"{ERROR_PREFIX}No {diff_type} changes found. Nothing to review."
 
-    parts = [REVIEW_DIFF_SYSTEM, "\n---\n"]
+    use_structured = params.structured_output
+    system_prompt = _build_review_system(REVIEW_DIFF_SYSTEM_BASE, structured=use_structured)
+    parts = [system_prompt, "\n---\n"]
 
     if params.user_prompt:
         parts.append(
@@ -2339,7 +2701,13 @@ async def codex_review_diff(params: ReviewDiffInput) -> str:
     effective_timeout = params.timeout_seconds or TOOL_TIMEOUTS.get("codex_review_diff", EXEC_TIMEOUT_SECONDS)
     effective_summary = params.reasoning_summary or DEFAULT_REASONING_SUMMARY
 
-    return await _run_codex(
+    schema = REVIEW_DIFF_SCHEMA if use_structured else None
+
+    # Build content parts separately (for clean fallback reconstruction)
+    content_parts = parts[2:]  # Everything after [system_prompt, separator]
+
+    start_time = time.monotonic()
+    result = await _run_codex(
         "\n".join(parts),
         project_dir=cwd,
         model=effective_model,
@@ -2347,7 +2715,60 @@ async def codex_review_diff(params: ReviewDiffInput) -> str:
         reasoning_summary=effective_summary,
         timeout=effective_timeout,
         tool_name="codex_review_diff",
+        output_schema=schema,
     )
+    elapsed = time.monotonic() - start_time
+
+    # Auto-fallback on CLI error when structured mode is on (e.g., old Codex CLI
+    # that doesn't support --output-schema). Errors hit ERROR_PREFIX, not JSON parse.
+    if use_structured and result.startswith(ERROR_PREFIX) and "output-schema" in result.lower():
+        logger.warning("Codex CLI may not support --output-schema, retrying in text mode")
+        fallback_parts = [_build_review_system(REVIEW_DIFF_SYSTEM_BASE, structured=False), "\n---\n"]
+        fallback_parts.extend(content_parts)
+        return await _run_codex(
+            "\n".join(fallback_parts),
+            project_dir=cwd,
+            model=effective_model,
+            reasoning_effort=params.reasoning_effort.value,
+            reasoning_summary=effective_summary,
+            timeout=effective_timeout,
+            tool_name="codex_review_diff",
+        )
+
+    # If structured output, parse JSON and format as markdown
+    if use_structured and not result.startswith(ERROR_PREFIX):
+        try:
+            data = json.loads(result)
+            if not isinstance(data, dict):
+                raise TypeError(f"Expected JSON object, got {type(data).__name__}")
+            formatted = _format_review_diff_json(data)
+            # Append raw JSON in collapsed details block
+            formatted += f"\n\n<details>\n<summary>Raw JSON</summary>\n\n```json\n{result}\n```\n</details>"
+            formatted += f"\n\n---\n_Codex: {effective_model}, {params.reasoning_effort.value}, {elapsed:.0f}s_"
+            return formatted
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError) as exc:
+            logger.warning(
+                "Structured output parse failed for codex_review_diff, "
+                "retrying in text mode: %s", exc,
+            )
+            # Auto-fallback: retry in text mode (costs 1 additional Codex call)
+            fallback_parts = [_build_review_system(REVIEW_DIFF_SYSTEM_BASE, structured=False), "\n---\n"]
+            fallback_parts.extend(content_parts)
+            fallback_result = await _run_codex(
+                "\n".join(fallback_parts),
+                project_dir=cwd,
+                model=effective_model,
+                reasoning_effort=params.reasoning_effort.value,
+                reasoning_summary=effective_summary,
+                timeout=effective_timeout,
+                tool_name="codex_review_diff",
+            )
+            return (
+                "**Note:** Structured output failed; auto-retried in text mode "
+                "(2 Codex messages used this call).\n\n"
+            ) + fallback_result
+
+    return result
 
 
 @mcp.tool(
@@ -2403,7 +2824,6 @@ async def codex_status(params: StatusInput) -> str:
     plugin_version = "unknown"
     if plugin_json.is_file():
         try:
-            import json
             plugin_version = json.loads(plugin_json.read_text()).get("version", "unknown")
         except (OSError, ValueError):
             pass
