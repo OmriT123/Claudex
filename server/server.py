@@ -416,7 +416,7 @@ STRUCTURED_OUTPUT_INSTRUCTIONS = """
 
 You MUST return valid JSON matching the provided schema. Key rules:
 - Every finding MUST include `file_path` in `code_location` — use the actual file path from the codebase.
-- Include `line_range` (start/end) whenever you can identify specific lines. Omit it only for architectural or file-level findings.
+- Always include `line_range` in `code_location`. Set it to `{"start": N, "end": N}` when you can identify specific lines, or `null` for architectural or file-level findings.
 - Put concrete code fix suggestions in the `suggestion` field as plain text (not markdown code blocks). Set to null if no fix applies.
 - `confidence_score` is 0.0-1.0 representing how confident you are in this finding.
 - `priority` is 0=critical, 1=high, 2=medium, 3=low.
@@ -462,18 +462,23 @@ _FINDING_SCHEMA = {
             "properties": {
                 "file_path": {"type": "string"},
                 "line_range": {
-                    "type": "object",
-                    "properties": {"start": {"type": "integer"}, "end": {"type": "integer"}},
-                    "required": ["start", "end"],
-                    "additionalProperties": False,
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {"start": {"type": "integer"}, "end": {"type": "integer"}},
+                            "required": ["start", "end"],
+                            "additionalProperties": False,
+                        },
+                        {"type": "null"},
+                    ],
                 },
             },
-            "required": ["file_path"],
+            "required": ["file_path", "line_range"],
             "additionalProperties": False,
         },
         "suggestion": {"type": ["string", "null"]},
     },
-    "required": ["title", "body", "severity", "priority", "confidence_score", "category", "code_location"],
+    "required": ["title", "body", "severity", "priority", "confidence_score", "category", "code_location", "suggestion"],
     "additionalProperties": False,
 }
 
@@ -2423,8 +2428,12 @@ async def codex_review_files(params: QuickReviewInput) -> str:
     elapsed = time.monotonic() - start_time
 
     # Auto-fallback on CLI error when structured mode is on (e.g., old Codex CLI
-    # that doesn't support --output-schema). Errors hit ERROR_PREFIX, not JSON parse.
-    if use_structured and result.startswith(ERROR_PREFIX) and "output-schema" in result.lower():
+    # that doesn't support --output-schema, or schema validation errors from the API).
+    if use_structured and result.startswith(ERROR_PREFIX) and (
+        "output-schema" in result.lower()
+        or "invalid_json_schema" in result.lower()
+        or "response_format" in result.lower()
+    ):
         logger.warning("Codex CLI may not support --output-schema, retrying in text mode")
         fallback_parts = [_build_review_system(REVIEW_FILES_SYSTEM_BASE, structured=False), "\n---\n"]
         fallback_parts.extend(content_parts)
@@ -2720,8 +2729,12 @@ async def codex_review_diff(params: ReviewDiffInput) -> str:
     elapsed = time.monotonic() - start_time
 
     # Auto-fallback on CLI error when structured mode is on (e.g., old Codex CLI
-    # that doesn't support --output-schema). Errors hit ERROR_PREFIX, not JSON parse.
-    if use_structured and result.startswith(ERROR_PREFIX) and "output-schema" in result.lower():
+    # that doesn't support --output-schema, or schema validation errors from the API).
+    if use_structured and result.startswith(ERROR_PREFIX) and (
+        "output-schema" in result.lower()
+        or "invalid_json_schema" in result.lower()
+        or "response_format" in result.lower()
+    ):
         logger.warning("Codex CLI may not support --output-schema, retrying in text mode")
         fallback_parts = [_build_review_system(REVIEW_DIFF_SYSTEM_BASE, structured=False), "\n---\n"]
         fallback_parts.extend(content_parts)

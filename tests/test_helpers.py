@@ -667,6 +667,9 @@ class TestReviewSchemas:
             elif schema.get("type") == "array":
                 items = schema.get("items", {})
                 check_no_additional(items, f"{path}[]")
+            # Traverse anyOf branches (used for nullable object types)
+            for variant in schema.get("anyOf", []):
+                check_no_additional(variant, f"{path}|anyOf")
 
         check_no_additional(REVIEW_FILES_SCHEMA, "REVIEW_FILES_SCHEMA")
         check_no_additional(REVIEW_DIFF_SCHEMA, "REVIEW_DIFF_SCHEMA")
@@ -1075,6 +1078,58 @@ class TestStructuredOutputIntegration:
 
         assert call_count == 2
         assert "Recovered review" in result
+
+    @pytest.mark.asyncio
+    async def test_review_files_api_schema_validation_error_fallback(self, tmp_path):
+        """API schema validation error (invalid_json_schema) triggers text-mode fallback."""
+        (tmp_path / "test.py").write_text("x = 1")
+
+        call_count = 0
+        async def mock_run_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if kwargs.get("output_schema") is not None:
+                return (
+                    f"{ERROR_PREFIX}Codex exited with code 1.\nStderr: ERROR: "
+                    '{"error": {"message": "Invalid schema for response_format '
+                    "'codex_output_schema'\", \"type\": \"invalid_request_error\", "
+                    '"code": "invalid_json_schema"}}'
+                )
+            return "## Recovered from schema error\nAll good."
+
+        with patch("server._run_codex", side_effect=mock_run_side_effect) as mock_run, \
+             patch("server._get_git_context", new_callable=AsyncMock, return_value=None):
+
+            params = QuickReviewInput(files="test.py", project_dir=str(tmp_path))
+            result = await codex_review_files(params)
+
+        assert call_count == 2
+        assert "Recovered from schema error" in result
+
+    @pytest.mark.asyncio
+    async def test_review_diff_api_schema_validation_error_fallback(self, tmp_path):
+        """API response_format error in diff review triggers text-mode fallback."""
+        call_count = 0
+        async def mock_run_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if kwargs.get("output_schema") is not None:
+                return (
+                    f"{ERROR_PREFIX}Codex exited with code 1.\nStderr: ERROR: "
+                    '{"error": {"message": "Invalid schema for response_format", '
+                    '"type": "invalid_request_error"}}'
+                )
+            return "## Recovered diff review\nShip it."
+
+        with patch("server._run_codex", side_effect=mock_run_side_effect) as mock_run, \
+             patch("server._get_git_diff", new_callable=AsyncMock, return_value="diff --git a/x.py"), \
+             patch("server._get_git_context", new_callable=AsyncMock, return_value=None):
+
+            params = ReviewDiffInput(project_dir=str(tmp_path))
+            result = await codex_review_diff(params)
+
+        assert call_count == 2
+        assert "Recovered diff review" in result
 
 
 class TestTempFileLifecycle:
