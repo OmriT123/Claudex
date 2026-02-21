@@ -83,6 +83,7 @@ from server import (
     codex_review_files,
     codex_review_diff,
     _run_codex_once,
+    _run_codex,
     ERROR_PREFIX,
 )
 
@@ -1322,6 +1323,141 @@ class TestFormatterEdgeCases:
         assert "## Overall Assessment" in result
         # Should show 0% (fallback)
         assert "confidence: 0%" in result
+
+
+# =========================================================================
+# Error handling fixes (issues #1-#5)
+# =========================================================================
+
+
+class TestErrorHandlingFixes:
+    """Tests for the 5 error handling fixes in _run_codex_once and _run_codex."""
+
+    @pytest.mark.asyncio
+    async def test_stderr_fallback_has_error_prefix(self, tmp_path):
+        """Fix #1: When returncode=0, stdout empty, stderr has content,
+        result must start with ERROR_PREFIX."""
+        import server as server_mod
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b'', b'some warning on stderr'))
+        mock_proc.returncode = 0
+        mock_proc.kill = MagicMock()
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc), \
+             patch.object(server_mod, "_find_codex_bin", return_value="/usr/bin/codex"), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=(b'', b'some warning on stderr')):
+
+            result = await _run_codex_once(
+                "test prompt",
+                project_dir=str(tmp_path),
+            )
+
+        assert result.startswith(ERROR_PREFIX), f"Expected ERROR_PREFIX, got: {result[:50]}"
+        assert "some warning on stderr" in result
+
+    @pytest.mark.asyncio
+    async def test_timeout_cleanup_kill_raises(self, tmp_path):
+        """Fix #2: If proc.kill() raises ProcessLookupError, the function
+        should still return a timeout error (not raise)."""
+        import server as server_mod
+
+        mock_proc = AsyncMock()
+        mock_proc.kill = MagicMock(side_effect=ProcessLookupError("No such process"))
+        mock_proc.communicate = AsyncMock(return_value=(b'', b''))
+
+        call_count = 0
+
+        async def mock_wait_for(coro, *, timeout=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # First call: the main communicate — raise timeout
+                raise asyncio.TimeoutError()
+            # Second call: the cleanup communicate — succeed
+            return await coro
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc), \
+             patch.object(server_mod, "_find_codex_bin", return_value="/usr/bin/codex"), \
+             patch("asyncio.wait_for", side_effect=mock_wait_for):
+
+            result = await _run_codex_once(
+                "test prompt",
+                project_dir=str(tmp_path),
+            )
+
+        assert result.startswith(ERROR_PREFIX)
+        assert "timed out" in result
+
+    @pytest.mark.asyncio
+    async def test_oserror_from_subprocess_returns_error(self, tmp_path):
+        """Fix #3: OSError (e.g. PermissionError) from create_subprocess_exec
+        should return an ERROR_PREFIX string, not raise."""
+        import server as server_mod
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock,
+                    side_effect=PermissionError("Permission denied")), \
+             patch.object(server_mod, "_find_codex_bin", return_value="/usr/bin/codex"):
+
+            result = await _run_codex_once(
+                "test prompt",
+                project_dir=str(tmp_path),
+            )
+
+        assert result.startswith(ERROR_PREFIX)
+        assert "Permission denied" in result
+
+    @pytest.mark.asyncio
+    async def test_version_warning_not_prepended_on_error(self, tmp_path):
+        """Fix #4: Version warning must not be prepended to error results,
+        which would break the ERROR_PREFIX contract."""
+        import server as server_mod
+
+        error_result = f"{ERROR_PREFIX}Codex timed out after 60s."
+
+        with patch.object(server_mod, "_run_codex_once", new_callable=AsyncMock, return_value=error_result), \
+             patch.object(server_mod, "_check_codex_version", new_callable=AsyncMock,
+                          return_value="⚠ Codex CLI v0.1 is outdated"):
+
+            result = await _run_codex(
+                "test prompt",
+                project_dir=str(tmp_path),
+                tool_name="test_tool",
+            )
+
+        assert result.startswith(ERROR_PREFIX), \
+            f"Version warning masked ERROR_PREFIX: {result[:80]}"
+
+    @pytest.mark.asyncio
+    async def test_schema_write_type_error_handled(self, tmp_path):
+        """Fix #5: TypeError from json.dump (e.g. non-serializable schema)
+        should be caught, not raise."""
+        import server as server_mod
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(return_value=(b'text mode output', b''))
+        mock_proc.returncode = 0
+        mock_proc.kill = MagicMock()
+
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc), \
+             patch.object(server_mod, "_find_codex_bin", return_value="/usr/bin/codex"), \
+             patch("asyncio.wait_for", new_callable=AsyncMock, return_value=(b'text mode output', b'')), \
+             patch.object(server_mod, "_prepare_run_dir", return_value=tmp_path / "run-test"), \
+             patch.object(server_mod, "_extract_and_save_artifacts", return_value=("text mode output", [])), \
+             patch("json.dump", side_effect=TypeError("Object not serializable")):
+
+            (tmp_path / "run-test").mkdir()
+
+            # Should NOT raise — should fall back to text mode
+            result = await _run_codex_once(
+                "test prompt",
+                project_dir=str(tmp_path),
+                output_schema={"type": "object"},  # Schema itself is fine, json.dump is mocked to fail
+            )
+
+        assert not result.startswith(ERROR_PREFIX), \
+            "Schema write failure should degrade to text mode, not return error"
+        assert "text mode output" in result
 
 
 # =========================================================================

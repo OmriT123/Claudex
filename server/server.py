@@ -1622,7 +1622,7 @@ async def _run_codex_once(
             with os.fdopen(schema_fd, "w", encoding="utf-8") as f:
                 json.dump(output_schema, f)
             cmd.extend(["--output-schema", schema_tmp_path])
-        except OSError as exc:
+        except (OSError, TypeError, ValueError) as exc:
             logger.warning("Failed to write schema temp file: %s", exc)
             schema_tmp_path = None
             output_schema = None  # Disable structured path entirely
@@ -1648,9 +1648,12 @@ async def _run_codex_once(
     except asyncio.TimeoutError:
         try:
             proc.kill()
-            await proc.communicate()  # Drain pipes to avoid zombies
         except (ProcessLookupError, OSError):
             pass  # Process already exited
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+        except (asyncio.TimeoutError, ProcessLookupError, OSError):
+            pass  # Best-effort pipe drain
         return (
             f"{ERROR_PREFIX}Codex timed out after {timeout}s. "
             "Try: (1) focus_files to narrow scope, (2) simpler prompt, "
@@ -1663,6 +1666,8 @@ async def _run_codex_once(
             "Then authenticate:\n"
             "  codex login"
         )
+    except OSError as exc:
+        return f"{ERROR_PREFIX}Failed to start Codex: {exc}"
     finally:
         # Clean up schema temp file
         if schema_tmp_path:
@@ -1691,7 +1696,7 @@ async def _run_codex_once(
     if not output:
         fallback = stderr.decode(errors="replace").strip()
         if fallback:
-            return fallback
+            return f"{ERROR_PREFIX}Codex returned no stdout (exit 0).\nStderr: {fallback}"
         return (
             f"{ERROR_PREFIX}Codex returned no output. "
             "Try being more specific or provide focus_files to direct attention."
@@ -1815,9 +1820,9 @@ async def _run_codex(
     if not result.startswith(ERROR_PREFIX):
         result += f"\n\n---\n_Codex: {model}, {reasoning_effort}, {elapsed:.0f}s_"
 
-    # Version check — prepend warning on first invocation only
+    # Version check — prepend warning on first successful invocation only
     version_warning = await _check_codex_version(consume=True)
-    if version_warning:
+    if version_warning and not result.startswith(ERROR_PREFIX):
         result = version_warning + "\n" + result
 
     return result
