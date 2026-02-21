@@ -31,7 +31,7 @@ There is no build system, no linter configured. Dependencies are declared inline
 uv run --script tests/test_helpers.py
 ```
 
-Tests (117 total, 111 methods + 6 parametrized) cover security-critical helpers (`_safe_claudex_path`, `_normalize_file_list`), session management, Pydantic model validation, auto-session-ID generation, per-tool timeouts, model/reasoning_summary validation, effort downgrade, metrics, session chaining, `ReviewDiffInput`, backward compatibility, structured output schemas, review formatters, `_build_review_system` toggle, `structured_output` field validation, structured output integration (mock-based), temp file lifecycle, and formatter edge cases. Test file uses PEP 723 inline metadata (same pattern as `server.py`).
+Tests (122 total) cover security-critical helpers (`_safe_claudex_path`, `_normalize_file_list`), session management, Pydantic model validation, auto-session-ID generation, per-tool timeouts, model/reasoning_summary validation, effort downgrade, metrics, session chaining, `ReviewDiffInput`, backward compatibility, structured output schemas, review formatters, `_build_review_system` toggle, `structured_output` field validation, structured output integration (mock-based), temp file lifecycle, formatter edge cases, and error handling fixes (stderr fallback, timeout cleanup, OSError catch, version warning masking, schema write errors). Test file uses PEP 723 inline metadata (same pattern as `server.py`).
 
 ## Architecture
 
@@ -69,7 +69,7 @@ Tests (117 total, 111 methods + 6 parametrized) cover security-critical helpers 
 
 **Slash commands** (`commands/*.md`): Define multi-step workflows for `/codex:plan`, `/codex:brainstorm`, `/codex:collab`, `/codex:status`, `/codex:evaluate`, `/codex:recap`, `/codex:review-files`, `/codex:review-diff`. Each has YAML frontmatter with `allowed-tools`.
 
-**Skill** (`skills/claudex/SKILL.md`): Auto-triggers during plan mode for non-trivial tasks. Contains the tool router decision tree and workflow patterns (Divergent, Convergent, Iterative, Evaluate).
+**Skill** (`skills/claudex/SKILL.md`): Auto-triggers during plan mode for non-trivial tasks. Contains the tool router decision tree, workflow patterns (Divergent, Convergent, Iterative, Evaluate), workflow chains (Plan→Stress-Test→Debug, Review→Fix→Verify, Explore→Decide), and the Claim Ledger format for cross-tool context carrying.
 
 ## Naming Convention
 
@@ -91,6 +91,7 @@ Tests (117 total, 111 methods + 6 parametrized) cover security-critical helpers 
 
 ## Key Constraints
 
+- CC must verify Codex's claims before presenting to the user — never relay without first-hand investigation
 - Codex subprocess must always use `--sandbox read-only` — security invariant
 - Codex explores the codebase directly — don't pre-summarize context in prompts
 - Artifact parsing only after the `---FINAL-ANSWER---` delimiter (prevents reasoning trace leakage)
