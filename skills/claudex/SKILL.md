@@ -92,7 +92,7 @@ These are handled automatically by the server. Understand them so you use them c
 | Context | What to pass as `user_prompt` |
 |---------|-------------------------------|
 | Independent planning (`codex_plan`, `codex_brainstorm`) | The user's current message, verbatim — Codex forms its OWN interpretation |
-| Single-shot review (`codex_review`, `codex_review_files`) | The user's current message, verbatim |
+| Single-shot review (`codex_review`, `codex_review_files`, `codex_review_diff`) | The user's current message, verbatim |
 | Iterative session (`codex_collab` with `session_id`) | The ORIGINAL task description from session start — same across all rounds |
 
 ### File Path Auto-Normalization
@@ -172,6 +172,11 @@ Use when debugging tricky issues or solving complex problems. Uses session docum
      Use the same user_prompt across all rounds — gives Codex consistent framing.
 3. Server writes Codex's response to .claudex/sessions/{session_id}.md
 4. Read the session document. Test Codex's top suggestions.
+   **Verification gate — MANDATORY before presenting to user:**
+   Read every file and line Codex referenced. Confirm or refute each specific claim.
+   Do NOT relay Codex's findings without first-hand verification. This is what makes
+   the output trustworthy — two models agreeing after independent investigation,
+   not one model echoing the other.
 5. IF another round is needed, call codex_collab again:
    - Update cc_analysis with: what Codex suggested + what you tried + results
    - Same session_id (accumulates context across rounds)
@@ -250,6 +255,45 @@ Use before committing to catch issues in your changes.
 
 **Key principle:** `codex_review_diff` focuses on what CHANGED — it doesn't critique pre-existing code. Fast and targeted.
 
+## Chaining Workflows — Evidence-Gated Transitions
+
+Tools are most powerful when chained. Each transition carries context forward.
+
+### Chain 1: Plan → Stress-Test → Debug
+```
+codex_plan → codex_review → codex_collab (if issues found)
+```
+1. Generate independent plan with `codex_plan`
+2. Stress-test the synthesized plan with `codex_review`
+3. If review surfaces issues: open a `codex_collab` session (`verification` or `red_team`) to resolve them
+
+### Chain 2: Review → Fix → Verify
+```
+codex_review_files / codex_review_diff → fix criticals → codex_collab (if conflict)
+```
+1. Get structured review findings
+2. Investigate and fix all critical-severity findings before presenting
+3. If Codex's findings conflict with your self-review: escalate to `codex_collab` with `request_type=verification`, include conflict evidence
+
+### Chain 3: Explore → Decide
+```
+codex_brainstorm → codex_evaluate (when multiple options emerge)
+```
+1. Brainstorm broadly to surface options
+2. If 2+ viable approaches emerge, call `codex_evaluate` with the options
+3. Present both analyses to the user for their decision
+
+### Context Carrying — Claim Ledger
+
+When transitioning between tools, structure the context you carry forward in `cc_analysis` or `context`:
+
+- **Prior Codex output**: What Codex said (claim, suggestion, or finding)
+- **File evidence**: Specific file:line you checked
+- **CC verification**: Confirmed / refuted / inconclusive — what you found
+- **Open question**: What still needs resolving in this next tool call
+
+This prevents context loss across tool boundaries without requiring server-side session sharing.
+
 ---
 
 ## Reading Codex Artifacts
@@ -281,6 +325,7 @@ If Codex fails (timeout, rate limit, empty response, error):
 - Critically evaluate Codex's output — it's a perspective, not authority
 - Show the user WHERE ideas came from (CC vs Codex) for transparency
 - Include the response metadata footer when attributing Codex findings to the user
+- When chaining tools, carry forward prior Codex output using the Claim Ledger format (see Workflow Chains)
 
 ### NEVER:
 - Pass credentials, API keys, or secrets in prompts

@@ -22,6 +22,16 @@ allowed-tools: Read, Glob, Grep
 4. **Evaluate Codex's review**:
    - Focus on issues INTRODUCED by the diff, not pre-existing problems
    - Verify Codex's findings against the actual diff
-5. **Present findings** to the user:
+5. **Act on critical findings**: Before presenting to the user:
+   - For each critical/warning finding: verify against the actual diff — confirm the issue was introduced by these changes
+   - Fix confirmed critical issues in the working tree
+   - If a fix touches auth, crypto, data integrity, or concurrency code → do NOT auto-fix; present the finding with a proposed fix for user approval
+   - If Codex flags something as `fix_first` but you disagree, investigate and note both perspectives
+6. **Escalate conflicts**: If Codex's verdict conflicts with your assessment:
+   - Call `codex_collab` with `request_type=verification` or `bug_approach`
+   - Include the specific diff hunks and both analyses in `cc_analysis`
+   - If the escalation call fails or is inconclusive: present both perspectives to the user and let them decide
+7. **Present findings** to the user:
    - Your findings + Codex's findings, clearly attributed
-   - Verdict: ship / fix first / needs discussion
+   - Final verdict: ship / fix first / needs discussion
+   - Note any findings you verified vs unverified Codex claims

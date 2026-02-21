@@ -22,6 +22,16 @@ allowed-tools: Read, Glob, Grep
    - Investigate issues Codex found that you missed
    - Verify Codex's suggestions are correct (check referenced line numbers)
    - Separate genuine issues from style preferences
-5. **Present a unified review** to the user:
+5. **Verify critical findings**: Before presenting to the user:
+   - For each critical/warning finding: read the referenced file and line, confirm the issue exists
+   - Fix confirmed critical issues yourself — present the fix alongside the finding
+   - If a fix touches auth, crypto, data integrity, or concurrency code → do NOT auto-fix; present the finding with a proposed fix for user approval
+   - If a finding conflicts with your self-review, note both perspectives with evidence
+6. **Escalate unresolved conflicts**: If Codex and your self-review disagree on something important:
+   - Call `codex_collab` with `request_type=verification`
+   - Include both your finding and Codex's finding in `cc_analysis`
+   - If the escalation call fails or is inconclusive: present both perspectives to the user and let them decide
+7. **Present a unified review** to the user:
    - Issues you found + issues Codex found, clearly attributed
+   - Mark which findings you verified vs which are unverified Codex claims
    - Prioritized: critical → warnings → suggestions

@@ -32,12 +32,23 @@ allowed-tools: Read, Glob, Grep
    - Did Codex find something you missed? → Investigate the specific files/lines it references
    - Does Codex disagree with your approach? → Compare evidence, adopt what's stronger
    - Did Codex suggest concrete next steps? → Evaluate feasibility and priority
-5. **Present a unified analysis** to the user:
+5. **Verify before presenting**: Before showing Codex's findings to the user:
+   - Read every file/line Codex referenced — confirm or refute each claim
+   - Test any specific hypothesis Codex proposed (run the code, check the logic)
+   - Record what you verified and what you found
+6. **Present a unified analysis** to the user:
    - Your findings + Codex's findings, clearly attributed
    - Where you agree and where you differ
    - Recommended next steps with rationale
-6. **Iterate if needed**: If Codex's suggestions lead to new findings:
-   - Call `codex_collab` again with the same `session_id` (accumulates context)
-   - Include: previous Codex suggestions + what you tried + results
-   - This builds a shared understanding across rounds
-   - Sessions terminate after **4 rounds** — use `codex_recap` to generate a summary
+7. **Follow up with Codex** (call `codex_collab` again, same `session_id`, same `user_prompt` as round 1) when ANY of these triggers fire:
+   - Codex referenced files/lines you haven't inspected yet → investigate first, then report back
+   - Codex's claim contradicts your analysis or test results → include both sides + evidence
+   - A proposed fix touches a high-risk path (auth, data integrity, concurrency) → verify with `verification` request_type
+   - Root cause is still unresolved after your first validation attempt
+   - Update `cc_analysis` with: what Codex suggested + what you verified + results + open questions
+8. **Stop iterating** when:
+   - All critical claims are verified and findings are actionable
+   - You and Codex converge on the same conclusion
+   - The session hits 4 rounds (auto-rollover generates a recap)
+   - The problem has rolled over to a second chained session without convergence — present all findings and let the user decide
+   - Use `codex_recap` to generate a decision record for multi-round sessions
