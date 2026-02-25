@@ -81,7 +81,7 @@ Tests (122 total) cover security-critical helpers (`_safe_claudex_path`, `_norma
 - Model: `gpt-5.3-codex` (overridable per-call via `model` param)
 - Reasoning effort: `high` (overridable per-call)
 - Reasoning summary: `detailed` (overridable per-call)
-- Timeout: 1200s (20 min) global default, with per-tool overrides (e.g. `codex_review_files`: 300s)
+- Timeout: 1200s (20 min) for all tools
 - Timeout auto-retry: on timeout, `xhigh` → `high` and `high` → `medium` are retried once automatically
 - Artifact max size: 100KB
 - Run directory cleanup: 1 hour

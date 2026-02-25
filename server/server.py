@@ -58,9 +58,9 @@ EXEC_TIMEOUT_SECONDS = 1200  # 20 min max per Codex call
 DEFAULT_REASONING_SUMMARY = "detailed"
 EFFORT_DOWNGRADE = {"xhigh": "high", "high": "medium"}
 TOOL_TIMEOUTS = {
-    "codex_review": 1200, "codex_plan": 1200, "codex_brainstorm": 900,
-    "codex_collab": 1200, "codex_review_files": 300, "codex_evaluate": 1200,
-    "codex_recap": 600, "codex_review_diff": 600,
+    "codex_review": 1200, "codex_plan": 1200, "codex_brainstorm": 1200,
+    "codex_collab": 1200, "codex_review_files": 1200, "codex_evaluate": 1200,
+    "codex_recap": 1200, "codex_review_diff": 1200,
 }
 
 FINAL_ANSWER_DELIMITER = "---FINAL-ANSWER---"
@@ -2253,7 +2253,7 @@ async def codex_collab(params: CollaborateInput) -> str:
                     "(CC vs Codex). Focus on decisions and reasoning, not process.",
                     project_dir=cwd,
                     reasoning_effort="medium",
-                    timeout=300,
+                    timeout=1200,
                     tool_name="codex_collab_recap",
                 )
                 # Save recap
