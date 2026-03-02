@@ -359,6 +359,6 @@ When Codex disagrees with your approach:
 
 **Reasoning summary:** `detailed` by default. Overridable per-call (`detailed`, `concise`, `none`).
 
-**Per-tool timeouts:** Each tool has a default timeout (e.g. `codex_review`: 1200s, `codex_review_files`: 300s). Overridable per-call via `timeout_seconds` (30-1800s).
+**Timeout:** 1200s (20 min) for all tools.
 
 **Metrics:** The server tracks per-tool stats (calls, successes, timeouts, errors, avg latency) in memory. View via `codex_status`.

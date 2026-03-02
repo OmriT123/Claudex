@@ -1,4 +1,4 @@
-# Claudex — Claude Code Plugin
+# Claudex — Claude Code Plugin <sup>v1.5.0</sup>
 
 Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, red-teaming, debugging, verification, and decision support.
 
@@ -170,7 +170,9 @@ Tested Codex's hypothesis — confirmed partial match...
 ...
 ```
 
-CC manages the document. The server writes Codex's responses. Each `codex_collab` call with the same `session_id` appends to the existing session. Pass `session_id="auto"` to auto-generate a descriptive ID from the problem statement. After 4 rounds or resolution, use `codex_recap` to generate a formal decision record.
+CC manages the document. The server writes Codex's responses. Each `codex_collab` call with the same `session_id` appends to the existing session. Pass `session_id="auto"` to auto-generate a descriptive ID from the problem statement. After 4 rounds, the session auto-rolls over — a recap is generated and a new chained session is created (e.g., `fix-race-condition` → `fix-race-condition-c1` → `fix-race-condition-c2`). Use `codex_recap` at any point to generate a formal decision record.
+
+When a round produces file artifacts, the artifact listing is automatically appended to the session document so subsequent rounds have visibility into what was generated.
 
 ## Decision Support with `codex_evaluate`
 
@@ -202,7 +204,7 @@ Codex can produce file artifacts — code snippets, test drafts, analysis docs �
 **Security model:**
 - Codex never has write access — the sandbox enforces it
 - Filenames are validated against path traversal (`Path.resolve()` + `is_relative_to()`)
-- Symlink writes are rejected; exclusive-create prevents overwrite races
+- Symlink writes are rejected at both the target file and `.claudex` directory levels; exclusive-create prevents overwrite races
 - Only the final-answer section is parsed (reasoning traces are ignored)
 - Artifacts > 100KB are skipped
 - Run directories are cleaned up after 1 hour
@@ -218,12 +220,30 @@ echo '.claudex' >> .gitignore
 - **Reasoning effort**: `high` (override per-call: `low`, `medium`, `high`, `xhigh`)
 - **Reasoning summary**: `detailed` (overridable: `detailed`, `concise`, `none`)
 - **Sandbox**: `read-only` — Codex reads your repo but never modifies it
-- **Timeout**: 1200s (20 min) global default, per-tool overrides (e.g. `codex_review_files`: 300s, `codex_brainstorm`: 900s)
-- **Auto-retry**: On timeout, `xhigh` → `high` and `high` → `medium` are retried once automatically
-- **Session rollover**: After 4 rounds, sessions auto-rollover (recap generated, new chained session)
-- **Structured output**: `codex_review_files` and `codex_review_diff` return structured JSON findings (severity, confidence, file:line) by default. Set `structured_output=False` for legacy text mode
-- **Version check**: Auto-checks for Codex CLI updates on first invocation
-- **Metrics**: In-memory per-tool stats (calls, successes, timeouts, errors, avg latency) — visible in `codex_status`
+- **Timeout**: 1200s (20 min) for all tools
+- **Auto-retry**: On timeout, effort is downgraded and retried once (`xhigh` → `high`, `high` → `medium`). No retry for `medium` or `low`
+- **Git context**: All tools (except `codex_review_diff`) automatically inject current branch, diff stat, recent commits, and staged changes into the Codex prompt — no manual context needed
+- **Session rollover**: After 4 rounds, sessions auto-rollover (recap generated, new chained session with `-c1`/`-c2` suffix)
+- **Structured output**: `codex_review_files` and `codex_review_diff` return structured JSON findings (severity, confidence, file:line) by default. Set `structured_output=False` for legacy text mode. If structured mode fails (CLI incompatibility or malformed JSON), the server auto-retries in text mode — this costs 1 extra message from your quota
+- **Version check**: Auto-checks for Codex CLI updates on first tool invocation (warning shown once per session)
+- **Metrics**: In-memory per-tool stats (calls, successes, timeouts, errors, avg latency) — visible in `codex_status`, reset on server restart
+
+## Structured Review Output
+
+`codex_review_files` and `codex_review_diff` return structured JSON by default with typed findings:
+
+| Field | Description |
+|-------|-------------|
+| `severity` | `critical`, `warning`, `suggestion`, or `positive` |
+| `priority` | Integer ranking within severity level |
+| `confidence_score` | 0.0–1.0 confidence in the finding |
+| `category` | `bug`, `security`, `performance`, `error_handling`, `maintainability`, `convention`, `logic`, `other` |
+| `code_location` | `file_path` + `line_range` |
+| `suggestion` | Recommended fix (nullable) |
+
+The server formats these as rich markdown with severity badges and collapsible raw JSON. `codex_review_diff` also includes an overall `verdict` (`ship` / `fix_first` / `needs_discussion`).
+
+Set `structured_output=False` to get free-form text analysis instead.
 
 ## Rate Limits
 
@@ -231,7 +251,18 @@ Codex uses your ChatGPT subscription quota:
 - **Plus ($20/mo)**: ~30–150 messages per 5-hour window
 - **Pro ($200/mo)**: ~300–1,500 messages per 5-hour window
 - Each tool call = 1 message from quota
+- Structured output auto-fallback costs 1 extra message if it triggers
 - If rate-limited: wait for window reset or use `gpt-5-codex-mini`
+
+## Under the Hood
+
+**Git context injection** — Every Codex call (except `codex_review_diff`, which handles its own diff) automatically collects and injects the current git branch, unstaged diff stat (capped at 20 lines), last 5 commit messages, and staged changes stat (capped at 5KB) into the system prompt. This gives Codex awareness of your working state without you needing to specify it.
+
+**Session context management** — Session documents are capped at 32KB. When a session exceeds this, the oldest rounds are dropped first to stay within the limit. Sessions expire after 24 hours of inactivity.
+
+**Error handling** — The server detects specific Codex CLI errors and returns user-friendly messages for "not authenticated", "rate limit/429", and empty output cases. All error responses use a consistent `[Claudex Error]` prefix.
+
+**Version check** — On the first tool invocation per session, the server checks npm for Codex CLI updates. The warning is shown once and then suppressed. If the check itself fails (timeout, network error), it stays unresolved and retries next time rather than caching a failure.
 
 ## Plugin Structure
 

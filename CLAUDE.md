@@ -35,7 +35,7 @@ Tests (122 total) cover security-critical helpers (`_safe_claudex_path`, `_norma
 
 ## Architecture
 
-**Single-file server** — all logic lives in `server/server.py` (~2900 lines). It's a FastMCP server (`FastMCP("codex")`) that exposes 10 tools:
+**Single-file server** — all logic lives in `server/server.py` (~3000 lines). It's a FastMCP server (`FastMCP("codex")`) that exposes 10 tools:
 
 | Tool | Purpose | Codex Persona |
 |------|---------|---------------|
@@ -69,7 +69,7 @@ Tests (122 total) cover security-critical helpers (`_safe_claudex_path`, `_norma
 
 **Slash commands** (`commands/*.md`): Define multi-step workflows for `/codex:plan`, `/codex:brainstorm`, `/codex:collab`, `/codex:status`, `/codex:evaluate`, `/codex:recap`, `/codex:review-files`, `/codex:review-diff`. Each has YAML frontmatter with `allowed-tools`.
 
-**Skill** (`skills/claudex/SKILL.md`): Auto-triggers during plan mode for non-trivial tasks. Contains the tool router decision tree, workflow patterns (Divergent, Convergent, Iterative, Evaluate), workflow chains (Plan→Stress-Test→Debug, Review→Fix→Verify, Explore→Decide), and the Claim Ledger format for cross-tool context carrying.
+**Skill** (`skills/claudex/SKILL.md`): Auto-triggers during plan mode for non-trivial tasks. Contains the tool router decision tree, workflow patterns (Divergent, Convergent, Iterative, Evaluate, Pre-Commit Review), workflow chains (Plan→Stress-Test→Debug, Review→Fix→Verify, Explore→Decide), and the Claim Ledger format for cross-tool context carrying.
 
 ## Naming Convention
 
