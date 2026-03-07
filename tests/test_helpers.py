@@ -392,12 +392,12 @@ class TestPerToolTimeout:
         assert inp.timeout_seconds is None
 
     def test_valid_timeout(self):
-        inp = SecondOpinionInput(plan="x" * 20, timeout_seconds=300)
-        assert inp.timeout_seconds == 300
+        inp = SecondOpinionInput(plan="x" * 20, timeout_seconds=1200)
+        assert inp.timeout_seconds == 1200
 
     def test_below_minimum_rejected(self):
         with pytest.raises(ValidationError):
-            SecondOpinionInput(plan="x" * 20, timeout_seconds=10)
+            SecondOpinionInput(plan="x" * 20, timeout_seconds=300)
 
     def test_above_maximum_rejected(self):
         with pytest.raises(ValidationError):
@@ -586,7 +586,7 @@ class TestReviewDiffInput:
             context="Pre-commit review",
             user_prompt="Review my changes",
             model="gpt-5-codex-mini",
-            timeout_seconds=300,
+            timeout_seconds=1200,
             reasoning_summary="concise",
         )
         assert inp.focus == "security"

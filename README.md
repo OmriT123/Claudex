@@ -1,4 +1,4 @@
-# Claudex — Claude Code Plugin <sup>v1.5.0</sup>
+# Claudex — Claude Code Plugin <sup>v1.5.1</sup>
 
 Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, red-teaming, debugging, verification, and decision support.
 
@@ -216,7 +216,7 @@ echo '.claudex' >> .gitignore
 
 ## Defaults
 
-- **Model**: `gpt-5.3-codex` (overridable per-call via `model` parameter)
+- **Model**: `gpt-5.4` (overridable per-call via `model` parameter)
 - **Reasoning effort**: `high` (override per-call: `low`, `medium`, `high`, `xhigh`)
 - **Reasoning summary**: `detailed` (overridable: `detailed`, `concise`, `none`)
 - **Sandbox**: `read-only` — Codex reads your repo but never modifies it
@@ -252,7 +252,7 @@ Codex uses your ChatGPT subscription quota:
 - **Pro ($200/mo)**: ~300–1,500 messages per 5-hour window
 - Each tool call = 1 message from quota
 - Structured output auto-fallback costs 1 extra message if it triggers
-- If rate-limited: wait for window reset or use `gpt-5-codex-mini`
+- If rate-limited: wait for window reset or lower `reasoning_effort`
 
 ## Under the Hood
 
@@ -306,7 +306,7 @@ Claudex/
 | "Codex CLI not found" | `npm i -g @openai/codex` |
 | "Not authenticated" | `codex login` |
 | "Rate limit reached" | Wait for 5-hour window reset |
-| Timeout (>5min) | Use `gpt-5-codex-mini` or `medium` reasoning |
+| Timeout | Lower `reasoning_effort` to `medium` |
 | Empty response | Be more specific about the task |
 | Tools not showing | Check `/mcp`, restart CC session |
 

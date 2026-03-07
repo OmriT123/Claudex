@@ -78,7 +78,7 @@ Tests (122 total) cover security-critical helpers (`_safe_claudex_path`, `_norma
 
 ## Defaults
 
-- Model: `gpt-5.3-codex` (overridable per-call via `model` param)
+- Model: `gpt-5.4` (overridable per-call via `model` param)
 - Reasoning effort: `high` (overridable per-call)
 - Reasoning summary: `detailed` (overridable per-call)
 - Timeout: 1200s (20 min) for all tools

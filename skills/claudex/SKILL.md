@@ -81,7 +81,7 @@ What's your situation?
 
 ---
 
-## Server-Side Features (v1.4)
+## Server-Side Features (v1.5)
 
 These are handled automatically by the server. Understand them so you use them correctly.
 
@@ -105,7 +105,7 @@ All analysis tools (`codex_plan`, `codex_review`, `codex_brainstorm`, `codex_col
 
 ### Response Metadata Footer
 
-Every successful Codex response includes a footer: `_Codex: {model}, {effort}, {elapsed}s_`. Reference this for transparency when reporting to the user, e.g.: "Codex (gpt-5.3-codex, high, 45s) suggests..."
+Every successful Codex response includes a footer: `_Codex: {model}, {effort}, {elapsed}s_`. Reference this for transparency when reporting to the user, e.g.: "Codex (gpt-5.4, high, 45s) suggests..."
 
 ---
 
@@ -319,7 +319,7 @@ If Codex fails (timeout, rate limit, empty response, error):
 
 ### ALWAYS:
 - Pass `project_dir` so Codex reads the correct codebase
-- Pass `user_prompt` on every tool that accepts it (see v1.4 features above)
+- Pass `user_prompt` on every tool that accepts it (see v1.5 features above)
 - Use `focus_files` to direct Codex's exploration — paths are auto-normalized, no need to verify existence
 - Let Codex read the codebase directly — don't pre-summarize context for it
 - Critically evaluate Codex's output — it's a perspective, not authority
@@ -347,7 +347,7 @@ When Codex disagrees with your approach:
 
 ## Model & Reasoning
 
-**Model:** `gpt-5.3-codex` by default. Overridable per-call via `model` parameter on any tool.
+**Model:** `gpt-5.4` by default. Overridable per-call via `model` parameter on any tool.
 
 **Reasoning effort:** `high` by default. Override with `reasoning_effort` parameter:
 - `low` — minimal reasoning, fast
