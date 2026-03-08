@@ -9,6 +9,16 @@ allowed-tools: Read, Glob
 
 **Session**: $ARGUMENTS
 
+## Pre-check
+If the session argument above is empty or blank:
+1. List all files in `.claudex/sessions/` with their modification dates
+2. Present them to the user and ask which session to recap
+3. If no sessions exist, tell the user there are no active sessions to recap and stop
+
+If a session_id is provided but the file doesn't exist in `.claudex/sessions/`:
+1. List available sessions
+2. Suggest the closest match or ask the user to pick one
+
 ## Your workflow:
 
 1. **Verify the session exists**: Check `.claudex/sessions/` for the session document

@@ -9,6 +9,13 @@ allowed-tools: Read, Glob, Grep
 
 **Files**: $ARGUMENTS
 
+## Pre-check
+If no files are specified above (empty or blank arguments):
+1. Check `git diff --name-only` for recently modified files
+2. If none, check `git diff --staged --name-only`
+3. If still none, ask the user which files they want reviewed
+4. Present the discovered files and confirm with the user before proceeding
+
 ## Your workflow:
 
 1. **Read the files yourself first**: Understand what you're sending for review

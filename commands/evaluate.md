@@ -9,6 +9,14 @@ allowed-tools: Read, Glob, Grep
 
 **Decision**: $ARGUMENTS
 
+## Pre-check
+If the arguments above do NOT contain at least 2 distinct options to compare
+(e.g., "Redis vs PostgreSQL" or "Option A: X, Option B: Y"):
+1. Read relevant code to understand the decision space
+2. Identify 2-3 viable options from the codebase and context
+3. Present the options to the user and ask them to confirm before proceeding
+4. Once confirmed, continue with the workflow below using the identified options
+
 ## Your workflow:
 
 1. **Understand the options**: Read relevant code to understand what's being compared

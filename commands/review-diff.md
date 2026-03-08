@@ -11,7 +11,9 @@ allowed-tools: Read, Glob, Grep
 
 ## Your workflow:
 
-1. **Check git state**: Run `git status` to understand what's changed
+1. **Check git state**: Run `git status` to understand what's changed.
+   If there are NO staged or unstaged changes, tell the user there's nothing
+   to review and stop — do NOT call `codex_review_diff` with an empty diff.
 2. **Review the diff yourself first**: Note issues you see in the changes
 3. **Call `codex_review_diff`** with:
    - user_prompt: The user's exact words (copy "$ARGUMENTS" verbatim — do NOT rephrase)
