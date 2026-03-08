@@ -1,6 +1,6 @@
-# Claudex — Claude Code Plugin <sup>v1.5.1</sup>
+# Claudex — Claude Code Plugin <sup>v1.6.0</sup>
 
-Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, red-teaming, debugging, verification, and decision support.
+Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, security-testing, debugging, verification, and decision support.
 
 ## How It Works
 
@@ -8,13 +8,13 @@ Give Claude Code a Codex-powered teammate. Two different AI architectures collab
 You ask Claude Code to implement something
         │
         ▼
-CC formulates its own plan
+Claude Code formulates its own plan
         │
         ▼
-CC calls codex_plan via MCP ─────────────────┐
+Claude Code calls codex_plan via MCP ────────┐
         │                                      │
         ▼                                      ▼
-CC has Plan A                          Codex reads your repo
+Claude Code has Plan A                 Codex reads your repo
                                        (read-only sandbox)
                                        Forms its OWN understanding
                                                │
@@ -24,7 +24,7 @@ CC has Plan A                          Codex reads your repo
         ◄──────────────────────────────────────┘
         │
         ▼
-CC compares Plan A vs Plan B
+Claude Code compares Plan A vs Plan B
 Adopts best ideas from each
         │
         ▼
@@ -32,7 +32,7 @@ Presents unified plan to you
 with clear CC/Codex attribution
 ```
 
-**Key design:** Codex explores the codebase directly — it reads files, understands patterns, and forms its own mental model. CC points it in the right direction with `focus_files`, it doesn't pre-summarize context.
+**Key design:** Codex explores the codebase directly — it reads files, understands patterns, and forms its own mental model. Claude Code points it in the right direction with `focus_files` — no need to pre-summarize context.
 
 ## Prerequisites
 
@@ -95,14 +95,16 @@ claude --plugin-dir /path/to/Claudex
 
 | Command | What It Does |
 |---------|-------------|
-| `/codex:plan [task]` | CC and Codex independently plan the same task, then CC synthesizes |
+| `/codex:plan [task]` | Claude Code and Codex independently plan the same task, then synthesize |
 | `/codex:brainstorm [topic]` | Explore approaches from two AI perspectives |
-| `/codex:collab [problem]` | CC shares its analysis, Codex provides targeted suggestions |
-| `/codex:evaluate [options]` | Codex analyzes tradeoffs between approaches — user decides |
+| `/codex:collab [problem]` | Claude Code shares its analysis, Codex provides targeted suggestions |
+| `/codex:evaluate [A vs B]` | Codex analyzes tradeoffs between approaches — user decides |
 | `/codex:recap [session_id]` | Generate a decision record from a collaboration session |
-| `/codex:review-files [files]` | Get a focused code review from Codex on specific files |
+| `/codex:review [files]` | Get a focused code review from Codex on specific files |
 | `/codex:review-diff [focus]` | Get Codex to review your git diff before committing |
 | `/codex:status` | Show Claudex diagnostics (zero Codex cost) |
+| `/codex:help` | Quick start guide |
+| `/codex:doctor` | Diagnose and fix Claudex issues |
 
 ### Examples
 
@@ -116,17 +118,19 @@ claude --plugin-dir /path/to/Claudex
 /codex:evaluate Redis vs PostgreSQL pub/sub for real-time events
 
 /codex:review-diff security
+
+/codex:review src/auth.py, src/middleware.py
 ```
 
 ## MCP Tools
 
 | Tool | Purpose | Codex Persona |
 |------|---------|---------------|
-| `codex_plan` | Codex makes its OWN plan, CC compares with its plan | Creative Architect |
-| `codex_review` | Codex critiques a specific plan you provide | Critical QA Engineer |
+| `codex_plan` | Codex makes its OWN plan, Claude Code compares with its plan | Creative Architect |
+| `codex_critique` | Codex critiques a specific plan you provide | Critical QA Engineer |
 | `codex_brainstorm` | Open-ended exploration of a problem | Innovation Consultant |
-| `codex_collab` | Targeted collaboration — CC sends analysis, gets suggestions | Varies by request type |
-| `codex_review_files` | Targeted code review of specific files (structured JSON by default) | Senior Code Reviewer |
+| `codex_collab` | Targeted collaboration — Claude Code sends analysis, gets suggestions | Varies by request type |
+| `codex_review` | Targeted code review of specific files (structured JSON by default) | Senior Code Reviewer |
 | `codex_review_diff` | Review git diff with structured findings (severity, confidence, line refs) | Diff Reviewer |
 | `codex_evaluate` | Analyze tradeoffs between options — user decides | Technical Advisor |
 | `codex_recap` | Generate decision record from a session | Technical Writer |
@@ -170,24 +174,24 @@ Tested Codex's hypothesis — confirmed partial match...
 ...
 ```
 
-CC manages the document. The server writes Codex's responses. Each `codex_collab` call with the same `session_id` appends to the existing session. Pass `session_id="auto"` to auto-generate a descriptive ID from the problem statement. After 4 rounds, the session auto-rolls over — a recap is generated and a new chained session is created (e.g., `fix-race-condition` → `fix-race-condition-c1` → `fix-race-condition-c2`). Use `codex_recap` at any point to generate a formal decision record.
+Claude Code manages the document. The server writes Codex's responses. Each `codex_collab` call with the same `session_id` appends to the existing session. Pass `session_id="auto"` to auto-generate a descriptive ID from the problem statement. After 4 rounds, the session auto-rolls over — a recap is generated and a new chained session is created (e.g., `fix-race-condition` → `fix-race-condition-p2` → `fix-race-condition-p3`). Use `codex_recap` at any point to generate a formal decision record.
 
 When a round produces file artifacts, the artifact listing is automatically appended to the session document so subsequent rounds have visibility into what was generated.
 
 ## Decision Support with `codex_evaluate`
 
-Unlike other tools where CC arbitrates, `codex_evaluate` presents analysis for the **user** to decide:
+Unlike other tools where Claude Code arbitrates, `codex_evaluate` presents analysis for the **user** to decide:
 
 ```
 You: "Should we use Redis or PostgreSQL pub/sub for real-time events?"
 
-CC calls codex_evaluate with both options + constraints + priorities
+Claude Code calls codex_evaluate with both options + constraints + priorities
 
 Codex analyzes tradeoffs:
   Redis: Lower latency, but adds infra dependency
   PG pub/sub: No new infra, but higher latency at scale
 
-CC presents BOTH analyses → You decide
+Claude Code presents BOTH analyses → You decide
 ```
 
 ## Artifact Scratchpad
@@ -199,7 +203,7 @@ Codex can produce file artifacts — code snippets, test drafts, analysis docs �
 2. Codex embeds `<claudex-artifact>` blocks in its text output
 3. The **server** parses these from the final-answer section only
 4. The server writes them to `.claudex/run-<uuid>/` (isolated per invocation)
-5. Claude Code receives clean text + an artifact listing and can read the files
+5. Claude Code receives clean text + artifact listing and can read the files
 
 **Security model:**
 - Codex never has write access — the sandbox enforces it
@@ -223,14 +227,14 @@ echo '.claudex' >> .gitignore
 - **Timeout**: 1200s (20 min) for all tools
 - **Auto-retry**: On timeout, effort is downgraded and retried once (`xhigh` → `high`, `high` → `medium`). No retry for `medium` or `low`
 - **Git context**: All tools (except `codex_review_diff`) automatically inject current branch, diff stat, recent commits, and staged changes into the Codex prompt — no manual context needed
-- **Session rollover**: After 4 rounds, sessions auto-rollover (recap generated, new chained session with `-c1`/`-c2` suffix)
-- **Structured output**: `codex_review_files` and `codex_review_diff` return structured JSON findings (severity, confidence, file:line) by default. Set `structured_output=False` for legacy text mode. If structured mode fails (CLI incompatibility or malformed JSON), the server auto-retries in text mode — this costs 1 extra message from your quota
+- **Session rollover**: After 4 rounds, sessions auto-rollover (recap generated, new chained session with `-p2`/`-p3` suffix)
+- **Structured output**: `codex_review` and `codex_review_diff` return structured JSON findings (severity, confidence, file:line) by default. Set `structured_output=False` for legacy text mode. If structured mode fails (CLI incompatibility or malformed JSON), the server auto-retries in text mode — this costs 1 extra message from your quota
 - **Version check**: Auto-checks for Codex CLI updates on first tool invocation (warning shown once per session)
 - **Metrics**: In-memory per-tool stats (calls, successes, timeouts, errors, avg latency) — visible in `codex_status`, reset on server restart
 
 ## Structured Review Output
 
-`codex_review_files` and `codex_review_diff` return structured JSON by default with typed findings:
+`codex_review` and `codex_review_diff` return structured JSON by default with typed findings:
 
 | Field | Description |
 |-------|-------------|
@@ -279,9 +283,11 @@ Claudex/
 │   ├── collab.md            # /codex:collab
 │   ├── evaluate.md          # /codex:evaluate
 │   ├── recap.md             # /codex:recap
-│   ├── review-files.md      # /codex:review-files
+│   ├── review.md            # /codex:review
 │   ├── review-diff.md       # /codex:review-diff
-│   └── status.md            # /codex:status
+│   ├── status.md            # /codex:status
+│   ├── help.md              # /codex:help
+│   └── doctor.md            # /codex:doctor
 ├── skills/
 │   └── claudex/
 │       └── SKILL.md         # Auto-triggers during plan mode
@@ -310,9 +316,11 @@ Claudex/
 | Empty response | Be more specific about the task |
 | Tools not showing | Check `/mcp`, restart CC session |
 
-## Author
+## Credits
 
 Created by **Omri Tal** — [GitHub](https://github.com/OmriT123) | [botique.co.il](https://www.botique.co.il) | hello@botique.co.il
+
+Infrastructure & logic contributions by **Gad Cohen**, COO @ [Evolven](https://www.evolven.com) — [LinkedIn](https://www.linkedin.com/in/gad-cohen-a4856/)
 
 ## License
 

@@ -1,7 +1,7 @@
 ---
 name: evaluate
 description: "Evaluate tradeoffs between approaches — Codex analyzes options so you can decide"
-argument-hint: "[options to evaluate]"
+argument-hint: "[Option A vs Option B]"
 allowed-tools: Read, Glob, Grep
 ---
 

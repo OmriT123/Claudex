@@ -1,7 +1,7 @@
 ---
 name: review-diff
 description: "Get Codex to review your git diff — staged or unstaged changes"
-argument-hint: "[focus area]"
+argument-hint: "[security | performance | correctness | all]"
 allowed-tools: Read, Glob, Grep
 ---
 

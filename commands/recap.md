@@ -1,7 +1,7 @@
 ---
 name: recap
 description: "Generate a decision record from a Codex collaboration session"
-argument-hint: "[session_id]"
+argument-hint: "[session_id from /codex:status]"
 allowed-tools: Read, Glob
 ---
 

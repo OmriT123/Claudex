@@ -1,5 +1,5 @@
 ---
-name: review-files
+name: review
 description: "Get a focused code review from Codex on specific files"
 argument-hint: "[file1, file2, ...]"
 allowed-tools: Read, Glob, Grep
@@ -20,7 +20,7 @@ If no files are specified above (empty or blank arguments):
 
 1. **Read the files yourself first**: Understand what you're sending for review
 2. **Self-review**: Note any issues you already see — fix obvious ones first
-3. **Call `codex_review_files`** with:
+3. **Call `codex_review`** with:
    - files: The files listed above (comma-separated paths)
    - user_prompt: The user's exact words (copy "$ARGUMENTS" verbatim — do NOT rephrase)
    - focus: What to focus on (security, performance, correctness, maintainability, or all)

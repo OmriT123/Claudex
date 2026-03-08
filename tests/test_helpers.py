@@ -59,7 +59,6 @@ from server import (
     EFFORT_DOWNGRADE,
     DEFAULT_MODEL,
     DEFAULT_REASONING_SUMMARY,
-    TOOL_TIMEOUTS,
     EXEC_TIMEOUT_SECONDS,
     ARTIFACT_INSTRUCTIONS,
     STRUCTURED_OUTPUT_INSTRUCTIONS,
@@ -80,7 +79,7 @@ from server import (
     RecapInput,
     ReviewDiffInput,
     StatusInput,
-    codex_review_files,
+    codex_review,
     codex_review_diff,
     _run_codex_once,
     _run_codex,
@@ -403,11 +402,9 @@ class TestPerToolTimeout:
         with pytest.raises(ValidationError):
             SecondOpinionInput(plan="x" * 20, timeout_seconds=2000)
 
-    def test_tool_timeouts_dict_populated(self):
-        """TOOL_TIMEOUTS should have entries for all Codex-calling tools."""
-        assert len(TOOL_TIMEOUTS) >= 8
-        assert "codex_review" in TOOL_TIMEOUTS
-        assert "codex_review_diff" in TOOL_TIMEOUTS
+    def test_exec_timeout_constant(self):
+        """EXEC_TIMEOUT_SECONDS should be set to a reasonable value."""
+        assert EXEC_TIMEOUT_SECONDS == 1200
 
 
 # =========================================================================
@@ -940,7 +937,7 @@ class TestStructuredOutputIntegration:
             mock_run.return_value = SAMPLE_REVIEW_FILES_JSON
 
             params = QuickReviewInput(files="test.py", project_dir=str(tmp_path))
-            result = await codex_review_files(params)
+            result = await codex_review(params)
 
         assert "## File Summaries" in result
         assert "## Findings" in result
@@ -968,7 +965,7 @@ class TestStructuredOutputIntegration:
              patch("server._get_git_context", new_callable=AsyncMock, return_value=None):
 
             params = QuickReviewInput(files="test.py", project_dir=str(tmp_path))
-            result = await codex_review_files(params)
+            result = await codex_review(params)
 
         assert call_count == 2  # First structured, then text fallback
         assert "Structured output failed" in result
@@ -992,7 +989,7 @@ class TestStructuredOutputIntegration:
              patch("server._get_git_context", new_callable=AsyncMock, return_value=None):
 
             params = QuickReviewInput(files="test.py", project_dir=str(tmp_path))
-            result = await codex_review_files(params)
+            result = await codex_review(params)
 
         assert call_count == 2
         assert "Text fallback" in result
@@ -1011,7 +1008,7 @@ class TestStructuredOutputIntegration:
             params = QuickReviewInput(
                 files="test.py", project_dir=str(tmp_path), structured_output=False
             )
-            result = await codex_review_files(params)
+            result = await codex_review(params)
 
         # Should pass output_schema=None
         mock_run.assert_called_once()
@@ -1102,7 +1099,7 @@ class TestStructuredOutputIntegration:
              patch("server._get_git_context", new_callable=AsyncMock, return_value=None):
 
             params = QuickReviewInput(files="test.py", project_dir=str(tmp_path))
-            result = await codex_review_files(params)
+            result = await codex_review(params)
 
         assert call_count == 2
         assert "Recovered from schema error" in result

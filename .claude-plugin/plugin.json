@@ -1,13 +1,16 @@
 {
   "name": "codex",
-  "description": "Claudex — Claude Code's Codex teammate. Two different AI architectures collaborate on planning, red-teaming, debugging, verification, and more.",
-  "version": "1.5.1",
+  "description": "Get a second AI to review your code, stress-test your plans, and debug alongside Claude Code.",
+  "version": "1.6.0",
   "author": {
     "name": "Omri Tal",
     "url": "https://www.botique.co.il",
     "email": "hello@botique.co.il"
   },
+  "contributors": [
+    { "name": "Gad Cohen", "url": "https://www.linkedin.com/in/gad-cohen-a4856/" }
+  ],
   "repository": "https://github.com/OmriT123/Claudex",
   "license": "MIT",
-  "keywords": ["claudex", "codex", "planning", "collaboration", "red-team", "verification", "second-opinion"]
+  "keywords": ["claudex", "codex", "planning", "collaboration", "red-team", "verification", "second-opinion", "code-review", "debugging", "ai-collaboration"]
 }

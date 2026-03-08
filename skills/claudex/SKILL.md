@@ -1,15 +1,19 @@
 ---
 name: codex
-description: "Use when entering plan mode for non-trivial tasks, when making architecture decisions, when debugging complex issues, when the user asks for a second opinion, when you need to verify correctness, or when evaluating tradeoffs between approaches. Auto-triggers during plan mode for complex implementations."
+description: "Use when entering plan mode for non-trivial tasks, when making architecture decisions, when debugging complex issues, when the user asks for a second opinion, when you need to verify correctness, or when evaluating tradeoffs between approaches. Auto-triggers during plan mode for complex implementations. Use for: auth changes, database schema, >100 LOC features, multi-file refactors, security-sensitive code."
 ---
 
 # Codex — Claude Code Skill
 
 ## Purpose
 
-Consult **OpenAI Codex as a specialist teammate** during planning, red-teaming, debugging, verification, and decision-making. Codex runs in a **read-only sandbox** on the same codebase — a different AI architecture (GPT/Codex) that catches different patterns, risks, and opportunities. This creates multi-perspective collaboration that stress-tests your work before you commit.
+Consult **OpenAI Codex as a specialist teammate** during planning, security-testing, debugging, verification, and decision-making. Codex runs in a **read-only sandbox** on the same codebase — a different AI architecture (GPT/Codex) that catches different patterns, risks, and opportunities. This creates multi-perspective collaboration that stress-tests your work before you commit.
 
 **Codex always explores the codebase directly.** It has full read access to the project. You don't need to pre-digest context — Codex reads files, understands patterns, and forms its own mental model. Your job is to point it in the right direction with `focus_files` and constraints, not to summarize what you've already seen.
+
+**Cost note:** Each tool call = 1 message from the user's ChatGPT quota. Don't call Codex for tasks you're confident about.
+
+**Skip Codex when:** config-only changes, documentation edits, trivial renames, formatting-only commits, dependency version bumps with no code change, or when you're confident about a low-risk change.
 
 ---
 
@@ -23,8 +27,8 @@ What's your situation?
 │   └─ Want to explore options broadly    → codex_brainstorm
 │
 ├─ "I have a plan or code already"
-│   ├─ Want it stress-tested/critiqued    → codex_review
-│   ├─ Want specific files reviewed       → codex_review_files
+│   ├─ Want it stress-tested/critiqued    → codex_critique
+│   ├─ Want specific files reviewed       → codex_review
 │   └─ Want my git diff reviewed          → codex_review_diff
 │
 ├─ "I have a specific problem"
@@ -50,6 +54,8 @@ What's your situation?
 
 **Auto-trigger guidance:** Use Codex whenever a second perspective would **materially improve** the output — architecture decisions, complex implementations, subtle bugs, security-sensitive code, or anything the user will deploy to production. When in doubt, use it.
 
+After completing a multi-round collab session → suggest `codex_recap` to generate a decision record.
+
 ---
 
 ## Tools Reference
@@ -57,10 +63,10 @@ What's your situation?
 | Tool | Purpose | Codex Persona |
 |------|---------|---------------|
 | `codex_plan` | Codex generates its OWN independent plan. You compare and synthesize. | **Creative Architect** — explore broadly, challenge conventions, suggest alternatives |
-| `codex_review` | Codex critiques your specific plan or implementation. | **Critical QA Engineer** — find bugs, edge cases, security holes, perf issues |
+| `codex_critique` | Codex critiques your specific plan or implementation. | **Critical QA Engineer** — find bugs, edge cases, security holes, perf issues |
 | `codex_brainstorm` | Open-ended exploration of a problem space. | **Innovation Consultant** — divergent thinking, cross-domain connections |
 | `codex_collab` | Targeted collaboration on a specific problem. Persona varies by `request_type`. | See Collab Personas below |
-| `codex_review_files` | Targeted code review of specific files. | **Senior Code Reviewer** — patterns, anti-patterns, maintainability, correctness |
+| `codex_review` | Targeted code review of specific files. | **Senior Code Reviewer** — patterns, anti-patterns, maintainability, correctness |
 | `codex_review_diff` | Review git diff (staged or unstaged) for bugs and risks. | **Diff Reviewer** — focus on what changed, not pre-existing issues |
 | `codex_evaluate` | Codex analyzes tradeoffs between options. User makes the final call. | **Technical Advisor** — balanced analysis, explicit tradeoffs, no recommendation bias |
 | `codex_recap` | Generate a decision record summarizing a session. | **Technical Writer** — clear, concise, decision-focused documentation |
@@ -87,12 +93,12 @@ These are handled automatically by the server. Understand them so you use them c
 
 ### `user_prompt` — Preserve the User's Voice
 
-`codex_plan`, `codex_review`, `codex_brainstorm`, `codex_collab`, `codex_review_files`, and `codex_review_diff` accept an optional `user_prompt` field. **Always pass it** — it ensures Codex responds to the user's actual intent, not just your interpretation.
+`codex_plan`, `codex_critique`, `codex_brainstorm`, `codex_collab`, `codex_review`, and `codex_review_diff` accept an optional `user_prompt` field. **Always pass it** — it ensures Codex responds to the user's actual intent, not just your interpretation.
 
 | Context | What to pass as `user_prompt` |
 |---------|-------------------------------|
 | Independent planning (`codex_plan`, `codex_brainstorm`) | The user's current message, verbatim — Codex forms its OWN interpretation |
-| Single-shot review (`codex_review`, `codex_review_files`, `codex_review_diff`) | The user's current message, verbatim |
+| Single-shot review (`codex_critique`, `codex_review`, `codex_review_diff`) | The user's current message, verbatim |
 | Iterative session (`codex_collab` with `session_id`) | The ORIGINAL task description from session start — same across all rounds |
 
 ### File Path Auto-Normalization
@@ -101,7 +107,7 @@ These are handled automatically by the server. Understand them so you use them c
 
 ### Git Context Injection
 
-All analysis tools (`codex_plan`, `codex_review`, `codex_brainstorm`, `codex_collab`, `codex_review_files`, `codex_evaluate`) automatically include the current git branch, `git diff --stat` (capped at 20 lines), recent commit log (`git log --oneline -5`), and staged diff summary in the prompt sent to Codex. **You do NOT need to manually include git state** — it's injected server-side. `codex_recap`, `codex_review_diff`, and `codex_ping` skip this (`codex_review_diff` gets its own full diff; recap summarizes a session; ping is a connectivity test). If the project isn't a git repo, this is silently skipped.
+All analysis tools (`codex_plan`, `codex_critique`, `codex_brainstorm`, `codex_collab`, `codex_review`, `codex_evaluate`) automatically include the current git branch, `git diff --stat` (capped at 20 lines), recent commit log (`git log --oneline -5`), and staged diff summary in the prompt sent to Codex. **You do NOT need to manually include git state** — it's injected server-side. `codex_recap`, `codex_review_diff`, and `codex_ping` skip this (`codex_review_diff` gets its own full diff; recap summarizes a session; ping is a connectivity test). If the project isn't a git repo, this is silently skipped.
 
 ### Response Metadata Footer
 
@@ -121,14 +127,14 @@ Use when the user describes a task/feature and you need independent perspectives
    - focus_files: Point Codex WHERE to explore (it reads them directly)
    - Do NOT include your interpretation of HOW to solve it
    NOTE: Codex will explore the codebase itself. You're pointing, not summarizing.
-3. WHILE WAITING, formulate YOUR plan/ideas independently
+3. AFTER receiving Codex's response, compare with YOUR independently formulated plan/ideas
 4. Compare using these criteria:
    - Novelty: Did Codex find an approach you didn't consider?
    - Feasibility: Is the suggestion practical given constraints?
    - Architecture alignment: Does it fit existing patterns?
    - Risk: What could go wrong with each approach?
 5. Synthesize with CLEAR attribution:
-   "Both CC and Codex agree on X.
+   "Both Claude Code and Codex agree on X.
     Codex suggested Y — adopting because [reason].
     Keeping my approach for Z because [reason]."
 ```
@@ -143,7 +149,7 @@ Use when you have code or a plan that needs quality assurance.
 1. Complete your implementation or plan
 2. Self-review first: check for obvious issues, edge cases, style
 3. Fix anything you find — send Codex a clean version
-4. Call codex_review or codex_review_files with the polished output
+4. Call codex_critique or codex_review with the polished output
    - user_prompt: The user's EXACT current message (preserves original intent)
 5. Evaluate Codex's critique:
    - Adopt: genuinely better suggestions (architecture, correctness, security)
@@ -185,7 +191,7 @@ Use when debugging tricky issues or solving complex problems. Uses session docum
    The rollover is transparent; you'll see a note in the response.
 ```
 
-**Key principle:** The session document IS the shared memory. Each round builds on all previous findings. CC stays the arbitrator — you decide which hypotheses to test.
+**Key principle:** The session document IS the shared memory. Each round builds on all previous findings. Claude Code stays the arbitrator — you decide which hypotheses to test.
 
 ### Session Document Format
 
@@ -212,7 +218,7 @@ Started: {timestamp}
 
 ## Workflow 4: Evaluate — Decision Support
 
-Use when choosing between approaches. This is the ONLY tool where CC does NOT arbitrate — the user decides.
+Use when choosing between approaches. This is the ONLY tool where Claude Code does NOT arbitrate — the user decides.
 
 ```
 1. Frame the decision:
@@ -261,15 +267,15 @@ Tools are most powerful when chained. Each transition carries context forward.
 
 ### Chain 1: Plan → Stress-Test → Debug
 ```
-codex_plan → codex_review → codex_collab (if issues found)
+codex_plan → codex_critique → codex_collab (if issues found)
 ```
 1. Generate independent plan with `codex_plan`
-2. Stress-test the synthesized plan with `codex_review`
+2. Stress-test the synthesized plan with `codex_critique`
 3. If review surfaces issues: open a `codex_collab` session (`verification` or `red_team`) to resolve them
 
 ### Chain 2: Review → Fix → Verify
 ```
-codex_review_files / codex_review_diff → fix criticals → codex_collab (if conflict)
+codex_review / codex_review_diff → fix criticals → codex_collab (if conflict)
 ```
 1. Get structured review findings
 2. Investigate and fix all critical-severity findings before presenting
@@ -309,7 +315,7 @@ Codex may produce file artifacts (code snippets, tests, analysis docs) written b
 
 If Codex fails (timeout, rate limit, empty response, error):
 1. **Inform the user** — be specific about what happened
-2. **Proceed with CC-only analysis** — don't block on Codex
+2. **Proceed with Claude Code-only analysis** — don't block on Codex
 3. **Flag it** — note the output was NOT dual-verified
 4. For rate limits: suggest waiting for the 5-hour window reset
 
@@ -323,7 +329,7 @@ If Codex fails (timeout, rate limit, empty response, error):
 - Use `focus_files` to direct Codex's exploration — paths are auto-normalized, no need to verify existence
 - Let Codex read the codebase directly — don't pre-summarize context for it
 - Critically evaluate Codex's output — it's a perspective, not authority
-- Show the user WHERE ideas came from (CC vs Codex) for transparency
+- Show the user WHERE ideas came from (Claude Code vs Codex) for transparency
 - Include the response metadata footer when attributing Codex findings to the user
 - When chaining tools, carry forward prior Codex output using the Claim Ledger format (see Workflow Chains)
 
