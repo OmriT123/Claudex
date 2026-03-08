@@ -7,9 +7,6 @@
     "url": "https://www.botique.co.il",
     "email": "hello@botique.co.il"
   },
-  "contributors": [
-    { "name": "Gad Cohen", "url": "https://www.linkedin.com/in/gad-cohen-a4856/" }
-  ],
   "repository": "https://github.com/OmriT123/Claudex",
   "license": "MIT",
   "keywords": ["claudex", "codex", "planning", "collaboration", "red-team", "verification", "second-opinion", "code-review", "debugging", "ai-collaboration"]
