@@ -51,11 +51,14 @@ with clear CC/Codex attribution
 
 ## Installation
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/OmriT123/Claudex/main/install.sh | bash
+In any Claude Code session, run:
+
+```
+/plugin marketplace add OmriT123/claude-plugins
+/plugin install claudex@omri-plugins
 ```
 
-This checks prerequisites, registers the plugin marketplace, and installs Claudex globally. Start a new Claude Code session and you're ready to go.
+Start a new session and you're ready to go.
 
 ### Verify
 
@@ -63,24 +66,12 @@ This checks prerequisites, registers the plugin marketplace, and installs Claude
 - Type: `use codex_ping to check if Codex is working`
 
 <details>
-<summary>Manual install / local development</summary>
+<summary>Alternative install / local development</summary>
 
-**Manual install:**
+**One-liner install (via shell):**
 
 ```bash
-# 1. Clone the marketplace
-git clone https://github.com/OmriT123/claude-plugins.git \
-  ~/.claude/plugins/marketplaces/omri-plugins
-
-# 2. Register it — add to ~/.claude/plugins/known_marketplaces.json:
-#    "omri-plugins": {
-#      "source": { "source": "github", "repo": "OmriT123/claude-plugins" },
-#      "installLocation": "~/.claude/plugins/marketplaces/omri-plugins",
-#      "lastUpdated": "2026-02-17T00:00:00.000Z"
-#    }
-
-# 3. Install
-claude plugin install codex
+curl -fsSL https://raw.githubusercontent.com/OmriT123/Claudex/main/install.sh | bash
 ```
 
 **Local development:**
