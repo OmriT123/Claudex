@@ -111,7 +111,7 @@ All analysis tools (`codex_plan`, `codex_critique`, `codex_brainstorm`, `codex_c
 
 ### Response Metadata Footer
 
-Every successful Codex response includes a footer: `_Codex: {model}, {effort}, {elapsed}s_`. Reference this for transparency when reporting to the user, e.g.: "Codex (gpt-5.4, high, 45s) suggests..."
+Every successful Codex response includes a footer: `_Codex: {model}, {effort}, {elapsed}s_`. Reference this for transparency when reporting to the user, e.g.: "Codex (gpt-5.5, high, 45s) suggests..."
 
 ---
 
@@ -353,7 +353,7 @@ When Codex disagrees with your approach:
 
 ## Model & Reasoning
 
-**Model:** `gpt-5.4` by default. Overridable per-call via `model` parameter on any tool.
+**Model:** `gpt-5.5` by default. Overridable per-call via `model` parameter on any tool.
 
 **Reasoning effort:** `high` by default. Override with `reasoning_effort` parameter:
 - `low` — minimal reasoning, fast
