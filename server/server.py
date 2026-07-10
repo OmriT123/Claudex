@@ -52,7 +52,7 @@ from pydantic import BaseModel, Field, ConfigDict
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "gpt-5.5"
+DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_REASONING_EFFORT = "high"
 EXEC_TIMEOUT_SECONDS = 1200  # 20 min max per Codex call
 

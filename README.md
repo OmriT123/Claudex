@@ -211,7 +211,7 @@ echo '.claudex' >> .gitignore
 
 ## Defaults
 
-- **Model**: `gpt-5.5` (overridable per-call via `model` parameter)
+- **Model**: `gpt-5.6-sol` (overridable per-call via `model` parameter)
 - **Reasoning effort**: `high` (override per-call: `low`, `medium`, `high`, `xhigh`)
 - **Reasoning summary**: `detailed` (overridable: `detailed`, `concise`, `none`)
 - **Sandbox**: `read-only` — Codex reads your repo but never modifies it
