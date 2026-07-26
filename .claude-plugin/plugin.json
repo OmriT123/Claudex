@@ -1,7 +1,7 @@
 {
   "name": "codex",
   "description": "Get a second AI to review your code, stress-test your plans, and debug alongside Claude Code.",
-  "version": "1.6.2",
+  "version": "1.7.1",
   "author": {
     "name": "Omri Tal",
     "url": "https://www.botique.co.il",
@@ -9,5 +9,5 @@
   },
   "repository": "https://github.com/OmriT123/Claudex",
   "license": "MIT",
-  "keywords": ["claudex", "codex", "planning", "collaboration", "red-team", "verification", "second-opinion", "code-review", "debugging", "ai-collaboration"]
+  "keywords": ["claudex", "codex", "planning", "collaboration", "red-team", "verification", "second-opinion", "code-review", "debugging", "ai-collaboration", "async-jobs"]
 }

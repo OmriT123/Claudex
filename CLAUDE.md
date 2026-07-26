@@ -35,7 +35,7 @@ Tests (122 total) cover security-critical helpers (`_safe_claudex_path`, `_norma
 
 ## Architecture
 
-**Single-file server** — all logic lives in `server/server.py` (~2800 lines). It's a FastMCP server (`FastMCP("codex")`) that exposes 10 tools:
+**Single-file server** — all logic lives in `server/server.py` (~3200 lines). It's a FastMCP server (`FastMCP("codex")`) that exposes 12 tools:
 
 | Tool | Purpose | Codex Persona |
 |------|---------|---------------|
@@ -49,6 +49,8 @@ Tests (122 total) cover security-critical helpers (`_safe_claudex_path`, `_norma
 | `codex_recap` | Decision record generation from a session | Technical Writer |
 | `codex_status` | Diagnostics dashboard (no Codex call, zero cost) | N/A |
 | `codex_ping` | Connectivity test | N/A |
+| `codex_submit` | Run any Codex tool as a background job (async layer, v1.7) | (delegates) |
+| `codex_result` | Poll/collect a background job; disk fallback after restart | N/A |
 
 **Execution flow:** Tool call → construct persona-specific system prompt (with codebase-first preamble) → append artifact or structured-output instructions → shell out to `codex exec --sandbox read-only` (with optional `--output-schema`) → capture stdout → for text mode: parse `<claudex-artifact>` blocks from after `---FINAL-ANSWER---` delimiter → write artifacts to `.claudex/run-<uuid>/` with security validation → return cleaned text + artifact listing. For structured mode (review tools): return raw JSON → parse and format as rich markdown with collapsed raw JSON details block.
 

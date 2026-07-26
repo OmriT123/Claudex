@@ -2,3 +2,9 @@
 .DS_Store
 __pycache__/
 *.pyc
+_cc-config/
+desktop-extension/claudex.mcpb
+.claude/settings.local.json
+.serena/
+.pytest_cache/
+desktop-extension/_stage/

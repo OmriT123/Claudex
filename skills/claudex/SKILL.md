@@ -48,8 +48,11 @@ What's your situation?
 ├─ "What's the current state of Claudex?"
 │   └─ Sessions, artifacts, disk usage    → codex_status (zero cost)
 │
-└─ "Is Codex even working?"
-    └─ Connection test                    → codex_ping
+├─ "Is Codex even working?"
+│   └─ Connection test                    → codex_ping
+│
+└─ "My client caps tool calls / I want fire-and-collect"
+    └─ codex_submit → codex_result        (async job layer, v1.7)
 ```
 
 **Auto-trigger guidance:** Use Codex whenever a second perspective would **materially improve** the output — architecture decisions, complex implementations, subtle bugs, security-sensitive code, or anything the user will deploy to production. When in doubt, use it.
@@ -72,6 +75,10 @@ After completing a multi-round collab session → suggest `codex_recap` to gener
 | `codex_recap` | Generate a decision record summarizing a session. | **Technical Writer** — clear, concise, decision-focused documentation |
 | `codex_status` | Show Claudex diagnostics (no Codex call, zero subscription cost). | N/A |
 | `codex_ping` | Verify Codex CLI is installed and working. | N/A |
+| `codex_submit` | Run any Codex tool above as a background job — returns job_id in <1s. Same arguments as the synchronous tool, wrapped in `{"tool": ..., "arguments": {...}}`. | (delegates) |
+| `codex_result` | Poll or collect a background job (bounded wait_seconds ≤ 45; zero Codex cost). Results persist to `.claudex/jobs/<job_id>.md` and survive server restarts. | N/A |
+
+**When to use the async layer:** whenever your MCP client caps tool-call duration below Codex latency (e.g. remote/bridged transports that kill calls at 60s), or to fire a panel of 2-4 lenses concurrently and keep working while they run. Each job still costs 1 ChatGPT quota message. Max 4 run concurrently, 8 admitted at once.
 
 ### Collab Personas (by `request_type`)
 

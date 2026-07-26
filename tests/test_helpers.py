@@ -27,6 +27,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
+import pytest_asyncio
 
 # --- Import server helpers ---
 # Add project root to sys.path so we can import from server/
@@ -1456,6 +1457,268 @@ class TestErrorHandlingFixes:
             "Schema write failure should degrade to text mode, not return error"
         assert "text mode output" in result
 
+
+# =========================================================================
+# Async job layer (v1.7): codex_submit / codex_result / _run_job
+# =========================================================================
+
+import server as _server
+from server import (
+    codex_submit,
+    codex_result,
+    SubmitInput,
+    JobResultInput,
+    _jobs,
+    _job_tasks,
+    _write_job_file,
+    MAX_ACTIVE_JOBS,
+    JOB_ID_RE,
+    ERROR_PREFIX,
+)
+
+
+@pytest_asyncio.fixture
+async def clean_jobs():
+    """Isolate job registry state per test (cancels leftover tasks, resets semaphore)."""
+    _jobs.clear()
+    _job_tasks.clear()
+    _server._job_semaphore = None
+    yield
+    for task in list(_job_tasks.values()):
+        task.cancel()
+    await asyncio.gather(*_job_tasks.values(), return_exceptions=True)
+    _jobs.clear()
+    _job_tasks.clear()
+    _server._job_semaphore = None
+
+
+class TestAsyncJobLayer:
+    @pytest.mark.asyncio
+    async def test_submit_unknown_tool_fast_fail(self, clean_jobs):
+        result = await codex_submit(SubmitInput(tool="nonsense", arguments={}))
+        assert result.startswith(ERROR_PREFIX)
+        assert "Unknown tool" in result
+        assert not _jobs
+
+    @pytest.mark.asyncio
+    async def test_submit_invalid_arguments_fast_fail(self, clean_jobs):
+        result = await codex_submit(SubmitInput(tool="review", arguments={"bogus": 1}))
+        assert result.startswith(ERROR_PREFIX)
+        assert "Invalid arguments" in result
+        assert not _jobs
+
+    @pytest.mark.asyncio
+    async def test_submit_accepts_codex_prefix(self, clean_jobs, tmp_path):
+        with patch.object(_server, "codex_critique", new=AsyncMock(return_value="ok")):
+            result = await codex_submit(SubmitInput(
+                tool="codex_critique",
+                arguments={"project_dir": str(tmp_path), "plan": "a plan long enough"},
+            ))
+        assert "Job submitted: job-" in result
+
+    @pytest.mark.asyncio
+    async def test_full_lifecycle_completed(self, clean_jobs, tmp_path):
+        with patch.object(_server, "codex_critique", new=AsyncMock(return_value="analysis text")):
+            sub = await codex_submit(SubmitInput(
+                tool="critique",
+                arguments={"project_dir": str(tmp_path), "plan": "a plan long enough"},
+            ))
+            job_id = sub.split("Job submitted: ")[1].split("\n")[0]
+            result = await codex_result(JobResultInput(job_id=job_id, wait_seconds=5))
+        assert result == "analysis text"
+        assert _jobs[job_id]["status"] == "completed"
+        # Persisted to disk with terminal status
+        job_file = tmp_path / ".claudex" / "jobs" / f"{job_id}.md"
+        assert job_file.is_file()
+        assert "Status: completed" in job_file.read_text()
+
+    @pytest.mark.asyncio
+    async def test_error_result_marks_failed(self, clean_jobs, tmp_path):
+        with patch.object(_server, "codex_critique", new=AsyncMock(return_value=f"{ERROR_PREFIX}boom")):
+            sub = await codex_submit(SubmitInput(
+                tool="critique",
+                arguments={"project_dir": str(tmp_path), "plan": "a plan long enough"},
+            ))
+            job_id = sub.split("Job submitted: ")[1].split("\n")[0]
+            result = await codex_result(JobResultInput(job_id=job_id, wait_seconds=5))
+        assert result.startswith(ERROR_PREFIX)
+        assert _jobs[job_id]["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_admission_cap(self, clean_jobs, tmp_path):
+        never = asyncio.Event()
+
+        async def _hang(params):
+            await never.wait()
+            return "unreachable"
+
+        with patch.object(_server, "codex_critique", new=_hang):
+            for _ in range(MAX_ACTIVE_JOBS):
+                r = await codex_submit(SubmitInput(
+                    tool="critique",
+                    arguments={"project_dir": str(tmp_path), "plan": "a plan long enough"},
+                ))
+                assert "Job submitted" in r
+            overflow = await codex_submit(SubmitInput(
+                tool="critique",
+                arguments={"project_dir": str(tmp_path), "plan": "a plan long enough"},
+            ))
+        assert overflow.startswith(ERROR_PREFIX)
+        assert "Too many active jobs" in overflow
+        never.set()
+        for task in list(_job_tasks.values()):
+            task.cancel()
+        await asyncio.gather(*_job_tasks.values(), return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_cancellation_persists_interrupted(self, clean_jobs, tmp_path):
+        started = asyncio.Event()
+
+        async def _hang(params):
+            started.set()
+            await asyncio.sleep(3600)
+            return "unreachable"
+
+        with patch.object(_server, "codex_critique", new=_hang):
+            sub = await codex_submit(SubmitInput(
+                tool="critique",
+                arguments={"project_dir": str(tmp_path), "plan": "a plan long enough"},
+            ))
+            job_id = sub.split("Job submitted: ")[1].split("\n")[0]
+            await started.wait()
+            task = _job_tasks[job_id]
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert _jobs[job_id]["status"] == "interrupted"
+        job_file = tmp_path / ".claudex" / "jobs" / f"{job_id}.md"
+        assert "Status: interrupted" in job_file.read_text()
+
+    @pytest.mark.asyncio
+    async def test_result_rejects_bad_job_id_format(self, clean_jobs):
+        result = await codex_result(JobResultInput(job_id="../../etc/passwd"))
+        assert result.startswith(ERROR_PREFIX)
+        assert "Invalid job_id format" in result
+
+    @pytest.mark.asyncio
+    async def test_disk_fallback_stale_running(self, clean_jobs, tmp_path):
+        jobs_dir = tmp_path / ".claudex" / "jobs"
+        jobs_dir.mkdir(parents=True)
+        stale_id = "job-abcdefabcdef"
+        (jobs_dir / f"{stale_id}.md").write_text(
+            f"# Codex job {stale_id}\nTool: codex_review\nStatus: running\n"
+        )
+        result = await codex_result(JobResultInput(job_id=stale_id, project_dir=str(tmp_path)))
+        assert result.startswith(ERROR_PREFIX)
+        assert "did not finish" in result
+
+    @pytest.mark.asyncio
+    async def test_disk_fallback_completed_returns_body(self, clean_jobs, tmp_path):
+        jobs_dir = tmp_path / ".claudex" / "jobs"
+        jobs_dir.mkdir(parents=True)
+        done_id = "job-123456abcdef"
+        (jobs_dir / f"{done_id}.md").write_text(
+            f"# Codex job {done_id}\nTool: codex_review\nStatus: completed\n"
+            f"Finished: 2026-01-01T00:00:00+00:00\n\n---\n\nthe analysis body"
+        )
+        result = await codex_result(JobResultInput(job_id=done_id, project_dir=str(tmp_path)))
+        assert result == "the analysis body"
+
+    @pytest.mark.asyncio
+    async def test_disk_fallback_failed_preserves_error_prefix(self, clean_jobs, tmp_path):
+        jobs_dir = tmp_path / ".claudex" / "jobs"
+        jobs_dir.mkdir(parents=True)
+        fail_id = "job-fffff0000001"
+        (jobs_dir / f"{fail_id}.md").write_text(
+            f"# Codex job {fail_id}\nTool: codex_review\nStatus: failed\n"
+            f"Finished: 2026-01-01T00:00:00+00:00\n\n---\n\n{ERROR_PREFIX}it broke"
+        )
+        result = await codex_result(JobResultInput(job_id=fail_id, project_dir=str(tmp_path)))
+        assert result.startswith(ERROR_PREFIX)
+
+    def test_job_id_regex(self):
+        assert JOB_ID_RE.match("job-0123456789ab")
+        assert not JOB_ID_RE.match("job-XYZ")
+        assert not JOB_ID_RE.match("job-0123456789ab/../x")
+        assert not JOB_ID_RE.match("notajob")
+
+    @pytest.mark.asyncio
+    async def test_disk_fallback_rejects_malformed_status(self, clean_jobs, tmp_path):
+        jobs_dir = tmp_path / ".claudex" / "jobs"
+        jobs_dir.mkdir(parents=True)
+        bad_id = "job-badbadbadbad"
+        (jobs_dir / f"{bad_id}.md").write_text(
+            f"# Codex job {bad_id}\nTool: codex_review\nStatus: nonsense\n\n---\n\nnot a result"
+        )
+        result = await codex_result(JobResultInput(job_id=bad_id, project_dir=str(tmp_path)))
+        assert result.startswith(ERROR_PREFIX)
+        assert "unrecognized" in result
+
+    @pytest.mark.asyncio
+    async def test_job_file_permissions(self, clean_jobs, tmp_path):
+        import stat as _stat
+        with patch.object(_server, "codex_critique", new=AsyncMock(return_value="ok")):
+            sub = await codex_submit(SubmitInput(
+                tool="critique",
+                arguments={"project_dir": str(tmp_path), "plan": "a plan long enough"},
+            ))
+            job_id = sub.split("Job submitted: ")[1].split("\n")[0]
+            await codex_result(JobResultInput(job_id=job_id, wait_seconds=5))
+        jobs_dir = tmp_path / ".claudex" / "jobs"
+        assert (jobs_dir.stat().st_mode & 0o777) == 0o700
+        assert ((jobs_dir / f"{job_id}.md").stat().st_mode & 0o777) == 0o600
+
+    @pytest.mark.asyncio
+    async def test_terminal_record_eviction(self, clean_jobs, tmp_path):
+        from server import MAX_JOB_RECORDS, _evict_old_job_records
+        import time as _time
+        for n in range(MAX_JOB_RECORDS + 5):
+            _jobs[f"job-{n:012x}"] = {
+                "tool": "critique", "status": "completed", "submitted": _time.time() + n,
+                "started_running": None, "finished": _time.time(), "project_dir": str(tmp_path),
+                "result": "x",
+            }
+        _evict_old_job_records()
+        assert len(_jobs) == MAX_JOB_RECORDS
+        # Oldest evicted, newest retained
+        assert f"job-{0:012x}" not in _jobs
+        assert f"job-{MAX_JOB_RECORDS + 4:012x}" in _jobs
+
+    @pytest.mark.asyncio
+    async def test_cancellation_removes_task_from_registry(self, clean_jobs, tmp_path):
+        started = asyncio.Event()
+
+        async def _hang(params):
+            started.set()
+            await asyncio.sleep(3600)
+            return "unreachable"
+
+        with patch.object(_server, "codex_critique", new=_hang):
+            sub = await codex_submit(SubmitInput(
+                tool="critique",
+                arguments={"project_dir": str(tmp_path), "plan": "a plan long enough"},
+            ))
+            job_id = sub.split("Job submitted: ")[1].split("\n")[0]
+            await started.wait()
+            task = _job_tasks[job_id]
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert job_id not in _job_tasks  # finally-block cleanup ran
+        assert _jobs[job_id]["status"] == "interrupted"
+
+    @pytest.mark.asyncio
+    async def test_list_jobs(self, clean_jobs, tmp_path):
+        with patch.object(_server, "codex_critique", new=AsyncMock(return_value="ok")):
+            sub = await codex_submit(SubmitInput(
+                tool="critique",
+                arguments={"project_dir": str(tmp_path), "plan": "a plan long enough"},
+            ))
+            job_id = sub.split("Job submitted: ")[1].split("\n")[0]
+            await codex_result(JobResultInput(job_id=job_id, wait_seconds=5))
+            listing = await codex_result(JobResultInput(job_id="list"))
+        assert job_id in listing
+        assert "completed" in listing
 
 # =========================================================================
 # Entry point for uv run --script

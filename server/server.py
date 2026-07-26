@@ -592,10 +592,14 @@ def _find_codex_bin() -> str:
     path = shutil.which("codex")
     if path:
         return path
-    # Common global npm install locations as fallback
+    # Common global npm install locations as fallback.
+    # /opt/homebrew/bin matters when the server is spawned by a GUI app
+    # (e.g. Claude Desktop) whose launchd PATH omits homebrew on Apple Silicon.
     for candidate in [
         os.path.expanduser("~/.npm-global/bin/codex"),
+        "/opt/homebrew/bin/codex",
         "/usr/local/bin/codex",
+        os.path.expanduser("~/.local/bin/codex"),
     ]:
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
@@ -675,7 +679,7 @@ def _cleanup_old_sessions(claudex_dir: Path) -> None:
     """Best-effort removal of session/recap files older than SESSION_MAX_AGE_SECONDS."""
     if not claudex_dir.is_dir():
         return
-    for subdir_name in ("sessions", "recaps"):
+    for subdir_name in ("sessions", "recaps", "jobs"):
         subdir = claudex_dir / subdir_name
         if not subdir.is_dir():
             continue
@@ -2702,7 +2706,12 @@ async def codex_status(params: StatusInput) -> str:
     lines.append(f"Default Model: {DEFAULT_MODEL}")
     lines.append(f"Effort:        {DEFAULT_REASONING_EFFORT}")
     lines.append(f"Timeout:       {EXEC_TIMEOUT_SECONDS}s (default, per-tool overrides available)")
-    lines.append(f"Tools:         10 (8 Codex-calling + codex_status + codex_ping)")
+    lines.append(f"Tools:         12 (8 Codex-calling + codex_submit/codex_result + codex_status + codex_ping)")
+
+    # --- Async jobs ---
+    if _jobs:
+        active = sum(1 for j in _jobs.values() if j["status"] in ("queued", "running"))
+        lines.append(f"Jobs:          {len(_jobs)} this session ({active} active) — see codex_result job_id='list'")
 
     # Plugin version — resolve relative to server.py, not project dir
     plugin_json = Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"
@@ -2825,11 +2834,15 @@ async def codex_ping() -> str:
             "--skip-git-repo-check",
             "--color", "never",
             "-m", DEFAULT_MODEL,
+            # Force minimal effort: this is a connectivity test, not analysis.
+            # Without this, a user-level config (e.g. xhigh default) makes even
+            # "pong" exceed the timeout.
+            "-c", "model_reasoning_effort=low",
             "Say 'pong' and nothing else.",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
     except asyncio.TimeoutError:
         return "Codex CLI found but timed out. Check your internet connection."
     except OSError as e:
@@ -2843,6 +2856,354 @@ async def codex_ping() -> str:
         return f"Codex CLI found but not authenticated.\nRun: codex login"
 
     return f"Codex CLI found but returned error:\n{err}"
+
+
+# ---------------------------------------------------------------------------
+# Async job layer — fire-and-collect for slow transports
+# ---------------------------------------------------------------------------
+# Some MCP clients cap synchronous tool calls well below Codex latency (e.g.
+# the Claude desktop-app device bridge kills calls at 60s; Claude Code holds
+# the session hostage for 20-minute calls). codex_submit returns a job_id in
+# <1s and runs the real tool as a background task in this (persistent) server
+# process; codex_result collects. Results also persist to .claudex/jobs/ so a
+# finished analysis survives client timeouts, disconnects, and server restarts.
+
+MAX_CONCURRENT_JOBS = 4
+MAX_ACTIVE_JOBS = 8        # queued + running admission cap (quota-flood guard)
+MAX_JOB_RECORDS = 50       # terminal records retained in memory (oldest evicted)
+JOB_WAIT_MAX_SECONDS = 45  # bounded so one poll stays under strict client caps
+JOB_ID_RE = re.compile(r'^job-[0-9a-f]{12}$')
+
+_jobs: dict[str, dict] = {}
+_job_tasks: dict[str, asyncio.Task] = {}
+_job_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _evict_old_job_records() -> None:
+    """Keep the in-memory registry bounded: evict oldest terminal records."""
+    terminal = [
+        (j["submitted"], jid) for jid, j in _jobs.items()
+        if j["status"] in ("completed", "failed", "interrupted")
+    ]
+    excess = len(_jobs) - MAX_JOB_RECORDS
+    if excess > 0:
+        for _, jid in sorted(terminal)[:excess]:
+            _jobs.pop(jid, None)
+            _job_tasks.pop(jid, None)
+
+
+def _get_job_semaphore() -> asyncio.Semaphore:
+    """Lazy-init semaphore (no event loop at module load time)."""
+    global _job_semaphore
+    if _job_semaphore is None:
+        _job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+    return _job_semaphore
+
+
+def _async_tool_registry() -> dict:
+    """Map submit keys to (tool function, input model). Defined as a function
+    so it can reference the tool callables declared above."""
+    return {
+        "critique": (codex_critique, SecondOpinionInput),
+        "plan": (codex_plan, ParallelPlanInput),
+        "brainstorm": (codex_brainstorm, BrainstormInput),
+        "collab": (codex_collab, CollaborateInput),
+        "review": (codex_review, QuickReviewInput),
+        "review_diff": (codex_review_diff, ReviewDiffInput),
+        "evaluate": (codex_evaluate, EvaluateInput),
+        "recap": (codex_recap, RecapInput),
+    }
+
+
+def _write_job_file(job_id: str, *, status_only: bool = False) -> None:
+    """Best-effort persistence of job state/result to .claudex/jobs/<id>.md."""
+    job = _jobs.get(job_id)
+    if not job:
+        return
+    path = _safe_claudex_path(job["project_dir"], "jobs", f"{job_id}.md")
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
+        header = (
+            f"# Codex job {job_id}\n"
+            f"Tool: codex_{job['tool']}\n"
+            f"Status: {job['status']}\n"
+        )
+        if status_only:
+            content = header
+        else:
+            header += f"Finished: {datetime.now(timezone.utc).isoformat()}\n\n---\n\n"
+            content = header + (job["result"] or "")
+        # Atomic replace via temp file (0600): a crash mid-write never destroys
+        # a valid record, and job files are not world-readable.
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.replace(tmp_path, path)
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        logger.warning("Job file write failed for %s: %s", job_id, exc)
+
+
+async def _run_job(job_id: str, fn, tool_params) -> None:
+    """Background job runner. Must never raise — failures land in the job record."""
+    job = _jobs[job_id]
+    try:
+        async with _get_job_semaphore():
+            job["status"] = "running"
+            job["started_running"] = time.time()
+            _write_job_file(job_id, status_only=True)
+            result = await fn(tool_params)
+        job["result"] = result
+        job["status"] = "failed" if result.startswith(ERROR_PREFIX) else "completed"
+    except asyncio.CancelledError:
+        # Server shutdown / task cancellation: record a terminal state so the
+        # persisted file never claims 'running' forever, then re-raise.
+        job["result"] = f"{ERROR_PREFIX}Job interrupted (server shutdown or cancellation)."
+        job["status"] = "interrupted"
+        raise
+    except Exception as exc:  # noqa: BLE001 — background task must never die silently
+        job["result"] = f"{ERROR_PREFIX}Job crashed: {exc!r}"
+        job["status"] = "failed"
+        logger.warning("Job %s crashed: %r", job_id, exc)
+    finally:
+        # Runs on success, failure, AND cancellation — registry cleanup is
+        # centralized here so no exit path leaks tasks or records.
+        job["finished"] = time.time()
+        _write_job_file(job_id)
+        _job_tasks.pop(job_id, None)
+        _evict_old_job_records()
+
+
+class SubmitInput(BaseModel):
+    """Input for codex_submit — run any Codex tool as a background job."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    tool: str = Field(
+        ...,
+        description=(
+            "Which Codex tool to run asynchronously: 'critique', 'plan', "
+            "'brainstorm', 'collab', 'review', 'review_diff', 'evaluate', or "
+            "'recap' (with or without the 'codex_' prefix)."
+        ),
+    )
+    arguments: dict = Field(
+        ...,
+        description=(
+            "The params object for that tool, exactly as you would pass it "
+            "synchronously (project_dir, user_prompt, reasoning_effort, "
+            "focus_files, etc.). Validated immediately — bad arguments fail "
+            "fast at submit time, not in the background."
+        ),
+    )
+
+
+class JobResultInput(BaseModel):
+    """Input for codex_result — collect a background job."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    job_id: str = Field(
+        ...,
+        description="Job ID returned by codex_submit, or 'list' to list all jobs this server session.",
+        min_length=1,
+    )
+    wait_seconds: int = Field(
+        default=0,
+        ge=0,
+        le=JOB_WAIT_MAX_SECONDS,
+        description=(
+            f"Block up to this many seconds (max {JOB_WAIT_MAX_SECONDS}) waiting for "
+            "completion before returning status. 0 returns immediately."
+        ),
+    )
+    project_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "Project directory for disk fallback: if the server restarted since "
+            "submit, finished results are read from <project>/.claudex/jobs/."
+        ),
+    )
+
+
+@mcp.tool(
+    name="codex_submit",
+    annotations={
+        "title": "Submit Async Codex Job",
+        "readOnlyHint": False,  # jobs persist files under .claudex/
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def codex_submit(params: SubmitInput) -> str:
+    """Run any Codex tool as a background job — returns a job_id in under a second.
+
+    Use this instead of the synchronous tools whenever the client transport
+    caps tool-call duration below Codex latency (e.g. remote bridges), or to
+    fire a panel of 2-4 lenses concurrently without blocking. Collect with
+    codex_result. Each job still costs 1 ChatGPT quota message.
+
+    The finished result is also written to .claudex/jobs/<job_id>.md in the
+    project, so it survives disconnects and server restarts.
+    """
+    registry = _async_tool_registry()
+    tool_key = params.tool.strip().lower()
+    if tool_key.startswith("codex_"):
+        tool_key = tool_key[len("codex_"):]
+    if tool_key not in registry:
+        return (
+            f"{ERROR_PREFIX}Unknown tool '{params.tool}'. "
+            f"Valid: {', '.join(sorted(registry))}"
+        )
+    fn, model_cls = registry[tool_key]
+
+    # Fail fast on bad arguments — at submit time, not in the background
+    try:
+        tool_params = model_cls(**params.arguments)
+    except Exception as exc:  # pydantic ValidationError and friends
+        return f"{ERROR_PREFIX}Invalid arguments for codex_{tool_key}: {exc}"
+
+    project_dir = getattr(tool_params, "project_dir", None) or os.getcwd()
+    try:
+        _validate_project_dir(project_dir)
+    except ValueError as e:
+        return f"{ERROR_PREFIX}{e}"
+
+    # Admission cap: bound queued+running so a submission flood can't retain
+    # unbounded state or burn unbounded ChatGPT quota.
+    active = sum(1 for j in _jobs.values() if j["status"] in ("queued", "running"))
+    if active >= MAX_ACTIVE_JOBS:
+        return (
+            f"{ERROR_PREFIX}Too many active jobs ({active}/{MAX_ACTIVE_JOBS}). "
+            "Collect or wait for running jobs before submitting more "
+            "(codex_result job_id='list')."
+        )
+
+    job_id = f"job-{uuid.uuid4().hex[:12]}"
+    _jobs[job_id] = {
+        "tool": tool_key,
+        "status": "queued",
+        "submitted": time.time(),
+        "started_running": None,
+        "finished": None,
+        "project_dir": project_dir,
+        "result": None,
+    }
+    _job_tasks[job_id] = asyncio.get_running_loop().create_task(
+        _run_job(job_id, fn, tool_params)
+    )
+    running = sum(1 for j in _jobs.values() if j["status"] == "running")
+    admitted = sum(1 for j in _jobs.values() if j["status"] in ("queued", "running"))
+    return (
+        f"Job submitted: {job_id}\n"
+        f"Tool: codex_{tool_key} | Project: {project_dir}\n"
+        f"Collect: codex_result with job_id='{job_id}' "
+        f"(optional wait_seconds up to {JOB_WAIT_MAX_SECONDS}).\n"
+        f"Result file on completion: .claudex/jobs/{job_id}.md\n"
+        f"Jobs: {running}/{MAX_CONCURRENT_JOBS} running, {admitted}/{MAX_ACTIVE_JOBS} admitted"
+    )
+
+
+@mcp.tool(
+    name="codex_result",
+    annotations={
+        "title": "Collect Async Codex Job",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def codex_result(params: JobResultInput) -> str:
+    """Collect the status or result of a codex_submit job. Zero Codex cost.
+
+    Returns immediately (or after wait_seconds, bounded to stay under strict
+    client timeouts). If the server restarted since submit, pass project_dir
+    to read the persisted result from .claudex/jobs/<job_id>.md.
+    """
+    if params.job_id == "list":
+        if not _jobs:
+            return "No jobs this server session. (Older results may exist in .claudex/jobs/ on disk.)"
+        lines = ["Jobs this server session:"]
+        for jid, j in sorted(_jobs.items(), key=lambda kv: kv[1]["submitted"]):
+            elapsed = (j["finished"] or time.time()) - j["submitted"]
+            lines.append(
+                f"  {jid}  codex_{j['tool']:<12s} {j['status']:<9s} {elapsed:>5.0f}s  {j['project_dir']}"
+            )
+        return "\n".join(lines)
+
+    if not JOB_ID_RE.match(params.job_id):
+        return f"{ERROR_PREFIX}Invalid job_id format (expected job-<12 hex chars>, or 'list')."
+
+    job = _jobs.get(params.job_id)
+
+    if job is None:
+        # Disk fallback — server may have restarted since submit. Parse the
+        # persisted record: only terminal states are results; a stale
+        # 'queued'/'running' header means the previous server died mid-job.
+        pd = params.project_dir or os.getcwd()
+        path = _safe_claudex_path(pd, "jobs", f"{params.job_id}.md")
+        if path is not None and path.is_file():
+            try:
+                # Bounded read from one handle (no stat/read TOCTOU gap)
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read(2_000_001)
+                if len(content) > 2_000_000:
+                    return f"{ERROR_PREFIX}Job file suspiciously large (>2MB); read it directly: .claudex/jobs/{params.job_id}.md"
+            except (OSError, UnicodeDecodeError) as exc:
+                return f"{ERROR_PREFIX}Job file unreadable: {exc}"
+            status_match = re.search(r'^Status: (\w+)$', content, re.MULTILINE)
+            disk_status = status_match.group(1) if status_match else "unknown"
+            if disk_status in ("queued", "running"):
+                return (
+                    f"{ERROR_PREFIX}Job {params.job_id} was left '{disk_status}' by a "
+                    "previous server instance (app quit mid-job). The job did not "
+                    "finish — resubmit it."
+                )
+            # Whitelist terminal states — a malformed/unknown record is never a result
+            if disk_status not in ("completed", "failed", "interrupted"):
+                return (
+                    f"{ERROR_PREFIX}Job file for {params.job_id} has unrecognized "
+                    f"status '{disk_status}' — treat as corrupt; resubmit the job."
+                )
+            # Terminal record: return the result body, preserving the error contract
+            body = content.split("\n---\n\n", 1)[-1] if "\n---\n\n" in content else content
+            if disk_status in ("failed", "interrupted") and not body.startswith(ERROR_PREFIX):
+                body = f"{ERROR_PREFIX}(persisted {disk_status} job)\n" + body
+            return body
+        return (
+            f"{ERROR_PREFIX}Unknown job_id '{params.job_id}'. If the server "
+            "restarted since submit, pass project_dir so the persisted result "
+            "can be read from .claudex/jobs/. Use job_id='list' to see live jobs."
+        )
+
+    if job["status"] in ("queued", "running") and params.wait_seconds > 0:
+        task = _job_tasks.get(params.job_id)
+        if task is not None:
+            await asyncio.wait([task], timeout=params.wait_seconds)
+
+    if job["status"] in ("queued", "running"):
+        elapsed = time.time() - job["submitted"]
+        return (
+            f"Job {params.job_id}: {job['status']} — codex_{job['tool']}, "
+            f"{elapsed:.0f}s elapsed. Poll codex_result again (wait_seconds "
+            f"up to {JOB_WAIT_MAX_SECONDS}), or read .claudex/jobs/{params.job_id}.md "
+            "after completion."
+        )
+
+    # completed or failed — return the full result text
+    return job["result"] or f"{ERROR_PREFIX}Job finished without a result."
 
 
 # ---------------------------------------------------------------------------

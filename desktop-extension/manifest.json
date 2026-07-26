@@ -1,0 +1,41 @@
+{
+  "manifest_version": "0.3",
+  "name": "claudex",
+  "display_name": "Claudex (Codex Teammate)",
+  "version": "1.7.1",
+  "description": "OpenAI Codex as a second-opinion teammate: parallel planning, plan critique, code/diff review, red-teaming, debugging collaboration, tradeoff analysis, and async background jobs. Codex runs in a read-only sandbox via the Codex CLI with your ChatGPT subscription.",
+  "author": {
+    "name": "Omri Tal",
+    "url": "https://www.botique.co.il"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OmriT123/Claudex"
+  },
+  "license": "MIT",
+  "server": {
+    "type": "python",
+    "entry_point": "server/server.py",
+    "mcp_config": {
+      "command": "/bin/sh",
+      "args": [
+        "-c",
+        "PATH=\"/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH\"; export PATH; exec uv run \"${__dirname}/server/server.py\""
+      ]
+    }
+  },
+  "keywords": [
+    "codex",
+    "second-opinion",
+    "code-review",
+    "red-team",
+    "planning",
+    "async-jobs",
+    "mcp"
+  ],
+  "compatibility": {
+    "platforms": [
+      "darwin"
+    ]
+  }
+}

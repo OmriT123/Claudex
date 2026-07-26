@@ -1,4 +1,4 @@
-# Claudex — Claude Code Plugin <sup>v1.6.0</sup>
+# Claudex — Claude Code Plugin <sup>v1.7.1</sup>
 
 Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, security-testing, debugging, verification, and decision support.
 
@@ -113,6 +113,22 @@ claude --plugin-dir /path/to/Claudex
 /codex:review src/auth.py, src/middleware.py
 ```
 
+## Install as a Claude Desktop Extension (Cowork / desktop app)
+
+Claudex also ships as a desktop extension (`.mcpb`) so the Codex tools are
+available in the Claude desktop app and get proxied into Cowork cloud sessions:
+
+```bash
+./desktop-extension/build.sh    # produces desktop-extension/claudex.mcpb
+```
+
+Double-click `claudex.mcpb` to install (Settings → Extensions if prompted),
+then fully restart the Claude desktop app. Prerequisites on the target Mac:
+[uv](https://astral.sh/uv) and the Codex CLI (`npm i -g @openai/codex && codex login`).
+
+Note for capped transports (e.g. Cowork's device bridge, which limits tool calls
+to 60s): use `codex_submit` / `codex_result` — see Async jobs below.
+
 ## MCP Tools
 
 | Tool | Purpose | Codex Persona |
@@ -127,6 +143,21 @@ claude --plugin-dir /path/to/Claudex
 | `codex_recap` | Generate decision record from a session | Technical Writer |
 | `codex_status` | Show Claudex diagnostics (no Codex call, zero cost) | — |
 | `codex_ping` | Test that Codex is installed and working | — |
+| `codex_submit` | Run any tool above as a background job — returns a job_id in <1s | (delegates) |
+| `codex_result` | Collect a background job's status/result (zero Codex cost) | — |
+
+### Async jobs (v1.7)
+
+Some MCP clients cap synchronous tool calls below Codex latency (the Claude
+desktop-app device bridge kills calls at 60s; long calls also block a Claude Code
+session). `codex_submit` accepts `{"tool": "review", "arguments": {...}}` — the same
+arguments you'd pass synchronously — validates them immediately, runs the tool as a
+background task (max 4 concurrent, 8 admitted), and returns a `job_id` instantly.
+`codex_result` polls (bounded `wait_seconds` ≤ 45) or returns the finished output.
+Results also persist to `.claudex/jobs/<job_id>.md`, so they survive client
+disconnects and server restarts (retained for 24 hours, then cleaned up like
+sessions); a job left `running` by a killed server is reported as interrupted,
+never returned as a result.
 
 ## Collaboration Modes
 
