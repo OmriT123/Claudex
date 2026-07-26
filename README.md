@@ -345,3 +345,8 @@ Infrastructure & logic contributions by **Gad Cohen**, COO @ [Evolven](https://w
 ## License
 
 MIT
+
+## Author
+
+**Omri Tal — Botique AI Solutions**
+AI systems, agents & automation for business · [www.botique.co.il](https://www.botique.co.il) · [hello@botique.co.il](mailto:hello@botique.co.il)
