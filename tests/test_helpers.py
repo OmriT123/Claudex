@@ -57,7 +57,6 @@ from server import (
     COLLAB_PERSONAS,
     MAX_SESSION_ROUNDS,
     SESSION_MAX_BYTES,
-    EFFORT_DOWNGRADE,
     DEFAULT_MODEL,
     DEFAULT_REASONING_SUMMARY,
     EXEC_TIMEOUT_SECONDS,
@@ -453,24 +452,35 @@ class TestReasoningSummary:
 
 
 # =========================================================================
-# Effort downgrade
+# Effort downgrade — REMOVED in v1.8.0
 # =========================================================================
 
+class TestNoDowngradeRetry:
+    """v1.8.0: the automatic effort-downgrade retry was removed — a timeout is
+    a single honest error, never a hidden second quota message."""
 
-class TestEffortDowngrade:
-    """Verify EFFORT_DOWNGRADE mapping for auto-retry."""
+    def test_downgrade_constant_removed(self):
+        import server as srv
+        assert not hasattr(srv, "EFFORT_DOWNGRADE")
 
-    def test_xhigh_downgrades_to_high(self):
-        assert EFFORT_DOWNGRADE["xhigh"] == "high"
+    @pytest.mark.asyncio
+    async def test_timeout_returns_error_without_retry(self, tmp_path):
+        import server as srv
+        calls = []
 
-    def test_high_downgrades_to_medium(self):
-        assert EFFORT_DOWNGRADE["high"] == "medium"
+        async def _once(prompt, **kw):
+            calls.append(kw.get("reasoning_effort"))
+            return "Error: Codex timed out after 1200s. Try: (1) focus_files"
 
-    def test_medium_not_downgradeable(self):
-        assert "medium" not in EFFORT_DOWNGRADE
+        with patch.object(srv, "_run_codex_once", new=_once):
+            result = await srv._run_codex("p", project_dir=str(tmp_path),
+                                          reasoning_effort="xhigh", tool_name="t")
+        assert result.startswith("Error:")
+        assert calls == ["xhigh"]  # exactly one attempt, at the requested effort
 
-    def test_low_not_downgradeable(self):
-        assert "low" not in EFFORT_DOWNGRADE
+
+# =========================================================================
+
 
 
 # =========================================================================
@@ -1719,6 +1729,187 @@ class TestAsyncJobLayer:
             listing = await codex_result(JobResultInput(job_id="list"))
         assert job_id in listing
         assert "completed" in listing
+
+# =========================================================================
+# v1.8.0 hardening
+# =========================================================================
+
+from server import (
+    _validate_project_dir,
+    _sanitized_codex_env,
+    _get_session_lock,
+    _check_daily_budget,
+    _daily_job_count,
+    ALLOWED_ROOTS_ENV,
+    MAX_JOBS_PER_DAY_ENV,
+)
+
+
+class TestHardening:
+    def test_allowlist_blocks_outside_root(self, tmp_path, monkeypatch):
+        allowed = tmp_path / "work"; allowed.mkdir()
+        outside = tmp_path / "elsewhere"; outside.mkdir()
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, str(allowed))
+        assert _validate_project_dir(str(allowed / ".")) == str(allowed.resolve())
+        with pytest.raises(ValueError, match="outside the allowed workspace"):
+            _validate_project_dir(str(outside))
+
+    def test_allowlist_allows_subdirectory(self, tmp_path, monkeypatch):
+        allowed = tmp_path / "work"; sub = allowed / "repo"; sub.mkdir(parents=True)
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, str(allowed))
+        assert _validate_project_dir(str(sub)) == str(sub.resolve())
+
+    def test_home_directory_rejected(self, monkeypatch):
+        monkeypatch.delenv(ALLOWED_ROOTS_ENV, raising=False)
+        with pytest.raises(ValueError, match="entire home directory"):
+            _validate_project_dir(str(Path.home()))
+
+    def test_protected_location_rejected(self, monkeypatch):
+        monkeypatch.delenv(ALLOWED_ROOTS_ENV, raising=False)
+        ssh = Path.home() / ".ssh"
+        if ssh.is_dir():
+            with pytest.raises(ValueError, match="protected location"):
+                _validate_project_dir(str(ssh))
+
+    def test_sanitized_env_drops_secrets(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
+        monkeypatch.setenv("GH_TOKEN", "gh-secret")
+        env = _sanitized_codex_env()
+        assert "OPENAI_API_KEY" not in env
+        assert "AWS_SECRET_ACCESS_KEY" not in env
+        assert "GH_TOKEN" not in env
+        assert "PATH" in env and "HOME" in env
+
+    def test_session_lock_alias_collision_shares_lock(self):
+        assert _get_session_lock("foo bar") is _get_session_lock("foo@bar")
+        assert _get_session_lock("foo_bar") is _get_session_lock("foo bar")
+        assert _get_session_lock("other") is not _get_session_lock("foo bar")
+
+    def test_daily_budget_enforced(self, monkeypatch):
+        monkeypatch.setenv(MAX_JOBS_PER_DAY_ENV, "2")
+        _daily_job_count["date"] = ""; _daily_job_count["count"] = 0
+        assert _check_daily_budget() is None
+        assert _check_daily_budget() is None
+        third = _check_daily_budget()
+        assert third is not None and third.startswith("Error:")
+        _daily_job_count["date"] = ""; _daily_job_count["count"] = 0
+
+    def test_daily_budget_unlimited_when_zero(self, monkeypatch):
+        monkeypatch.setenv(MAX_JOBS_PER_DAY_ENV, "0")
+        _daily_job_count["date"] = ""; _daily_job_count["count"] = 0
+        for _ in range(10):
+            assert _check_daily_budget() is None
+
+    @pytest.mark.asyncio
+    async def test_isolation_flags_in_command(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(ALLOWED_ROOTS_ENV, raising=False)
+        import server as srv
+        captured = {}
+
+        async def fake_exec(*cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["env"] = kwargs.get("env")
+            captured["start_new_session"] = kwargs.get("start_new_session")
+            raise FileNotFoundError()  # short-circuit after capture
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            result = await srv._run_codex_once("p", project_dir=str(tmp_path))
+        assert result.startswith("Error:")
+        cmd = captured["cmd"]
+        for flag in ("--ignore-user-config", "--ignore-rules", "--ephemeral"):
+            assert flag in cmd, f"missing {flag}"
+        assert "project_doc_max_bytes=0" in cmd
+        assert captured["start_new_session"] is True
+        assert captured["env"] is not None and "PATH" in captured["env"]
+
+    @pytest.mark.asyncio
+    async def test_diff_includes_deletions_and_attestation(self, tmp_path):
+        import subprocess as sp
+        from server import _get_git_diff
+        repo = tmp_path / "r"; repo.mkdir()
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                "--allow-empty", "-m", "init"], cwd=repo, check=True)
+        keep = repo / "keep.py"; keep.write_text("x = 1\n")
+        gone = repo / "gone.py"; gone.write_text("secret_check = True\n")
+        sp.run(["git", "add", "-A"], cwd=repo, check=True)
+        sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "add"],
+               cwd=repo, check=True)
+        gone.unlink()                      # deletion must appear
+        (repo / "sneaky.py").write_text("backdoor = 1\n")  # untracked must be named
+        diff = await _get_git_diff(str(repo), staged=False)
+        assert diff is not None
+        assert "REVIEWED-STATE: HEAD" in diff and "sha256:" in diff
+        assert "gone.py" in diff           # deletion included
+        assert "sneaky.py" in diff         # untracked named in header
+
+# =========================================================================
+# v1.8.0 gate-2 fixes
+# =========================================================================
+
+class TestGate2Fixes:
+    @pytest.mark.asyncio
+    async def test_oversized_diff_fails_closed(self, tmp_path):
+        import subprocess as sp
+        from server import _get_git_diff, DIFF_MAX_BYTES
+        repo = tmp_path / "r"; repo.mkdir()
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        big = repo / "big.txt"; big.write_text("line zero\n")
+        sp.run(["git", "add", "-A"], cwd=repo, check=True)
+        sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "i"],
+               cwd=repo, check=True)
+        big.write_text("x" * (DIFF_MAX_BYTES + 10_000))
+        result = await _get_git_diff(str(repo), staged=False)
+        assert result is not None and result.startswith("Error:")
+        assert "refusing a partial review" in result
+
+    @pytest.mark.asyncio
+    async def test_untracked_only_repo_not_silent(self, tmp_path):
+        import subprocess as sp
+        import server as srv
+        from server import codex_review_diff, ReviewDiffInput
+        repo = tmp_path / "r"; repo.mkdir()
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                "--allow-empty", "-m", "i"], cwd=repo, check=True)
+        (repo / "backdoor.py").write_text("evil = True\n")
+        result = await codex_review_diff(ReviewDiffInput(project_dir=str(repo)))
+        assert result.startswith("Error:")
+        assert "UNTRACKED" in result and "backdoor.py" in result
+
+    @pytest.mark.asyncio
+    async def test_budget_counts_synchronous_calls(self, tmp_path, monkeypatch):
+        import server as srv
+        from server import _daily_job_count, MAX_JOBS_PER_DAY_ENV
+        monkeypatch.setenv(MAX_JOBS_PER_DAY_ENV, "1")
+        _daily_job_count["date"] = ""; _daily_job_count["count"] = 0
+        with patch.object(srv, "_run_codex_once", new=AsyncMock(return_value="ok")):
+            first = await srv._run_codex("p", project_dir=str(tmp_path), tool_name="t")
+            second = await srv._run_codex("p", project_dir=str(tmp_path), tool_name="t")
+        assert not first.startswith("Error:")
+        assert second.startswith("Error:") and "budget" in second.lower()
+        _daily_job_count["date"] = ""; _daily_job_count["count"] = 0
+
+    def test_proxy_env_preserved(self, monkeypatch):
+        from server import _sanitized_codex_env
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy:8080")
+        monkeypatch.setenv("NO_PROXY", "localhost")
+        env = _sanitized_codex_env()
+        assert env.get("HTTPS_PROXY") == "http://proxy:8080"
+        assert env.get("NO_PROXY") == "localhost"
+
+    @pytest.mark.asyncio
+    async def test_skill_isolation_flags_present(self, tmp_path, monkeypatch):
+        import server as srv
+        captured = {}
+        async def fake_exec(*cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            raise FileNotFoundError()
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            await srv._run_codex_once("p", project_dir=str(tmp_path))
+        assert "skills.include_instructions=false" in captured["cmd"]
+        assert "skills.bundled.enabled=false" in captured["cmd"]
 
 # =========================================================================
 # Entry point for uv run --script

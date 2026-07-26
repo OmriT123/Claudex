@@ -57,7 +57,23 @@ DEFAULT_REASONING_EFFORT = "high"
 EXEC_TIMEOUT_SECONDS = 1200  # 20 min max per Codex call
 
 DEFAULT_REASONING_SUMMARY = "detailed"
-EFFORT_DOWNGRADE = {"xhigh": "high", "high": "medium"}
+# NOTE (v1.8.0): the automatic effort-downgrade retry was REMOVED. A timeout now
+# returns an honest error instead of silently spending a second quota message at
+# a lower effort and mislabeling the result. Callers retry deliberately.
+
+# --- Workspace confinement (v1.8.0) ---
+# CLAUDEX_ALLOWED_ROOTS: colon-separated absolute paths. When set, project_dir
+# must resolve inside one of them. When unset, any directory is allowed
+# (power-user mode) EXCEPT the always-denied sensitive locations below.
+ALLOWED_ROOTS_ENV = "CLAUDEX_ALLOWED_ROOTS"
+ALWAYS_DENIED_SUBPATHS = (
+    ".ssh", ".aws", ".gnupg", ".codex", ".config/gh",
+    "Library/Keychains", "Library/Application Support/Claude",
+)
+MAX_JOBS_PER_DAY_ENV = "CLAUDEX_MAX_JOBS_PER_DAY"
+DEFAULT_MAX_JOBS_PER_DAY = 200
+MAX_TEXT_FIELD_CHARS = 200_000       # bound on large free-text inputs
+MAX_OUTPUT_BYTES = 4_000_000         # cap captured Codex stdout/stderr
 
 FINAL_ANSWER_DELIMITER = "---FINAL-ANSWER---"
 ARTIFACT_MAX_BYTES = 100 * 1024  # 100 KB per artifact
@@ -533,10 +549,16 @@ _session_locks: dict[str, asyncio.Lock] = {}
 
 
 def _get_session_lock(session_id: str) -> asyncio.Lock:
-    """Get or create an async lock for a session ID."""
-    if session_id not in _session_locks:
-        _session_locks[session_id] = asyncio.Lock()
-    return _session_locks[session_id]
+    """Get or create an async lock for a session.
+
+    Keyed by the SANITIZED filename form (v1.8.0): distinct raw IDs like
+    'foo bar' and 'foo@bar' map to the same session file, so they must share
+    one lock — keying by raw ID allowed alias writes to bypass locking.
+    """
+    key = re.sub(r'[^a-zA-Z0-9_\-.]', '_', session_id)
+    if key not in _session_locks:
+        _session_locks[key] = asyncio.Lock()
+    return _session_locks[key]
 
 
 def _record_metric(tool_name: str, *, success: bool, elapsed: float, timed_out: bool = False) -> None:
@@ -606,16 +628,73 @@ def _find_codex_bin() -> str:
     return "codex"  # Let it fail with a clear FileNotFoundError
 
 
+def _allowed_roots() -> list[Path]:
+    """Parse CLAUDEX_ALLOWED_ROOTS into resolved paths (empty = unrestricted)."""
+    raw = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
+    if not raw:
+        return []
+    roots = []
+    for part in raw.split(":"):
+        part = part.strip()
+        if part:
+            try:
+                roots.append(Path(os.path.expanduser(part)).resolve())
+            except OSError:
+                pass
+    return roots
+
+
 def _validate_project_dir(project_dir: Optional[str]) -> str:
     """Validate and return project directory. Returns cwd if None.
 
-    Raises ValueError if the directory does not exist — this produces a
-    distinct error from 'codex binary not found' (FileNotFoundError).
+    Enforces workspace confinement (v1.8.0):
+    - Always denies sensitive locations (.ssh, .aws, keychains, ...).
+    - When CLAUDEX_ALLOWED_ROOTS is set, requires containment in a listed root.
+
+    Raises ValueError on rejection — distinct from 'codex binary not found'.
     """
     cwd = project_dir or os.getcwd()
     if not Path(cwd).is_dir():
         raise ValueError(f"Project directory does not exist: {cwd}")
-    return cwd
+    resolved = Path(cwd).resolve()
+
+    home = Path.home().resolve()
+    if resolved == home:
+        raise ValueError(
+            "Refusing to run Codex over the entire home directory. "
+            "Pass a specific project directory."
+        )
+    for denied in ALWAYS_DENIED_SUBPATHS:
+        denied_path = (home / denied).resolve()
+        if resolved == denied_path or resolved.is_relative_to(denied_path):
+            raise ValueError(f"Project directory is a protected location: {resolved}")
+
+    roots = _allowed_roots()
+    if roots and not any(resolved == r or resolved.is_relative_to(r) for r in roots):
+        raise ValueError(
+            f"Project directory {resolved} is outside the allowed workspace roots "
+            f"({ALLOWED_ROOTS_ENV}). Allowed: {', '.join(str(r) for r in roots)}"
+        )
+    if not roots:
+        logger.warning(
+            "%s not set — Codex may be pointed at any non-protected directory. "
+            "Set it for production/client deployments.", ALLOWED_ROOTS_ENV,
+        )
+    return str(resolved)
+
+
+def _sanitized_codex_env() -> dict:
+    """Minimal environment for the Codex subprocess.
+
+    Prevents leaking server-process env vars (tokens, API keys) into a child
+    that sends context to a third-party model. Codex needs HOME (auth in
+    ~/.codex), PATH, and little else.
+    """
+    keep = ("PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TERM", "LANG", "LC_ALL",
+            "CODEX_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+            "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+            "http_proxy", "https_proxy", "no_proxy", "all_proxy")
+    return {k: v for k, v in os.environ.items() if k in keep}
 
 
 def _safe_claudex_path(
@@ -1028,6 +1107,7 @@ class CodexBaseInput(BaseModel):
 
     project_dir: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description="Absolute path to the project directory. Defaults to cwd.",
     )
     reasoning_effort: ReasoningEffort = Field(
@@ -1036,6 +1116,7 @@ class CodexBaseInput(BaseModel):
     )
     model: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description="Override the default Codex model for this call.",
         pattern=r'^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$',
     )
@@ -1047,6 +1128,7 @@ class CodexBaseInput(BaseModel):
     )
     reasoning_summary: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description="Override reasoning summary mode (e.g. 'detailed', 'concise', 'none').",
         pattern=r'^[a-z]{2,20}$',
     )
@@ -1062,9 +1144,11 @@ class SecondOpinionInput(CodexBaseInput):
             "Include what you're trying to accomplish and how you intend to do it."
         ),
         min_length=10,
+        max_length=MAX_TEXT_FIELD_CHARS,
     )
     user_prompt: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "The user's original request, verbatim. Ensures Codex responds "
             "to user intent, not just CC's interpretation."
@@ -1072,6 +1156,7 @@ class SecondOpinionInput(CodexBaseInput):
     )
     context: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "Additional context: constraints, tech stack details, business requirements, "
             "or anything Codex should know beyond what's in the repo."
@@ -1079,6 +1164,7 @@ class SecondOpinionInput(CodexBaseInput):
     )
     focus_files: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "Comma-separated list of files/dirs Codex should pay special attention to "
             "(e.g. 'src/auth/,src/models/user.py'). Codex has full repo access regardless."
@@ -1096,9 +1182,11 @@ class ParallelPlanInput(CodexBaseInput):
             "Codex will read the codebase and generate its own approach independently."
         ),
         min_length=10,
+        max_length=MAX_TEXT_FIELD_CHARS,
     )
     user_prompt: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "The user's original request, verbatim. Pass this EXACTLY as the user "
             "typed it — do not rephrase, interpret, or add your own framing. "
@@ -1107,6 +1195,7 @@ class ParallelPlanInput(CodexBaseInput):
     )
     constraints: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "Hard constraints Codex must respect: deadlines, tech requirements, "
             "backward compatibility, performance targets, etc."
@@ -1114,6 +1203,7 @@ class ParallelPlanInput(CodexBaseInput):
     )
     focus_files: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "Comma-separated files/dirs most relevant to this task "
             "(e.g. 'src/auth/,src/models/'). Helps Codex focus."
@@ -1131,9 +1221,11 @@ class BrainstormInput(CodexBaseInput):
             "what you're trying to solve."
         ),
         min_length=10,
+        max_length=MAX_TEXT_FIELD_CHARS,
     )
     user_prompt: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "The user's original request, verbatim. Pass this EXACTLY as the user "
             "typed it — do not rephrase, interpret, or add your own framing. "
@@ -1142,6 +1234,7 @@ class BrainstormInput(CodexBaseInput):
     )
     context: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description="Additional context, constraints, or prior art to consider.",
     )
 
@@ -1153,11 +1246,13 @@ class CollaborateInput(CodexBaseInput):
         ...,
         description="The problem CC needs help with.",
         min_length=10,
+        max_length=MAX_TEXT_FIELD_CHARS,
     )
     cc_analysis: str = Field(
         ...,
         description="What CC has already figured out — its findings and current thinking.",
         min_length=10,
+        max_length=MAX_TEXT_FIELD_CHARS,
     )
     request_type: RequestType = Field(
         default=RequestType.GENERAL,
@@ -1168,6 +1263,7 @@ class CollaborateInput(CodexBaseInput):
     )
     user_prompt: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "The user's original request, verbatim. Ensures Codex responds "
             "to user intent, not just CC's interpretation."
@@ -1175,6 +1271,7 @@ class CollaborateInput(CodexBaseInput):
     )
     session_id: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "Session ID for iterative workflows. Creates/continues a session "
             "document in .claudex/sessions/ for shared memory across rounds. "
@@ -1183,6 +1280,7 @@ class CollaborateInput(CodexBaseInput):
     )
     files_involved: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description="Comma-separated list of files relevant to this problem.",
     )
 
@@ -1201,9 +1299,11 @@ class QuickReviewInput(CodexBaseInput):
             "(e.g. 'src/auth.py,src/routes/login.py')."
         ),
         min_length=1,
+        max_length=MAX_TEXT_FIELD_CHARS,
     )
     user_prompt: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "The user's original request, verbatim. Ensures Codex responds "
             "to user intent, not just CC's interpretation."
@@ -1211,6 +1311,7 @@ class QuickReviewInput(CodexBaseInput):
     )
     focus: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "What to focus the review on: 'security', 'performance', 'correctness', "
             "'maintainability', or a custom focus area."
@@ -1232,13 +1333,16 @@ class EvaluateInput(CodexBaseInput):
             "for analysis. Separate with clear labels (Option A, Option B, etc.)."
         ),
         min_length=20,
+        max_length=MAX_TEXT_FIELD_CHARS,
     )
     constraints: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description="Non-negotiable requirements that any option must satisfy.",
     )
     priorities: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "What the user is optimizing for (performance, maintainability, "
             "speed to ship, cost, etc.)."
@@ -1246,10 +1350,12 @@ class EvaluateInput(CodexBaseInput):
     )
     context: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description="Additional context about why this decision matters or what's driving it.",
     )
     focus_files: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description="Comma-separated file/directory paths for Codex to read for codebase context.",
     )
 
@@ -1265,9 +1371,11 @@ class RecapInput(CodexBaseInput):
         ...,
         description="Session ID corresponding to a document in .claudex/sessions/.",
         min_length=1,
+        max_length=MAX_TEXT_FIELD_CHARS,
     )
     additional_context: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description="Additional context about what was decided or any final outcomes.",
     )
 
@@ -1281,6 +1389,7 @@ class ReviewDiffInput(CodexBaseInput):
     )
     focus: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description="What to focus the review on: 'security', 'performance', 'correctness', or a custom area.",
     )
     staged: bool = Field(
@@ -1293,10 +1402,12 @@ class ReviewDiffInput(CodexBaseInput):
     )
     context: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description="Additional context about what these changes are for.",
     )
     user_prompt: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description="The user's original request, verbatim.",
     )
 
@@ -1403,6 +1514,7 @@ class StatusInput(BaseModel):
 
     project_dir: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description="Absolute path to the project directory. Defaults to cwd.",
     )
 
@@ -1427,7 +1539,7 @@ async def _run_codex_once(
     Run Codex CLI in non-interactive, read-only mode and return the output.
 
     This is the low-level runner. Use ``_run_codex`` for the wrapper with
-    metrics, auto-retry on timeout, and version check.
+    metrics and version check.
 
     When ``output_schema`` is provided, Codex is instructed to return structured
     JSON matching the schema via ``--output-schema``. Artifact extraction is
@@ -1459,6 +1571,16 @@ async def _run_codex_once(
         "--sandbox", "read-only",
         "--skip-git-repo-check",
         "--color", "never",
+        # --- Isolation (v1.8.0): treat repository content and user config as
+        # untrusted. The user's config.toml (custom instructions, hooks, skills,
+        # MCP integrations) and repo AGENTS.md files are instruction-injection
+        # surfaces when two "independent" models read the same repo.
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--ephemeral",
+        "-c", "project_doc_max_bytes=0",
+        "-c", "skills.include_instructions=false",
+        "-c", "skills.bundled.enabled=false",
         "-m", model,
         "-c", f"model_reasoning_effort={reasoning_effort}",
         "-c", f"model_reasoning_summary={reasoning_summary}",
@@ -1487,6 +1609,25 @@ async def _run_codex_once(
         "yes" if output_schema else "no",
     )
 
+    def _kill_tree(p) -> None:
+        """Kill the process group (children included), falling back to the process.
+
+        Refuses pgid <= 1 defensively — killing init's group would take down
+        the host session (start_new_session=True guarantees pgid == child pid
+        in practice, so a real child always passes).
+        """
+        try:
+            pid = int(p.pid)
+            pgid = os.getpgid(pid)
+            if pid <= 1 or pgid <= 1:
+                raise OSError(f"refusing to kill pgid {pgid}")
+            os.killpg(pgid, 9)
+        except (ProcessLookupError, PermissionError, OSError, TypeError, ValueError):
+            try:
+                p.kill()
+            except (ProcessLookupError, OSError):
+                pass
+
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -1495,15 +1636,14 @@ async def _run_codex_once(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
+            env=_sanitized_codex_env(),
+            start_new_session=True,  # own process group -> clean tree termination
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(input=prompt.encode("utf-8")), timeout=timeout
         )
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except (ProcessLookupError, OSError):
-            pass  # Process already exited
+        _kill_tree(proc)
         try:
             await asyncio.wait_for(proc.communicate(), timeout=5)
         except (asyncio.TimeoutError, ProcessLookupError, OSError):
@@ -1523,12 +1663,9 @@ async def _run_codex_once(
     except OSError as exc:
         return f"{ERROR_PREFIX}Failed to start Codex: {exc}"
     finally:
-        # Kill orphaned subprocess (e.g. on CancelledError during server shutdown)
+        # Kill orphaned subprocess tree (e.g. on CancelledError during shutdown)
         if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()
-            except (ProcessLookupError, OSError):
-                pass
+            _kill_tree(proc)
             try:
                 await asyncio.wait_for(proc.communicate(), timeout=5)
             except (asyncio.TimeoutError, ProcessLookupError, OSError):
@@ -1541,7 +1678,7 @@ async def _run_codex_once(
                 pass
 
     if proc.returncode != 0:
-        err_msg = stderr.decode(errors="replace").strip()
+        err_msg = stderr[:16_384].decode(errors="replace").strip()
         if "not authenticated" in err_msg.lower() or "login" in err_msg.lower():
             return (
                 f"{ERROR_PREFIX}Codex is not authenticated. Run:\n"
@@ -1554,11 +1691,20 @@ async def _run_codex_once(
                 "per-window message limits (resets every ~5 hours). "
                 "Try again later or use lower reasoning_effort."
             )
+        if "unexpected argument" in err_msg.lower() or "unrecognized option" in err_msg.lower():
+            return (
+                f"{ERROR_PREFIX}Codex CLI too old for the required isolation flags. "
+                "Update it: npm i -g @openai/codex (needs >= 0.140)."
+            )
         return f"{ERROR_PREFIX}Codex exited with code {proc.returncode}.\nStderr: {err_msg}"
 
+    # Output bound (transport-size guard; memory is bounded only after
+    # communicate() returns — streaming caps are a future hardening step)
+    if len(stdout) > MAX_OUTPUT_BYTES:
+        stdout = stdout[:MAX_OUTPUT_BYTES] + b"\n... [output truncated at 4MB]"
     output = stdout.decode(errors="replace").strip()
     if not output:
-        fallback = stderr.decode(errors="replace").strip()
+        fallback = stderr[:16_384].decode(errors="replace").strip()
         if fallback:
             return f"{ERROR_PREFIX}Codex returned no stdout (exit 0).\nStderr: {fallback}"
         return (
@@ -1613,17 +1759,20 @@ async def _run_codex(
     output_schema: Optional[dict] = None,
 ) -> str:
     """
-    High-level Codex runner with metrics, auto-retry on timeout, and version check.
+    High-level Codex runner with metrics and version check.
 
     Wraps ``_run_codex_once`` and adds:
       - Metrics recording (success/timeout/error + elapsed time)
-      - Auto-downgrade on timeout (xhigh->high, high->medium) with one retry
       - Version check warning on first invocation
 
     When ``output_schema`` is set, ALL text mutations (version warning, retry note,
     metadata footer) are suppressed to keep the JSON output clean. Metrics recording
     still happens.
     """
+    budget_err = _check_daily_budget()
+    if budget_err:
+        return budget_err
+
     start_time = time.monotonic()
 
     result = await _run_codex_once(
@@ -1643,38 +1792,9 @@ async def _run_codex(
 
     _record_metric(tool_name, success=success, elapsed=elapsed, timed_out=timed_out)
 
-    # Auto-retry with downgraded effort on timeout
-    if timed_out and reasoning_effort in EFFORT_DOWNGRADE:
-        downgraded = EFFORT_DOWNGRADE[reasoning_effort]
-        logger.info(
-            "Timeout at effort=%s, retrying with effort=%s for tool=%s",
-            reasoning_effort, downgraded, tool_name,
-        )
-        retry_start = time.monotonic()
-        result = await _run_codex_once(
-            prompt,
-            project_dir=project_dir,
-            model=model,
-            reasoning_effort=downgraded,
-            reasoning_summary=reasoning_summary,
-            timeout=timeout,
-            tool_name=tool_name,
-            output_schema=output_schema,
-        )
-        retry_elapsed = time.monotonic() - retry_start
-        retry_timed_out = result.startswith(ERROR_PREFIX) and "timed out" in result
-        retry_success = not result.startswith(ERROR_PREFIX)
-
-        _record_metric(tool_name, success=retry_success, elapsed=retry_elapsed, timed_out=retry_timed_out)
-
-        if retry_success and output_schema is None:
-            result = (
-                f"**Note:** Original call timed out at {reasoning_effort}. "
-                f"Auto-retried with {downgraded}.\n\n"
-            ) + result
-            # Update for metadata footer
-            elapsed = time.monotonic() - start_time
-            reasoning_effort = downgraded
+    # v1.8.0: no automatic downgrade retry. A timeout is reported honestly and
+    # the caller decides whether to retry (and at what effort). This keeps the
+    # effort label truthful and quota spend explicit — one call, one message.
 
     # When output_schema is set, suppress ALL text mutations to keep JSON clean
     if output_schema is not None:
@@ -1921,6 +2041,8 @@ async def _run_structured_review(
                 timeout=effective_timeout,
                 tool_name=tool_name,
             )
+            if fallback_result.startswith(ERROR_PREFIX):
+                return fallback_result  # propagate unchanged — never mask an error
             return (
                 "**Note:** Structured output failed; auto-retried in text mode "
                 "(2 Codex messages used this call).\n\n"
@@ -1938,7 +2060,7 @@ async def _run_structured_review(
     name="codex_critique",
     annotations={
         "title": "Get Codex Second Opinion on a Plan",
-        "readOnlyHint": True,
+        "readOnlyHint": False,  # writes .claudex/ artifacts/sessions
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
@@ -2010,7 +2132,7 @@ async def codex_critique(params: SecondOpinionInput) -> str:
     name="codex_plan",
     annotations={
         "title": "Get Codex's Own Independent Plan",
-        "readOnlyHint": True,
+        "readOnlyHint": False,  # writes .claudex/ artifacts/sessions
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
@@ -2081,7 +2203,7 @@ async def codex_plan(params: ParallelPlanInput) -> str:
     name="codex_brainstorm",
     annotations={
         "title": "Brainstorm with Codex",
-        "readOnlyHint": True,
+        "readOnlyHint": False,  # writes .claudex/ artifacts/sessions
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
@@ -2143,7 +2265,7 @@ async def codex_brainstorm(params: BrainstormInput) -> str:
     name="codex_collab",
     annotations={
         "title": "Collaborate with Codex",
-        "readOnlyHint": True,
+        "readOnlyHint": False,  # writes .claudex/ artifacts/sessions
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
@@ -2327,7 +2449,7 @@ async def codex_collab(params: CollaborateInput) -> str:
     name="codex_review",
     annotations={
         "title": "Quick Code Review from Codex",
-        "readOnlyHint": True,
+        "readOnlyHint": False,  # writes .claudex/ artifacts/sessions
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
@@ -2399,7 +2521,7 @@ async def codex_review(params: QuickReviewInput) -> str:
     name="codex_evaluate",
     annotations={
         "title": "Codex Evaluate — Tradeoff Analysis",
-        "readOnlyHint": True,
+        "readOnlyHint": False,  # writes .claudex/ artifacts/sessions
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
@@ -2534,13 +2656,21 @@ async def codex_recap(params: RecapInput) -> str:
 
 
 async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]:
-    """Get git diff content, filtering binary files, capped at DIFF_MAX_BYTES and DIFF_MAX_FILES."""
+    """Get git diff content with review-integrity guarantees (v1.8.0).
+
+    - Includes DELETIONS (removed authorization checks are security-relevant).
+    - Reports untracked files by name so a review never silently omits them.
+    - Prepends an attestation header (HEAD SHA + diff SHA256) binding the
+      review to an exact repository state.
+    - Fails CLOSED on truncation: a partial diff is marked PARTIAL and the
+      caller must not treat the verdict as repository-wide approval.
+    """
     try:
         # Enforce file count cap before generating full diff
         name_cmd = ["git", "diff", "--name-only"]
         if staged:
             name_cmd.append("--staged")
-        name_cmd.append("--diff-filter=ACMRT")
+        name_cmd.append("--diff-filter=ACMRTD")
         proc = await asyncio.create_subprocess_exec(
             *name_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -2560,7 +2690,7 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
         cmd = ["git", "diff"]
         if staged:
             cmd.append("--staged")
-        cmd.extend(["--no-color", "--diff-filter=ACMRT"])
+        cmd.extend(["--no-color", "--diff-filter=ACMRTD"])
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -2576,11 +2706,36 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
         if not diff_text.strip():
             return None
 
-        # Cap size
-        if len(diff_text.encode("utf-8")) > DIFF_MAX_BYTES:
-            diff_text = diff_text.encode("utf-8")[:DIFF_MAX_BYTES].decode("utf-8", errors="ignore") + "\n... [diff truncated at 50KB]"
+        # --- Attestation: bind the review to an exact repository state ---
+        import hashlib
+        head_sha = await _git_cmd(project_dir, "rev-parse", "HEAD") or "unknown"
+        diff_hash = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()[:16]
+        untracked = await _git_cmd(
+            project_dir, "ls-files", "--others", "--exclude-standard"
+        )
+        _all_untracked = [f for f in (untracked or "").split("\n") if f]
+        untracked_count = len(_all_untracked)
+        untracked_files = _all_untracked[:50]
 
-        return diff_text
+        # FAIL CLOSED (v1.8.0): an oversized diff is an error, never a silently
+        # partial review. A "ship" verdict must always mean full coverage.
+        if len(diff_text.encode("utf-8")) > DIFF_MAX_BYTES:
+            return (
+                f"{ERROR_PREFIX}Diff exceeds {DIFF_MAX_BYTES // 1000}KB — refusing a "
+                "partial review. Split the work: stage and review in batches "
+                "(git add -p), or review specific files with codex_review."
+            )
+
+        header_lines = [
+            f"REVIEWED-STATE: HEAD {head_sha} | diff sha256:{diff_hash} | "
+            f"files {len(changed_files)} | {'staged' if staged else 'unstaged'}",
+        ]
+        if untracked_files:
+            note = "UNTRACKED FILES (NOT in this diff — flag if any look security-relevant): " + ", ".join(untracked_files)
+            if untracked_count > len(untracked_files):
+                note += f" ... and {untracked_count - len(untracked_files)} more (list incomplete)"
+            header_lines.append(note)
+        return "\n".join(header_lines) + "\n\n" + diff_text
     except (asyncio.TimeoutError, OSError):
         return None
 
@@ -2589,7 +2744,7 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
     name="codex_review_diff",
     annotations={
         "title": "Codex Diff Review",
-        "readOnlyHint": True,
+        "readOnlyHint": False,  # writes .claudex/ artifacts/sessions
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
@@ -2610,7 +2765,20 @@ async def codex_review_diff(params: ReviewDiffInput) -> str:
 
     diff_text = await _get_git_diff(cwd, staged=params.staged)
     if not diff_text:
+        # v1.8.0: untracked-only changes must never read as "nothing to review" —
+        # a brand-new untracked file is exactly where a backdoor hides.
+        untracked_probe = await _git_cmd(cwd, "ls-files", "--others", "--exclude-standard")
+        untracked_list = [f for f in (untracked_probe or "").split("\n") if f]
         diff_type = "staged" if params.staged else "unstaged"
+        if untracked_list:
+            shown = ", ".join(untracked_list[:50])
+            more = f" (+{len(untracked_list) - 50} more)" if len(untracked_list) > 50 else ""
+            return (
+                f"{ERROR_PREFIX}No {diff_type} tracked changes — but {len(untracked_list)} "
+                f"UNTRACKED file(s) exist and are NOT reviewable via diff: {shown}{more}. "
+                "Review them explicitly with codex_review (files=...), or git add them "
+                "and review the staged diff."
+            )
         return f"{ERROR_PREFIX}No {diff_type} changes found. Nothing to review."
     if diff_text.startswith(ERROR_PREFIX):
         return diff_text  # Propagate file-count limit errors directly
@@ -2667,7 +2835,7 @@ async def codex_review_diff(params: ReviewDiffInput) -> str:
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
-        "openWorldHint": False,
+        "openWorldHint": True,  # network: version check / OpenAI
     },
 )
 async def codex_status(params: StatusInput) -> str:
@@ -2814,7 +2982,7 @@ async def codex_status(params: StatusInput) -> str:
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
-        "openWorldHint": False,
+        "openWorldHint": True,  # network: version check / OpenAI
     },
 )
 async def codex_ping() -> str:
@@ -2871,6 +3039,32 @@ async def codex_ping() -> str:
 MAX_CONCURRENT_JOBS = 4
 MAX_ACTIVE_JOBS = 8        # queued + running admission cap (quota-flood guard)
 MAX_JOB_RECORDS = 50       # terminal records retained in memory (oldest evicted)
+_daily_job_count = {"date": "", "count": 0}
+
+
+def _check_daily_budget() -> Optional[str]:
+    """Rolling per-day job budget (CLAUDEX_MAX_JOBS_PER_DAY, default 200).
+
+    In-memory (resets with the server process) — a guardrail against runaway
+    loops burning ChatGPT quota, not an accounting system.
+    """
+    try:
+        cap = int(os.environ.get(MAX_JOBS_PER_DAY_ENV, DEFAULT_MAX_JOBS_PER_DAY))
+    except ValueError:
+        cap = DEFAULT_MAX_JOBS_PER_DAY
+    if cap <= 0:
+        return None  # explicitly unlimited
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _daily_job_count["date"] != today:
+        _daily_job_count["date"] = today
+        _daily_job_count["count"] = 0
+    if _daily_job_count["count"] >= cap:
+        return (
+            f"{ERROR_PREFIX}Daily Codex job budget reached ({cap}). "
+            f"Raise {MAX_JOBS_PER_DAY_ENV} or wait for the UTC day rollover."
+        )
+    _daily_job_count["count"] += 1
+    return None
 JOB_WAIT_MAX_SECONDS = 45  # bounded so one poll stays under strict client caps
 JOB_ID_RE = re.compile(r'^job-[0-9a-f]{12}$')
 
@@ -2945,6 +3139,8 @@ def _write_job_file(job_id: str, *, status_only: bool = False) -> None:
         try:
             with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
                 f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, path)
         except OSError:
             try:
@@ -3017,6 +3213,7 @@ class JobResultInput(BaseModel):
         ...,
         description="Job ID returned by codex_submit, or 'list' to list all jobs this server session.",
         min_length=1,
+        max_length=MAX_TEXT_FIELD_CHARS,
     )
     wait_seconds: int = Field(
         default=0,
@@ -3029,6 +3226,7 @@ class JobResultInput(BaseModel):
     )
     project_dir: Optional[str] = Field(
         default=None,
+        max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "Project directory for disk fallback: if the server restarted since "
             "submit, finished results are read from <project>/.claudex/jobs/."
@@ -3090,6 +3288,13 @@ async def codex_submit(params: SubmitInput) -> str:
             "(codex_result job_id='list')."
         )
 
+    # Bound serialized argument size (transport/DoS guard)
+    try:
+        if len(json.dumps(params.arguments)) > MAX_TEXT_FIELD_CHARS:
+            return f"{ERROR_PREFIX}Arguments too large (> {MAX_TEXT_FIELD_CHARS} chars serialized)."
+    except (TypeError, ValueError):
+        return f"{ERROR_PREFIX}Arguments are not JSON-serializable."
+
     job_id = f"job-{uuid.uuid4().hex[:12]}"
     _jobs[job_id] = {
         "tool": tool_key,
@@ -3111,7 +3316,8 @@ async def codex_submit(params: SubmitInput) -> str:
         f"Collect: codex_result with job_id='{job_id}' "
         f"(optional wait_seconds up to {JOB_WAIT_MAX_SECONDS}).\n"
         f"Result file on completion: .claudex/jobs/{job_id}.md\n"
-        f"Jobs: {running}/{MAX_CONCURRENT_JOBS} running, {admitted}/{MAX_ACTIVE_JOBS} admitted"
+        f"Jobs: {running}/{MAX_CONCURRENT_JOBS} running, {admitted}/{MAX_ACTIVE_JOBS} admitted\n"
+        "Cost: 1 ChatGPT quota message (up to 2 if a structured review falls back to text mode)."
     )
 
 

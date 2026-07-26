@@ -247,10 +247,8 @@ echo '.claudex' >> .gitignore
 - **Reasoning summary**: `detailed` (overridable: `detailed`, `concise`, `none`)
 - **Sandbox**: `read-only` — Codex reads your repo but never modifies it
 - **Timeout**: 1200s (20 min) for all tools
-- **Auto-retry**: On timeout, effort is downgraded and retried once (`xhigh` → `high`, `high` → `medium`). No retry for `medium` or `low`
 - **Git context**: All tools (except `codex_review_diff`) automatically inject current branch, diff stat, recent commits, and staged changes into the Codex prompt — no manual context needed
 - **Session rollover**: After 4 rounds, sessions auto-rollover (recap generated, new chained session with `-p2`/`-p3` suffix)
-- **Structured output**: `codex_review` and `codex_review_diff` return structured JSON findings (severity, confidence, file:line) by default. Set `structured_output=False` for legacy text mode. If structured mode fails (CLI incompatibility or malformed JSON), the server auto-retries in text mode — this costs 1 extra message from your quota
 - **Version check**: Auto-checks for Codex CLI updates on first tool invocation (warning shown once per session)
 - **Metrics**: In-memory per-tool stats (calls, successes, timeouts, errors, avg latency) — visible in `codex_status`, reset on server restart
 

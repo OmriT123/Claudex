@@ -31,7 +31,7 @@ There is no build system, no linter configured. Dependencies are declared inline
 uv run --script tests/test_helpers.py
 ```
 
-Tests (122 total) cover security-critical helpers (`_safe_claudex_path`, `_normalize_file_list`), session management, Pydantic model validation, auto-session-ID generation, timeout constants, model/reasoning_summary validation, effort downgrade, metrics, session chaining, `ReviewDiffInput`, backward compatibility, structured output schemas, review formatters, `_build_review_system` toggle, `structured_output` field validation, structured output integration (mock-based), temp file lifecycle, formatter edge cases, and error handling fixes (stderr fallback, timeout cleanup, OSError catch, version warning masking, schema write errors). Test file uses PEP 723 inline metadata (same pattern as `server.py`).
+Tests (147+ total) cover security-critical helpers (`_safe_claudex_path`, `_normalize_file_list`), session management, Pydantic model validation, auto-session-ID generation, timeout constants, model/reasoning_summary validation, metrics, session chaining, `ReviewDiffInput`, backward compatibility, structured output schemas, review formatters, `_build_review_system` toggle, `structured_output` field validation, structured output integration (mock-based), temp file lifecycle, formatter edge cases, and error handling fixes (stderr fallback, timeout cleanup, OSError catch, version warning masking, schema write errors). Test file uses PEP 723 inline metadata (same pattern as `server.py`).
 
 ## Architecture
 
@@ -60,7 +60,7 @@ Tests (122 total) cover security-critical helpers (`_safe_claudex_path`, `_norma
 - **Dynamic collab personas** — `COLLAB_PERSONAS` dict maps request_type → persona instructions
 - **Pydantic input models** — typed inputs for each tool with validation (regex patterns on `model` and `reasoning_summary` to prevent injection)
 - **Enums** — `ReasoningEffort` (4 levels), `RequestType` (7 collab modes)
-- **`_run_codex()` / `_run_codex_once()`** — core async subprocess runner with auto-retry on timeout (effort downgrade), metrics, artifact extraction, and optional `--output-schema` for structured JSON output
+- **`_run_codex()` / `_run_codex_once()`** — core async subprocess runner (hardened v1.8: isolated Codex profile, sanitized env, process-group kill) with metrics, artifact extraction, and optional `--output-schema` for structured JSON output
 - **`_run_structured_review()`** — shared helper for `codex_review` and `codex_review_diff` handling structured-output fallback, JSON parsing, and markdown formatting
 - **Structured output** — `REVIEW_FILES_SCHEMA` / `REVIEW_DIFF_SCHEMA` define JSON schemas for review tools. `_build_review_system()` toggles between artifact and structured-output instructions. Formatters (`_format_finding`, `_format_review_files_json`, `_format_review_diff_json`) render JSON as rich markdown. Auto-fallback to text mode on JSON parse failure.
 - **Session management** — `_safe_claudex_path()`, `_init_session()`, `_append_to_session()` for iterative debugging
@@ -85,7 +85,7 @@ Tests (122 total) cover security-critical helpers (`_safe_claudex_path`, `_norma
 - Reasoning effort: `high` (overridable per-call)
 - Reasoning summary: `detailed` (overridable per-call)
 - Timeout: 1200s (20 min) for all tools
-- Timeout auto-retry: on timeout, `xhigh` → `high` and `high` → `medium` are retried once automatically
+- No timeout auto-retry (removed v1.8.0): timeouts return honest errors; callers retry deliberately
 - Artifact max size: 100KB
 - Run directory cleanup: 1 hour
 - Session termination: 4 rounds max, then auto-rollover (recap + chained session)

@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "claudex",
   "display_name": "Claudex (Codex Teammate)",
-  "version": "1.7.1",
+  "version": "1.8.0",
   "description": "OpenAI Codex as a second-opinion teammate: parallel planning, plan critique, code/diff review, red-teaming, debugging collaboration, tradeoff analysis, and async background jobs. Codex runs in a read-only sandbox via the Codex CLI with your ChatGPT subscription.",
   "author": {
     "name": "Omri Tal",
@@ -20,7 +20,9 @@
       "command": "/bin/sh",
       "args": [
         "-c",
-        "PATH=\"/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH\"; export PATH; exec uv run \"${__dirname}/server/server.py\""
+        "CLAUDEX_ALLOWED_ROOTS=$(IFS=:; printf '%s' \"$*\"); export CLAUDEX_ALLOWED_ROOTS; PATH=\"/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH\"; export PATH; exec uv run \"${__dirname}/server/server.py\"",
+        "claudex-launcher",
+        "${user_config.allowed_roots}"
       ]
     }
   },
@@ -37,5 +39,14 @@
     "platforms": [
       "darwin"
     ]
+  },
+  "user_config": {
+    "allowed_roots": {
+      "type": "directory",
+      "title": "Allowed project folders",
+      "description": "Codex runs only inside these project folders (working-directory confinement; protected locations like ~/.ssh are always denied). Note: OS-level read sandboxing is on the roadmap \u2014 Codex retains user file permissions like any local dev tool. Leave empty for unrestricted power-user mode.",
+      "multiple": true,
+      "required": false
+    }
   }
 }

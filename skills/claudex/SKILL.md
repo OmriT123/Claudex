@@ -368,7 +368,7 @@ When Codex disagrees with your approach:
 - `high` — default, good for most analysis
 - `xhigh` — maximum depth, slower but more thorough
 
-**Auto-retry on timeout:** If a call times out and the effort level is `xhigh` or `high`, the server automatically retries once with a lower effort (`xhigh` → `high`, `high` → `medium`). A note is prepended to the response when this happens.
+**No hidden retries (v1.8):** a timeout returns an honest error and spends no extra quota. Retry deliberately — same effort with a longer `timeout_seconds`, or a lower effort if speed matters.
 
 **Reasoning summary:** `detailed` by default. Overridable per-call (`detailed`, `concise`, `none`).
 
