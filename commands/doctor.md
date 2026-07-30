@@ -2,7 +2,7 @@
 name: doctor
 description: "Diagnose and fix Claudex issues — checks prerequisites, auth, connectivity, and common problems"
 argument-hint: ""
-allowed-tools: Read, Glob, Grep
+allowed-tools: Read, Glob, Grep, Bash(which:*), Bash(codex --version), Bash(du:*), mcp__plugin_codex_codex__codex_ping
 ---
 
 # Claudex Doctor

@@ -2,7 +2,7 @@
 name: plan
 description: "Generate a parallel plan — CC and Codex independently plan the same task, then CC synthesizes the best of both"
 argument-hint: "[task description]"
-allowed-tools: Read, Glob, Grep
+allowed-tools: Read, Glob, Grep, mcp__plugin_codex_codex__codex_plan
 ---
 
 # Parallel Planning with Codex

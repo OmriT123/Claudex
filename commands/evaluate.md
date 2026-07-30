@@ -2,7 +2,7 @@
 name: evaluate
 description: "Evaluate tradeoffs between approaches — Codex analyzes options so you can decide"
 argument-hint: "[Option A vs Option B]"
-allowed-tools: Read, Glob, Grep
+allowed-tools: Read, Glob, Grep, mcp__plugin_codex_codex__codex_evaluate
 ---
 
 # Evaluate with Codex

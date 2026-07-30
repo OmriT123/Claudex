@@ -2,7 +2,7 @@
 name: collab
 description: "Collaborate with Codex — security-test, debug, verify, review code, suggest features, or get an independent analysis"
 argument-hint: "[problem description]"
-allowed-tools: Read, Glob, Grep
+allowed-tools: Read, Glob, Grep, mcp__plugin_codex_codex__codex_collab, mcp__plugin_codex_codex__codex_recap
 ---
 
 # Collaborate with Codex

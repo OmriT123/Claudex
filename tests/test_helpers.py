@@ -36,6 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "server"))
 
 from server import (
     _safe_claudex_path,
+    _prepare_run_dir,
     _normalize_file_list,
     _init_session,
     _append_to_session,
@@ -134,6 +135,21 @@ class TestSafeClaudexPath:
         result = _safe_claudex_path(str(tmp_path), "sessions", "foo bar!.md")
         assert result is not None
         assert result.name == "foo_bar_.md"
+
+
+class TestPrepareRunDir:
+    def test_symlink_at_claudex_dir_rejected(self, tmp_path):
+        # Same guard as _safe_claudex_path: a symlinked .claudex is refused
+        claudex_link = tmp_path / ".claudex"
+        claudex_link.symlink_to("/tmp")
+        with pytest.raises(OSError, match="symlink"):
+            _prepare_run_dir(str(tmp_path))
+
+    def test_normal_run_dir_created(self, tmp_path):
+        run_dir = _prepare_run_dir(str(tmp_path))
+        assert run_dir.is_dir()
+        assert run_dir.name.startswith("run-")
+        assert run_dir.parent == tmp_path / ".claudex"
 
 
 # =========================================================================

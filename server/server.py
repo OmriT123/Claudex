@@ -778,11 +778,15 @@ def _prepare_run_dir(project_dir: str) -> Path:
     """Create an isolated per-run artifact directory under .claudex/.
 
     Returns the Path to the run directory (e.g. <project>/.claudex/run-<uuid>/).
+    Rejects .claudex being a symlink (same symlink guard as _safe_claudex_path).
     Also performs best-effort cleanup of stale run dirs and sessions, and warns
     if .claudex is not in .gitignore.
     """
     root = Path(project_dir)
     claudex_dir = root / ".claudex"
+    if claudex_dir.is_symlink():
+        logger.warning("Symlink rejected at .claudex/ directory: %s", claudex_dir)
+        raise OSError(f".claudex is a symlink, refusing to use it: {claudex_dir}")
 
     # Best-effort cleanup of old runs and sessions
     _cleanup_old_run_dirs(claudex_dir)

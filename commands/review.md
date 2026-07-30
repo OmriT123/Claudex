@@ -2,7 +2,7 @@
 name: review
 description: "Get a focused code review from Codex on specific files"
 argument-hint: "[file1, file2, ...]"
-allowed-tools: Read, Glob, Grep
+allowed-tools: Read, Glob, Grep, Bash(git diff:*), mcp__plugin_codex_codex__codex_review, mcp__plugin_codex_codex__codex_collab
 ---
 
 # Code Review with Codex

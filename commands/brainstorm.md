@@ -2,7 +2,7 @@
 name: brainstorm
 description: "Brainstorm with Codex — explore approaches to a problem from two AI perspectives"
 argument-hint: "[topic or problem]"
-allowed-tools: Read, Glob, Grep
+allowed-tools: Read, Glob, Grep, mcp__plugin_codex_codex__codex_brainstorm
 ---
 
 # Brainstorm with Codex

@@ -1,7 +1,7 @@
 ---
 name: status
 description: "Show Claudex status — Codex CLI info, active sessions, artifacts, disk usage (zero Codex cost)"
-allowed-tools: []
+allowed-tools: mcp__plugin_codex_codex__codex_status
 ---
 
 # Claudex Status

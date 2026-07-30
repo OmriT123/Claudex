@@ -2,7 +2,7 @@
 name: review-diff
 description: "Get Codex to review your git diff — staged or unstaged changes"
 argument-hint: "[security | performance | correctness | all]"
-allowed-tools: Read, Glob, Grep
+allowed-tools: Read, Glob, Grep, Bash(git status:*), Bash(git diff:*), mcp__plugin_codex_codex__codex_review_diff, mcp__plugin_codex_codex__codex_collab
 ---
 
 # Diff Review with Codex
