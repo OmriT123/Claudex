@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "claudex",
   "display_name": "Claudex (Codex Teammate)",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "OpenAI Codex as a second-opinion teammate: parallel planning, plan critique, code/diff review, red-teaming, debugging collaboration, tradeoff analysis, and async background jobs. Codex runs in a read-only sandbox via the Codex CLI with your ChatGPT subscription.",
   "author": {
     "name": "Omri Tal",
