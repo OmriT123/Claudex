@@ -66,6 +66,11 @@ DEFAULT_REASONING_SUMMARY = "detailed"
 # must resolve inside one of them. When unset, any directory is allowed
 # (power-user mode) EXCEPT the always-denied sensitive locations below.
 ALLOWED_ROOTS_ENV = "CLAUDEX_ALLOWED_ROOTS"
+# Launcher-template shape that must never be treated as a real root (v1.8.2):
+# the desktop app passes ${user_config.allowed_roots} through literally when
+# the setting is absent. Only this exact shape is neutralized — any other
+# unexpanded ${...} is a user misconfiguration and still fails closed.
+_UNEXPANDED_TEMPLATE_RE = re.compile(r"\$\{user_config\.[^}]*\}")
 ALWAYS_DENIED_SUBPATHS = (
     ".ssh", ".aws", ".gnupg", ".codex", ".config/gh",
     "Library/Keychains", "Library/Application Support/Claude",
@@ -636,11 +641,20 @@ def _allowed_roots() -> list[Path]:
     roots = []
     for part in raw.split(":"):
         part = part.strip()
-        if part:
-            try:
-                roots.append(Path(os.path.expanduser(part)).resolve())
-            except OSError:
-                pass
+        if not part:
+            continue
+        if _UNEXPANDED_TEMPLATE_RE.fullmatch(part):
+            # Unexpanded launcher template (${user_config.*}) must never become
+            # a real root — that turns into deny-all. Any other ${...}-bearing
+            # part is a user misconfiguration and keeps failing closed.
+            logger.warning(
+                "Ignoring unexpanded template in %s: %r", ALLOWED_ROOTS_ENV, part
+            )
+            continue
+        try:
+            roots.append(Path(os.path.expanduser(part)).resolve())
+        except OSError:
+            pass
     return roots
 
 
@@ -2879,6 +2893,21 @@ async def codex_status(params: StatusInput) -> str:
     lines.append(f"Effort:        {DEFAULT_REASONING_EFFORT}")
     lines.append(f"Timeout:       {EXEC_TIMEOUT_SECONDS}s (default, per-tool overrides available)")
     lines.append(f"Tools:         12 (8 Codex-calling + codex_submit/codex_result + codex_status + codex_ping)")
+
+    # --- Workspace confinement (v1.8.2) ---
+    raw_roots = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
+    active_roots = _allowed_roots()
+    if active_roots:
+        lines.append(f"Roots:         {':'.join(str(r) for r in active_roots)}")
+        if any(_UNEXPANDED_TEMPLATE_RE.fullmatch(p.strip()) for p in raw_roots.split(":")):
+            lines.append("               (unexpanded template part(s) in the configured value were ignored)")
+    elif raw_roots:
+        lines.append(
+            f"Roots:         unrestricted — {ALLOWED_ROOTS_ENV} was set but yielded no "
+            "usable roots (unexpanded template or invalid parts discarded)"
+        )
+    else:
+        lines.append(f"Roots:         unrestricted ({ALLOWED_ROOTS_ENV} not set)")
 
     # --- Async jobs ---
     if _jobs:

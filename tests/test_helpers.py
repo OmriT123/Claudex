@@ -1928,6 +1928,73 @@ class TestGate2Fixes:
         assert "skills.bundled.enabled=false" in captured["cmd"]
 
 # =========================================================================
+# v1.8.2: unexpanded ${user_config...} placeholder must not become a root
+# =========================================================================
+
+from server import _allowed_roots
+
+
+class TestAllowedRootsPlaceholder:
+    def test_literal_placeholder_env_is_unrestricted(self, monkeypatch):
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, "${user_config.allowed_roots}")
+        assert _allowed_roots() == []
+
+    def test_mixed_real_and_placeholder_keeps_real_root_only(self, tmp_path, monkeypatch):
+        real = tmp_path / "work"; real.mkdir()
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, f"{real}:${{user_config.allowed_roots}}")
+        assert _allowed_roots() == [real.resolve()]
+
+    def test_placeholder_env_does_not_deny_all(self, tmp_path, monkeypatch):
+        # The reported failure mode: literal placeholder bricked every call
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, "${user_config.allowed_roots}")
+        project = tmp_path / "repo"; project.mkdir()
+        assert _validate_project_dir(str(project)) == str(project.resolve())
+
+    def test_non_template_dollar_part_still_fails_closed(self, tmp_path, monkeypatch):
+        # Narrow guard: a hand-written unexpanded var like ${HOME}/dev is a
+        # misconfiguration, not the launcher bug — it must stay a (bogus) root
+        # so confinement still denies loudly instead of silently opening up.
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, "${HOME}/dev")
+        assert len(_allowed_roots()) == 1
+        project = tmp_path / "repo"; project.mkdir()
+        with pytest.raises(ValueError, match="outside the allowed workspace"):
+            _validate_project_dir(str(project))
+
+
+class TestLauncherPlaceholder:
+    def _launcher_script(self):
+        import json as _json
+        manifest = PROJECT_ROOT / "desktop-extension" / "manifest.json"
+        return _json.loads(manifest.read_text())["server"]["mcp_config"]["args"][1]
+
+    def _run_launcher(self, *args):
+        import subprocess as sp
+        probe = self._launcher_script().split("; export CLAUDEX_ALLOWED_ROOTS")[0] \
+            + '; printf "%s" "$CLAUDEX_ALLOWED_ROOTS"'
+        out = sp.run(["/bin/sh", "-c", probe, "claudex-launcher", *args],
+                     capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+        return out.stdout
+
+    def test_literal_placeholder_neutralized(self):
+        assert self._run_launcher("${user_config.allowed_roots}") == ""
+
+    def test_real_roots_preserved(self):
+        assert self._run_launcher("/tmp/a", "/tmp/b") == "/tmp/a:/tmp/b"
+
+    def test_mixed_input_neutralized_whole(self):
+        # Launcher layer is deliberately blunt: any placeholder empties the
+        # whole value; the server layer keeps real parts if one leaks through.
+        assert self._run_launcher("/tmp/a", "${user_config.allowed_roots}") == ""
+
+    def test_launcher_script_parses(self):
+        import subprocess as sp
+        check = sp.run(["/bin/sh", "-n", "-c", self._launcher_script()],
+                       capture_output=True, text=True)
+        assert check.returncode == 0, check.stderr
+
+
+# =========================================================================
 # Entry point for uv run --script
 # =========================================================================
 

@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "claudex",
   "display_name": "Claudex (Codex Teammate)",
-  "version": "1.8.1",
+  "version": "1.8.2",
   "description": "OpenAI Codex as a second-opinion teammate: parallel planning, plan critique, code/diff review, red-teaming, debugging collaboration, tradeoff analysis, and async background jobs. Codex runs in a read-only sandbox via the Codex CLI with your ChatGPT subscription.",
   "author": {
     "name": "Omri Tal",
@@ -20,7 +20,7 @@
       "command": "/bin/sh",
       "args": [
         "-c",
-        "CLAUDEX_ALLOWED_ROOTS=$(IFS=:; printf '%s' \"$*\"); export CLAUDEX_ALLOWED_ROOTS; PATH=\"/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH\"; export PATH; exec uv run \"${__dirname}/server/server.py\"",
+        "CLAUDEX_ALLOWED_ROOTS=$(IFS=:; printf '%s' \"$*\"); case \"$CLAUDEX_ALLOWED_ROOTS\" in *'${user_config'*) CLAUDEX_ALLOWED_ROOTS=\"\";; esac; export CLAUDEX_ALLOWED_ROOTS; PATH=\"/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH\"; export PATH; exec uv run \"${__dirname}/server/server.py\"",
         "claudex-launcher",
         "${user_config.allowed_roots}"
       ]

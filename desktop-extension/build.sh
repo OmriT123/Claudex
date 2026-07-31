@@ -5,6 +5,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
+# Fail closed if the launcher shell snippet doesn't parse (it carries control flow since v1.8.2)
+python3 -c 'import json,sys; sys.stdout.write(json.load(open("manifest.json"))["server"]["mcp_config"]["args"][1])' \
+  | /bin/sh -n || { echo "error: launcher script in manifest.json failed sh -n" >&2; exit 1; }
 mkdir -p "$STAGE/server"
 cp manifest.json "$STAGE/"
 cp ../server/server.py "$STAGE/server/"
