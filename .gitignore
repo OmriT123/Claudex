@@ -9,3 +9,4 @@ desktop-extension/claudex.mcpb
 .pytest_cache/
 desktop-extension/_stage/
 docs/v2-plan/
+docs/adr/
