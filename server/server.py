@@ -37,6 +37,8 @@ import os
 import re
 import shutil
 import logging
+import sqlite3
+import sys
 import tempfile
 import time
 import uuid
@@ -55,17 +57,21 @@ from pydantic import BaseModel, Field, ConfigDict
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_REASONING_EFFORT = "high"
 EXEC_TIMEOUT_SECONDS = 1200  # 20 min max per Codex call
+MIN_CODEX_VERSION = "0.140.0"  # oldest Codex CLI with the required isolation flags
 
 DEFAULT_REASONING_SUMMARY = "detailed"
 # NOTE (v1.8.0): the automatic effort-downgrade retry was REMOVED. A timeout now
 # returns an honest error instead of silently spending a second quota message at
 # a lower effort and mislabeling the result. Callers retry deliberately.
 
-# --- Workspace confinement (v1.8.0) ---
-# CLAUDEX_ALLOWED_ROOTS: colon-separated absolute paths. When set, project_dir
-# must resolve inside one of them. When unset, any directory is allowed
-# (power-user mode) EXCEPT the always-denied sensitive locations below.
+# --- Workspace confinement (deny-by-default since v2.0; was fail-open) ---
+# CLAUDEX_ALLOWED_ROOTS: os.pathsep-separated absolute paths (':' on POSIX,
+# ';' on Windows — so C:\work survives). project_dir must resolve inside one
+# of them. NO configured roots means every project directory is REJECTED.
+# The structured transport `--allowed-roots <path> ...` on the server argv
+# takes precedence over the env var and involves no separator parsing at all.
 ALLOWED_ROOTS_ENV = "CLAUDEX_ALLOWED_ROOTS"
+_ARGV_ROOTS: Optional[list[str]] = None  # set by the __main__ argv parser
 # Launcher-template shape that must never be treated as a real root (v1.8.2):
 # the desktop app passes ${user_config.allowed_roots} through literally when
 # the setting is absent. Only this exact shape is neutralized — any other
@@ -75,10 +81,17 @@ ALWAYS_DENIED_SUBPATHS = (
     ".ssh", ".aws", ".gnupg", ".codex", ".config/gh",
     "Library/Keychains", "Library/Application Support/Claude",
 )
-MAX_JOBS_PER_DAY_ENV = "CLAUDEX_MAX_JOBS_PER_DAY"
-DEFAULT_MAX_JOBS_PER_DAY = 200
+# Local per-day Codex execution cap — a guardrail against runaway loops,
+# never an OpenAI usage/billing meter. Durable (SQLite in per-user app data,
+# v2.0); counts actual Codex executions on every path, sync and async.
+MAX_RUNS_PER_DAY_ENV = "CLAUDEX_MAX_RUNS_PER_DAY"
+MAX_JOBS_PER_DAY_ENV = "CLAUDEX_MAX_JOBS_PER_DAY"  # deprecated alias (pre-v2.0 name)
+DEFAULT_MAX_RUNS_PER_DAY = 200
+STATE_DIR_ENV = "CLAUDEX_STATE_DIR"
 MAX_TEXT_FIELD_CHARS = 200_000       # bound on large free-text inputs
-MAX_OUTPUT_BYTES = 4_000_000         # cap captured Codex stdout/stderr
+MAX_OUTPUT_BYTES = 4_000_000         # combined stdout+stderr cap, enforced DURING read
+MAX_LINE_BYTES = 1_000_000           # single-line cap (no-newline flood guard)
+STDERR_TAIL_BYTES = 16_384           # stderr kept for diagnostics (rolling tail)
 
 FINAL_ANSWER_DELIMITER = "---FINAL-ANSWER---"
 ARTIFACT_MAX_BYTES = 100 * 1024  # 100 KB per artifact
@@ -634,12 +647,21 @@ def _find_codex_bin() -> str:
 
 
 def _allowed_roots() -> list[Path]:
-    """Parse CLAUDEX_ALLOWED_ROOTS into resolved paths (empty = unrestricted)."""
-    raw = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
-    if not raw:
-        return []
+    """Resolve configured workspace roots (argv --allowed-roots wins over env).
+
+    Deny-by-default (v2.0): an empty result means _validate_project_dir
+    REJECTS every project directory — never "unrestricted".
+    """
+    if _ARGV_ROOTS is not None:
+        parts = list(_ARGV_ROOTS)
+    else:
+        raw = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
+        if not raw:
+            return []
+        # os.pathsep, not a literal ':' — a ':' split corrupts C:\ paths on Windows.
+        parts = raw.split(os.pathsep)
     roots = []
-    for part in raw.split(":"):
+    for part in parts:
         part = part.strip()
         if not part:
             continue
@@ -656,6 +678,37 @@ def _allowed_roots() -> list[Path]:
         except OSError:
             pass
     return roots
+
+
+def _authorized_cwd(
+    project_dir: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """Confinement gate for tool handlers: (cwd, None) ok / (None, error) denied.
+
+    One home for the denial contract — every project-bound tool opens with
+    `cwd, err = _authorized_cwd(...); if err: return err`. The subprocess
+    runner still re-validates as defense-in-depth (never trust the caller).
+    """
+    try:
+        return _validate_project_dir(project_dir), None
+    except ValueError as e:
+        return None, f"{ERROR_PREFIX}{e}"
+
+
+def _roots_span_filesystem() -> bool:
+    """True when a configured root is so broad that confinement is nominal.
+
+    A root of `/` (or a filesystem root / drive root) or the home directory lets
+    a caller reach almost anything under it — the ALWAYS_DENIED list is only a
+    thin backstop there. Diagnostics use this to report 'nominal' rather than
+    falsely claiming 'confinement active'. (A narrower per-file read denylist is
+    tracked as a follow-up hardening task — see ROADMAP.)
+    """
+    home = Path.home().resolve()
+    for r in _allowed_roots():
+        if r == home or r == r.parent:  # r == r.parent is true only at a FS/drive root
+            return True
+    return False
 
 
 def _validate_project_dir(project_dir: Optional[str]) -> str:
@@ -684,17 +737,37 @@ def _validate_project_dir(project_dir: Optional[str]) -> str:
             raise ValueError(f"Project directory is a protected location: {resolved}")
 
     roots = _allowed_roots()
-    if roots and not any(resolved == r or resolved.is_relative_to(r) for r in roots):
+    if not roots:
+        raise ValueError(
+            "No workspace roots configured — all project directories are denied. "
+            "Claudex is deny-by-default since v2.0 (earlier versions allowed any "
+            f"directory here). Fix: set {ALLOWED_ROOTS_ENV} to your project "
+            f"folder(s), separated by '{os.pathsep}' — e.g. an env block in "
+            ".mcp.json / your MCP client config, or your shell profile. "
+            "Claude Desktop users: pick folders in the extension settings. "
+            "See README → 'Workspace confinement (required)'."
+        )
+    if not any(resolved == r or resolved.is_relative_to(r) for r in roots):
         raise ValueError(
             f"Project directory {resolved} is outside the allowed workspace roots "
             f"({ALLOWED_ROOTS_ENV}). Allowed: {', '.join(str(r) for r in roots)}"
         )
-    if not roots:
-        logger.warning(
-            "%s not set — Codex may be pointed at any non-protected directory. "
-            "Set it for production/client deployments.", ALLOWED_ROOTS_ENV,
-        )
     return str(resolved)
+
+
+_CODEX_ENV_KEEP = frozenset((
+    # POSIX
+    "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TERM", "LANG", "LC_ALL",
+    "CODEX_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+    # Windows essentials — without these a child loses winsock/DNS/TLS init
+    # (SYSTEMROOT/WINDIR/COMSPEC) and cannot find its per-user config/auth
+    # (USERPROFILE/APPDATA/LOCALAPPDATA). Harmless on POSIX (simply absent).
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP",
+    "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+))
 
 
 def _sanitized_codex_env() -> dict:
@@ -704,11 +777,7 @@ def _sanitized_codex_env() -> dict:
     that sends context to a third-party model. Codex needs HOME (auth in
     ~/.codex), PATH, and little else.
     """
-    keep = ("PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TERM", "LANG", "LC_ALL",
-            "CODEX_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
-            "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
-            "http_proxy", "https_proxy", "no_proxy", "all_proxy")
-    return {k: v for k, v in os.environ.items() if k in keep}
+    return {k: v for k, v in os.environ.items() if k in _CODEX_ENV_KEEP}
 
 
 def _safe_claudex_path(
@@ -1054,15 +1123,34 @@ def _normalize_file_list(files_csv: str, project_dir: str) -> list[str]:
 
 # --- Git context ---
 
+# Repo-local .git/config can weaponize otherwise-read-only git commands: they
+# execute helper programs (in OUR process, outside `--sandbox read-only`) merely
+# from operating on a repo. These flags close the vectors git lets us disable —
+# core.fsmonitor (runs on worktree scans), diff.external + textconv (run during a
+# diff), and hooks — but this is REDUCTION, NOT a sandbox. Git has no flag to
+# disable attribute-driven clean/smudge filters (a hostile repo's .gitattributes
+# + filter.<d>.clean still runs on a worktree diff), so operating on a repo you
+# do not trust runs its configured tooling — the same as your shell/editor/build
+# already do. Do NOT treat this as isolation against a hostile repo. A real
+# git-op sandbox (throwaway copy / OS sandbox for git) is a v2.1 backlog item.
+_GIT_SAFE_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+_GIT_DIFF_SAFE_FLAGS = ("--no-ext-diff", "--no-textconv")
+
 
 async def _git_cmd(project_dir: str, *args: str, timeout: int = 2) -> Optional[str]:
-    """Run a git command and return stdout, or None on failure."""
+    """Run a git command and return stdout, or None on failure.
+
+    Always injects _GIT_SAFE_CONFIG so a hostile repo's local config cannot
+    turn a read into command execution. Env is sanitized too (drops GIT_DIR/
+    GIT_WORK_TREE redirect + GIT_EXTERNAL_DIFF/GIT_SSH_COMMAND vectors).
+    """
     try:
         proc = await asyncio.create_subprocess_exec(
-            "git", *args,
+            "git", *_GIT_SAFE_CONFIG, *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=project_dir,
+            env=_sanitized_codex_env(),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         if proc.returncode != 0:
@@ -1085,9 +1173,9 @@ async def _get_git_context(project_dir: str) -> Optional[str]:
         # Run remaining git commands in parallel
         branch_result, diff_stat, recent_commits, staged_stat = await asyncio.gather(
             _git_cmd(project_dir, "branch", "--show-current"),
-            _git_cmd(project_dir, "diff", "--stat", "HEAD"),
+            _git_cmd(project_dir, "diff", *_GIT_DIFF_SAFE_FLAGS, "--stat", "HEAD"),
             _git_cmd(project_dir, "log", "--oneline", "-5"),
-            _git_cmd(project_dir, "diff", "--staged", "--stat"),
+            _git_cmd(project_dir, "diff", *_GIT_DIFF_SAFE_FLAGS, "--staged", "--stat"),
         )
 
         branch = branch_result or "detached HEAD"
@@ -1436,13 +1524,16 @@ class ReviewDiffInput(CodexBaseInput):
 
 _VERSION_CHECK_BACKOFF_SECONDS = 900  # 15 minutes before retrying failed checks
 _version_cache: dict = {"warning": "", "resolved": False, "consumed": False,
-                        "lock": None, "last_failure": 0.0}
+                        "lock": None, "last_failure": 0.0, "installed": ""}
 
 
 async def _check_codex_version(*, consume: bool = False) -> str:
-    """Check if Codex CLI is up to date. Returns warning string or empty.
+    """Warn when the installed Codex CLI is older than the pinned minimum.
 
-    The npm lookup runs at most once per server lifetime. Results are cached.
+    OFFLINE by design (v2.0): compares `codex --version` against
+    MIN_CODEX_VERSION. The pre-v2.0 implementation queried the npm registry at
+    runtime — an undeclared outbound network call, removed. Runs at most once
+    per server lifetime; results are cached.
 
     Args:
         consume: If True, the warning is returned on the first call only —
@@ -1466,11 +1557,13 @@ async def _check_codex_version(*, consume: bool = False) -> str:
             try:
                 codex_bin = _find_codex_bin()
 
-                # Get installed version
+                # Get installed version (sanitized env \u2014 no server-process
+                # secrets leak into the child)
                 proc = await asyncio.create_subprocess_exec(
                     codex_bin, "--version",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    env=_sanitized_codex_env(),
                 )
                 stdout, _ = await asyncio.wait_for(
                     proc.communicate(), timeout=3,
@@ -1479,32 +1572,25 @@ async def _check_codex_version(*, consume: bool = False) -> str:
                     return ""
                 installed = stdout.decode().strip()
                 installed_ver = installed.split()[-1] if installed else ""
+                _version_cache["installed"] = installed_ver  # reused by diagnostics
 
-                # Get latest version from npm registry
-                proc = await asyncio.create_subprocess_exec(
-                    "npm", "view", "@openai/codex", "version",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await asyncio.wait_for(
-                    proc.communicate(), timeout=5,
-                )
-                if proc.returncode != 0:
-                    return ""
-                latest_ver = stdout.decode().strip()
-
-                if installed_ver and latest_ver and installed_ver != latest_ver:
-                    inst_parts = tuple(
-                        int(x) for x in installed_ver.split('.')
-                    )
-                    lat_parts = tuple(
-                        int(x) for x in latest_ver.split('.')
-                    )
-                    if inst_parts < lat_parts:
+                # Compare against the locally pinned minimum \u2014 no network.
+                if installed_ver:
+                    try:
+                        inst_parts = tuple(
+                            int(x) for x in installed_ver.lstrip("v").split(".")
+                        )
+                        min_parts = tuple(
+                            int(x) for x in MIN_CODEX_VERSION.split(".")
+                        )
+                    except ValueError:
+                        inst_parts = ()
+                        min_parts = ()
+                    if inst_parts and inst_parts < min_parts:
                         _version_cache["warning"] = (
-                            f"\u26a0 Codex CLI v{installed_ver} is outdated "
-                            f"(latest: v{latest_ver}).\n"
-                            f"  Run: npm i -g @openai/codex\n"
+                            f"\u26a0 Codex CLI v{installed_ver} is older than the "
+                            f"supported minimum (v{MIN_CODEX_VERSION}).\n"
+                            f"  Update: npm i -g @openai/codex\n"
                         )
 
                 # Mark resolved only on success — failures will retry
@@ -1540,6 +1626,112 @@ class StatusInput(BaseModel):
 # ---------------------------------------------------------------------------
 # Core execution helper
 # ---------------------------------------------------------------------------
+
+
+class _StreamCapExceeded(Exception):
+    """Raised by the capped readers when Codex output breaches a hard limit."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+async def _read_stream_capped(
+    stream, sink: bytearray, shared: dict, *, tail_only: bool
+) -> None:
+    """Incrementally read one pipe, enforcing output caps DURING the read.
+
+    - shared["total"]: RETAINED bytes vs MAX_OUTPUT_BYTES. stdout is retained in
+      full and counts; stderr is trimmed to a 16 KB tail (tail_only) so its
+      discarded bulk does NOT count — otherwise a stderr flood would wrongly
+      abort a complete stdout result. A stderr flood is still bounded by the
+      per-line cap below and by the caller's wall-clock timeout.
+    - per-stream single-line run vs MAX_LINE_BYTES (no-newline flood guard),
+      enforced on BOTH streams so neither can balloon transient memory.
+    - tail_only sinks (stderr) retain only the last STDERR_TAIL_BYTES
+
+    Memory stays bounded: a breach raises BEFORE the offending chunk is kept.
+    A rate cap is intentionally omitted — the retained-bytes cap already bounds
+    memory, and the wall-clock timeout bounds total read time.
+    """
+    line_run = 0
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            return
+        if not tail_only:  # only retained (stdout) bytes count toward the cap
+            shared["total"] += len(chunk)
+            if shared["total"] > MAX_OUTPUT_BYTES:
+                raise _StreamCapExceeded(
+                    f"output exceeded {MAX_OUTPUT_BYTES // 1_000_000}MB"
+                )
+        first_nl = chunk.find(b"\n")
+        if first_nl == -1:
+            # No newline in this chunk: the current line keeps growing.
+            line_run += len(chunk)
+        else:
+            # The line that ENDS in this chunk = prior run + bytes before the
+            # first newline. Check it before resetting (a >1MB line completing
+            # mid-chunk must not slip through). Interior complete lines are
+            # bounded by the 64KB read size, so only this boundary case matters.
+            if line_run + first_nl > MAX_LINE_BYTES:
+                raise _StreamCapExceeded(
+                    f"a single output line exceeded {MAX_LINE_BYTES // 1_000_000}MB"
+                )
+            line_run = len(chunk) - chunk.rfind(b"\n") - 1
+        if line_run > MAX_LINE_BYTES:
+            raise _StreamCapExceeded(
+                f"a single output line exceeded {MAX_LINE_BYTES // 1_000_000}MB"
+            )
+        sink.extend(chunk)
+        # Amortize the tail trim: only memmove once the buffer grows past 2×,
+        # so a stderr stream arriving in small chunks doesn't re-shift 16 KB
+        # on every read.
+        if tail_only and len(sink) > 2 * STDERR_TAIL_BYTES:
+            del sink[: len(sink) - STDERR_TAIL_BYTES]
+
+
+async def _pump_capped(proc, input_bytes: bytes) -> tuple[bytearray, bytearray]:
+    """communicate() replacement: write stdin, read both pipes with live caps.
+
+    Returns (stdout, stderr_tail). Raises _StreamCapExceeded on any breach —
+    partial output is NEVER returned as a result (a verdict must not be
+    computed from a truncated stream).
+    """
+    stdout_buf = bytearray()
+    stderr_tail = bytearray()
+    shared = {"total": 0}
+
+    async def _feed_stdin() -> None:
+        try:
+            proc.stdin.write(input_bytes)
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # child exited early — returncode/stderr surface the cause
+        finally:
+            try:
+                proc.stdin.close()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+    tasks = [
+        asyncio.create_task(_feed_stdin()),
+        asyncio.create_task(_read_stream_capped(
+            proc.stdout, stdout_buf, shared, tail_only=False)),
+        asyncio.create_task(_read_stream_capped(
+            proc.stderr, stderr_tail, shared, tail_only=True)),
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    await proc.wait()
+    # Return the buffers directly — every caller only does len()/slice/.decode(),
+    # all supported by bytearray, so an extra 4 MB copy would be pure waste.
+    return stdout_buf, stderr_tail
 
 
 async def _run_codex_once(
@@ -1583,6 +1775,25 @@ async def _run_codex_once(
         return f"{ERROR_PREFIX}{e}"
 
     codex_bin = _find_codex_bin()
+    # Resolve the binary BEFORE reserving — a missing CLI is not an execution,
+    # so it must not burn a durable daily slot (else a broken install spends
+    # the whole cap). Auth-fail/timeout DO count: Codex actually ran.
+    if codex_bin == "codex" and not shutil.which("codex"):
+        return (
+            f"{ERROR_PREFIX}Codex CLI not found. Install it with:\n"
+            "  npm i -g @openai/codex\n"
+            "Then authenticate:\n"
+            "  codex login"
+        )
+
+    # Reserve one execution from the durable daily cap at the SINGLE real
+    # subprocess boundary — AFTER validation + binary resolution (neither a
+    # rejected dir nor a missing binary spends a reservation) and here rather
+    # than in _run_codex, so paths that call _run_codex_once directly (e.g.
+    # auto-recap rollover) are counted too. Blocking SQLite fsync runs off loop.
+    budget_err = await asyncio.to_thread(_reserve_daily_run)
+    if budget_err:
+        return budget_err
 
     cmd = [
         codex_bin, "exec",
@@ -1658,7 +1869,20 @@ async def _run_codex_once(
             start_new_session=True,  # own process group -> clean tree termination
         )
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=prompt.encode("utf-8")), timeout=timeout
+            _pump_capped(proc, prompt.encode("utf-8")), timeout=timeout
+        )
+    except _StreamCapExceeded as exc:
+        _kill_tree(proc)
+        try:
+            # The child is already SIGKILLed and its output is being discarded,
+            # so just reap it — no uncapped communicate() drain of the flood.
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except (asyncio.TimeoutError, ProcessLookupError, OSError):
+            pass  # best-effort reap
+        return (
+            f"{ERROR_PREFIX}Codex output terminated: {exc.reason}. The partial "
+            "output was discarded — a truncated stream is never returned as a "
+            "result. Narrow the task (focus_files) or lower reasoning_effort."
         )
     except asyncio.TimeoutError:
         _kill_tree(proc)
@@ -1696,7 +1920,7 @@ async def _run_codex_once(
                 pass
 
     if proc.returncode != 0:
-        err_msg = stderr[:16_384].decode(errors="replace").strip()
+        err_msg = stderr[-STDERR_TAIL_BYTES:].decode(errors="replace").strip()
         if "not authenticated" in err_msg.lower() or "login" in err_msg.lower():
             return (
                 f"{ERROR_PREFIX}Codex is not authenticated. Run:\n"
@@ -1716,13 +1940,12 @@ async def _run_codex_once(
             )
         return f"{ERROR_PREFIX}Codex exited with code {proc.returncode}.\nStderr: {err_msg}"
 
-    # Output bound (transport-size guard; memory is bounded only after
-    # communicate() returns — streaming caps are a future hardening step)
-    if len(stdout) > MAX_OUTPUT_BYTES:
-        stdout = stdout[:MAX_OUTPUT_BYTES] + b"\n... [output truncated at 4MB]"
+    # Caps are enforced DURING the read (_pump_capped): stdout here is always
+    # within MAX_OUTPUT_BYTES, and a breached stream returned an error instead
+    # of a silently-truncated "success".
     output = stdout.decode(errors="replace").strip()
     if not output:
-        fallback = stderr[:16_384].decode(errors="replace").strip()
+        fallback = stderr[-STDERR_TAIL_BYTES:].decode(errors="replace").strip()
         if fallback:
             return f"{ERROR_PREFIX}Codex returned no stdout (exit 0).\nStderr: {fallback}"
         return (
@@ -1787,10 +2010,9 @@ async def _run_codex(
     metadata footer) are suppressed to keep the JSON output clean. Metrics recording
     still happens.
     """
-    budget_err = _check_daily_budget()
-    if budget_err:
-        return budget_err
-
+    # (Daily-cap reservation now lives in _run_codex_once, the single
+    # subprocess boundary — so direct callers are counted and a rejected dir
+    # never spends a reservation.)
     start_time = time.monotonic()
 
     result = await _run_codex_once(
@@ -2099,7 +2321,9 @@ async def codex_critique(params: SecondOpinionInput) -> str:
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     Read them when referenced in the output.
     """
-    cwd = params.project_dir or os.getcwd()
+    cwd, _auth_err = _authorized_cwd(params.project_dir)
+    if _auth_err:
+        return _auth_err
     parts = [SECOND_OPINION_SYSTEM, "\n---\n"]
 
     if params.user_prompt:
@@ -2169,7 +2393,9 @@ async def codex_plan(params: ParallelPlanInput) -> str:
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     Read them when referenced in the output.
     """
-    cwd = params.project_dir or os.getcwd()
+    cwd, _auth_err = _authorized_cwd(params.project_dir)
+    if _auth_err:
+        return _auth_err
     parts = [PARALLEL_PLAN_SYSTEM, "\n---\n"]
 
     if params.user_prompt:
@@ -2239,7 +2465,9 @@ async def codex_brainstorm(params: BrainstormInput) -> str:
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     Read them when referenced in the output.
     """
-    cwd = params.project_dir or os.getcwd()
+    cwd, _auth_err = _authorized_cwd(params.project_dir)
+    if _auth_err:
+        return _auth_err
     parts = [BRAINSTORM_SYSTEM, "\n---\n"]
 
     if params.user_prompt:
@@ -2312,7 +2540,9 @@ async def codex_collab(params: CollaborateInput) -> str:
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     Read them when referenced in the output.
     """
-    cwd = params.project_dir or os.getcwd()
+    cwd, _auth_err = _authorized_cwd(params.project_dir)
+    if _auth_err:
+        return _auth_err
 
     # --- Auto-generate session ID if requested ---
     session_was_auto = False
@@ -2484,7 +2714,9 @@ async def codex_review(params: QuickReviewInput) -> str:
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     Read them when referenced in the output.
     """
-    cwd = params.project_dir or os.getcwd()
+    cwd, _auth_err = _authorized_cwd(params.project_dir)
+    if _auth_err:
+        return _auth_err
 
     normalized = _normalize_file_list(params.files, cwd)
     if not normalized:
@@ -2558,7 +2790,9 @@ async def codex_evaluate(params: EvaluateInput) -> str:
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     Read them when referenced in the output.
     """
-    cwd = params.project_dir or os.getcwd()
+    cwd, _auth_err = _authorized_cwd(params.project_dir)
+    if _auth_err:
+        return _auth_err
     parts = [EVALUATE_SYSTEM, "\n---\n"]
 
     parts.append(f"## Decision to Evaluate\n{params.options}")
@@ -2621,7 +2855,9 @@ async def codex_recap(params: RecapInput) -> str:
     Requires a session_id that corresponds to an existing session document
     in .claudex/sessions/. The generated recap is saved to .claudex/recaps/.
     """
-    cwd = params.project_dir or os.getcwd()
+    cwd, _auth_err = _authorized_cwd(params.project_dir)
+    if _auth_err:
+        return _auth_err
 
     # Read session document
     session_path = _safe_claudex_path(cwd, "sessions", f"{params.session_id}.md")
@@ -2685,7 +2921,7 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
     """
     try:
         # Enforce file count cap before generating full diff
-        name_cmd = ["git", "diff", "--name-only"]
+        name_cmd = ["git", *_GIT_SAFE_CONFIG, "diff", *_GIT_DIFF_SAFE_FLAGS, "--name-only"]
         if staged:
             name_cmd.append("--staged")
         name_cmd.append("--diff-filter=ACMRTD")
@@ -2694,6 +2930,7 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=project_dir,
+            env=_sanitized_codex_env(),  # drop GIT_DIR/GIT_EXTERNAL_DIFF/etc. (see _git_cmd)
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
         if proc.returncode != 0:
@@ -2705,7 +2942,7 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
                 f"(limit: {DIFF_MAX_FILES}). Narrow the scope or commit in smaller batches."
             )
 
-        cmd = ["git", "diff"]
+        cmd = ["git", *_GIT_SAFE_CONFIG, "diff", *_GIT_DIFF_SAFE_FLAGS]
         if staged:
             cmd.append("--staged")
         cmd.extend(["--no-color", "--diff-filter=ACMRTD"])
@@ -2715,6 +2952,7 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=project_dir,
+            env=_sanitized_codex_env(),  # drop GIT_DIR/GIT_EXTERNAL_DIFF/etc. (see _git_cmd)
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
         if proc.returncode != 0:
@@ -2779,7 +3017,9 @@ async def codex_review_diff(params: ReviewDiffInput) -> str:
 
     Codex may produce file artifacts (code, tests, analysis) in `.claudex/`.
     """
-    cwd = params.project_dir or os.getcwd()
+    cwd, _auth_err = _authorized_cwd(params.project_dir)
+    if _auth_err:
+        return _auth_err
 
     diff_text = await _get_git_diff(cwd, staged=params.staged)
     if not diff_text:
@@ -2862,28 +3102,21 @@ async def codex_status(params: StatusInput) -> str:
     This is a lightweight diagnostic tool that does NOT call Codex (zero subscription cost).
     Use it for situational awareness without consuming a ChatGPT message.
     """
-    cwd = params.project_dir or os.getcwd()
+    # Diagnostics must stay reachable when confinement denies \u2014 the Roots
+    # section below explains the denial; project-state sections are skipped.
+    cwd, _auth_err = _authorized_cwd(params.project_dir)
+    cwd_authorized = _auth_err is None
     lines = ["Claudex Status", "\u2550" * 14]
 
-    # --- Codex CLI ---
+    # --- Codex CLI --- (version resolved once & cached; no extra spawn here)
     codex_bin = _find_codex_bin()
-    codex_version = "unknown"
-    codex_location = codex_bin
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            codex_bin, "--version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
-        if proc.returncode == 0:
-            codex_version = stdout.decode().strip() or "unknown"
-    except (asyncio.TimeoutError, OSError):
-        codex_version = "not found"
-        codex_location = "not found"
-
-    # Check for updates
+    # Location reflects whether the binary EXISTS — not whether the version
+    # probe happened to succeed (a transient --version failure must not report
+    # an installed CLI as "not found" and send the user to reinstall).
+    binary_found = codex_bin != "codex" or shutil.which("codex") is not None
     version_warning = await _check_codex_version()
+    codex_version = _version_cache.get("installed") or "unknown"
+    codex_location = codex_bin if binary_found else "not found"
     if version_warning:
         lines.append(f"Codex CLI:     {codex_location} ({codex_version}) — OUTDATED")
         lines.append(version_warning.strip())
@@ -2898,16 +3131,25 @@ async def codex_status(params: StatusInput) -> str:
     raw_roots = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
     active_roots = _allowed_roots()
     if active_roots:
-        lines.append(f"Roots:         {':'.join(str(r) for r in active_roots)}")
-        if any(_UNEXPANDED_TEMPLATE_RE.fullmatch(p.strip()) for p in raw_roots.split(":")):
+        lines.append(f"Roots:         {os.pathsep.join(str(r) for r in active_roots)}")
+        if _roots_span_filesystem():
+            lines.append("               (confinement NOMINAL — a root spans the whole filesystem or home; narrow it)")
+        if any(_UNEXPANDED_TEMPLATE_RE.fullmatch(p.strip()) for p in raw_roots.split(os.pathsep)):
             lines.append("               (unexpanded template part(s) in the configured value were ignored)")
     elif raw_roots:
         lines.append(
-            f"Roots:         unrestricted — {ALLOWED_ROOTS_ENV} was set but yielded no "
-            "usable roots (unexpanded template or invalid parts discarded)"
+            f"Roots:         DENY-ALL — {ALLOWED_ROOTS_ENV} was set but yielded no "
+            "usable roots (unexpanded template or invalid parts discarded); every "
+            "project directory is rejected until it names a real folder"
         )
     else:
-        lines.append(f"Roots:         unrestricted ({ALLOWED_ROOTS_ENV} not set)")
+        lines.append(
+            f"Roots:         DENY-ALL — {ALLOWED_ROOTS_ENV} not configured; every "
+            "project directory is rejected (deny-by-default). Set it to enable Claudex."
+        )
+
+    # --- Daily execution cap (durable, per-user state) ---
+    lines.append(f"Run cap:       {_run_cap_status_value()}")
 
     # --- Async jobs ---
     if _jobs:
@@ -2924,6 +3166,16 @@ async def codex_status(params: StatusInput) -> str:
             pass
     lines.append(f"Plugin:        v{plugin_version}")
     lines.append(f"Author:        Omri Tal | botique.co.il | hello@botique.co.il")
+
+    # --- Project-state sections require an authorized project dir ---
+    if not cwd_authorized:
+        lines.append(
+            "\nProject state: skipped — project directory not authorized "
+            "(see Roots above)"
+        )
+        metrics_summary = _get_metrics_summary()
+        lines.append(f"\nMetrics (this session):\n{metrics_summary}")
+        return "\n".join(lines)
 
     # --- Sessions ---
     claudex_dir = Path(cwd) / ".claudex"
@@ -3008,18 +3260,41 @@ async def codex_status(params: StatusInput) -> str:
     return "\n".join(lines)
 
 
+class PingInput(BaseModel):
+    """Input for codex_ping — free health check by default; optional model test."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    model_test: bool = Field(
+        default=False,
+        description=(
+            "False (default): free health check — binary, version, auth status, "
+            "quota state DB, confinement readiness; NO model call, no quota use. "
+            "True: explicit model round-trip through the normal quota/confinement/"
+            "env/streaming controls (consumes one local run reservation and "
+            "OpenAI-side usage)."
+        ),
+    )
+
+
 @mcp.tool(
     name="codex_ping",
     annotations={
-        "title": "Test Codex Connection",
-        "readOnlyHint": True,
+        "title": "Claudex Health Check / Model Test",
+        # NOT unconditionally read-only/idempotent: the default health check is,
+        # but model_test=true spends durable quota, makes an OpenAI call, and
+        # creates a run dir. Annotate for the stronger (mutating) mode so an
+        # MCP client's approval/retry logic treats it correctly.
+        "readOnlyHint": False,
         "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,  # network: version check / OpenAI
+        "idempotentHint": False,
+        "openWorldHint": True,  # network only when model_test=true (OpenAI)
     },
 )
-async def codex_ping() -> str:
-    """Test that Codex CLI is installed, authenticated, and working."""
+async def codex_ping(params: Optional[PingInput] = None) -> str:
+    """Health check (free, default) or explicit Codex model connectivity test."""
+    # Default-construct so a no-argument / `{}` invocation still works — the
+    # tool's contract is "free health check by default".
+    params = params or PingInput()
     codex_path = _find_codex_bin()
     if codex_path == "codex" and not shutil.which("codex"):
         return (
@@ -3028,35 +3303,87 @@ async def codex_ping() -> str:
             "Auth:    codex login"
         )
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            codex_path, "exec",
-            "--sandbox", "read-only",
-            "--skip-git-repo-check",
-            "--color", "never",
-            "-m", DEFAULT_MODEL,
-            # Force minimal effort: this is a connectivity test, not analysis.
-            # Without this, a user-level config (e.g. xhigh default) makes even
-            # "pong" exceed the timeout.
-            "-c", "model_reasoning_effort=low",
-            "Say 'pong' and nothing else.",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+    if not params.model_test:
+        # --- Free health check: zero model calls, zero quota use ---
+        lines = ["Claudex health check (no model call, no quota use)"]
+        # One resolve of the version (cached), reused for display + the warning
+        # — no second `codex --version` spawn.
+        min_warn = await _check_codex_version()
+        version = _version_cache.get("installed") or "unknown"
+        lines.append(f"Codex CLI:   {codex_path} ({version})")
+        if min_warn:
+            lines.append(min_warn.strip())
+
+        auth = "unknown"
+        auth_proc = None
+        try:
+            auth_proc = await asyncio.create_subprocess_exec(
+                codex_path, "login", "status",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_sanitized_codex_env(),
+            )
+            out, err = await asyncio.wait_for(auth_proc.communicate(), timeout=10)
+            if auth_proc.returncode == 0:
+                auth = "logged in"
+            else:
+                text = (out + err).decode(errors="replace").strip()
+                detail = text.splitlines()[-1] if text else "not logged in"
+                auth = f"{detail} — run: codex login"  # always carry the fix
+        except asyncio.TimeoutError:
+            auth = "check timed out (codex login status hung)"
+        except OSError as e:
+            auth = f"check failed ({e})"
+        finally:
+            # A timed-out communicate() leaves the child running — kill + reap it
+            # so repeated health checks can't accumulate orphaned processes.
+            if auth_proc is not None and auth_proc.returncode is None:
+                try:
+                    auth_proc.kill()
+                    await asyncio.wait_for(auth_proc.wait(), timeout=2)
+                except (ProcessLookupError, OSError, asyncio.TimeoutError):
+                    pass
+        lines.append(f"Auth:        {auth}")
+
+        lines.append(f"Run cap:     {_run_cap_status_value()}")
+
+        roots = _allowed_roots()
+        if roots and _roots_span_filesystem():
+            lines.append(
+                f"Roots:       {len(roots)} configured — confinement NOMINAL "
+                "(a root spans the whole filesystem or home; narrow it)"
+            )
+        elif roots:
+            lines.append(f"Roots:       {len(roots)} configured — confinement active")
+        else:
+            lines.append(
+                f"Roots:       NOT CONFIGURED — every project directory is "
+                f"denied until {ALLOWED_ROOTS_ENV} is set"
+            )
+
+        lines.append(
+            "Model test:  not run (pass model_test=true to spend one execution)"
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=90)
-    except asyncio.TimeoutError:
-        return "Codex CLI found but timed out. Check your internet connection."
-    except OSError as e:
-        return f"Codex CLI found at {codex_path} but failed to run: {e}"
+        return "\n".join(lines)
 
-    if proc.returncode == 0:
-        return f"Codex CLI ready at {codex_path}\nResponse: {stdout.decode().strip()}"
-
-    err = stderr.decode(errors="replace").strip()
-    if "login" in err.lower() or "auth" in err.lower():
-        return f"Codex CLI found but not authenticated.\nRun: codex login"
-
-    return f"Codex CLI found but returned error:\n{err}"
+    # --- Explicit model round-trip: routed through the normal runner so it
+    # gets the full quota/confinement/sanitized-env/streaming controls ---
+    roots = _allowed_roots()
+    if not roots:
+        return (
+            f"{ERROR_PREFIX}The model test needs an allowed workspace root to "
+            f"run in — set {ALLOWED_ROOTS_ENV} first (deny-by-default)."
+        )
+    result = await _run_codex(
+        "Say 'pong' and nothing else.",
+        project_dir=str(roots[0]),
+        reasoning_effort="low",
+        timeout=90,
+        tool_name="ping",
+    )
+    if result.startswith(ERROR_PREFIX):
+        return result
+    return f"Codex model round-trip OK.\nResponse: {result.strip()[:200]}"
 
 
 # ---------------------------------------------------------------------------
@@ -3072,32 +3399,176 @@ async def codex_ping() -> str:
 MAX_CONCURRENT_JOBS = 4
 MAX_ACTIVE_JOBS = 8        # queued + running admission cap (quota-flood guard)
 MAX_JOB_RECORDS = 50       # terminal records retained in memory (oldest evicted)
-_daily_job_count = {"date": "", "count": 0}
+
+_legacy_quota_env_warned = False
+
+_QUOTA_TABLE_DDL = (
+    "CREATE TABLE IF NOT EXISTS quota_usage ("
+    "day_utc TEXT PRIMARY KEY, "
+    "attempts INTEGER NOT NULL, "
+    "updated_at TEXT NOT NULL)"
+)
+_quota_db_initialized: set = set()  # db paths whose schema/pragmas are set up
 
 
-def _check_daily_budget() -> Optional[str]:
-    """Rolling per-day job budget (CLAUDEX_MAX_JOBS_PER_DAY, default 200).
+def _utc_day() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    In-memory (resets with the server process) — a guardrail against runaway
-    loops burning ChatGPT quota, not an accounting system.
+
+def _quota_conn(timeout: float) -> sqlite3.Connection:
+    """Open the quota DB, ensuring the state dir, schema, and WAL pragmas.
+
+    The DDL runs on EVERY connection (idempotent `IF NOT EXISTS`, negligible
+    cost) so that deleting a corrupted DB and letting it recreate — the repair
+    the error message advises — actually restores a usable schema without a
+    server restart. Only the WAL/synchronous pragmas are guarded per-path
+    (they persist in the DB file, so re-applying is pure waste, not needed).
     """
+    path = _quota_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)  # mkdir here, never in _state_dir
+    conn = sqlite3.connect(path, timeout=timeout)
+    # synchronous is per-CONNECTION, so it must be set every time (guarding it
+    # behind the once-per-path flag left every later connection at FULL).
+    conn.execute("PRAGMA synchronous=NORMAL")
+    if str(path) not in _quota_db_initialized:
+        conn.execute("PRAGMA journal_mode=WAL")  # persists in the file → once is enough
+        _quota_db_initialized.add(str(path))
+    conn.execute(_QUOTA_TABLE_DDL)
+    conn.commit()
+    return conn
+
+
+def _state_dir() -> Path:
+    """Per-user Claudex state directory — always OUTSIDE any project repo.
+
+    PURE path resolution — no mkdir side effect, so it is safe to call from an
+    error handler (the directory is created lazily in _quota_conn). Resolution
+    order: CLAUDEX_STATE_DIR → CLAUDE_PLUGIN_DATA → OS-native per-user app data.
+    Holds only operational state (quota counters); never prompts/results/code.
+    """
+    override = os.environ.get(STATE_DIR_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    if os.environ.get("CLAUDE_PLUGIN_DATA", "").strip():
+        return Path(os.environ["CLAUDE_PLUGIN_DATA"]) / "claudex"
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA", "").strip()
+        root = Path(local) if local else Path.home() / "AppData" / "Local"
+        return root / "Botique" / "Claudex"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Botique" / "Claudex"
+    xdg = os.environ.get("XDG_DATA_HOME", "").strip()
+    root = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    return root / "botique-claudex"
+
+
+def _quota_db_path() -> Path:
+    return _state_dir() / "quota.db"
+
+
+def _daily_run_cap() -> int:
+    """Read the daily execution cap; the deprecated pre-v2.0 env name still works."""
+    global _legacy_quota_env_warned
+    raw = os.environ.get(MAX_RUNS_PER_DAY_ENV)
+    if raw is None:
+        legacy = os.environ.get(MAX_JOBS_PER_DAY_ENV)
+        if legacy is not None:
+            if not _legacy_quota_env_warned:
+                logger.warning(
+                    "%s is deprecated — use %s (same semantics: local per-day "
+                    "Codex execution cap).",
+                    MAX_JOBS_PER_DAY_ENV, MAX_RUNS_PER_DAY_ENV,
+                )
+                _legacy_quota_env_warned = True
+            raw = legacy
     try:
-        cap = int(os.environ.get(MAX_JOBS_PER_DAY_ENV, DEFAULT_MAX_JOBS_PER_DAY))
+        return int(raw) if raw is not None else DEFAULT_MAX_RUNS_PER_DAY
     except ValueError:
-        cap = DEFAULT_MAX_JOBS_PER_DAY
+        return DEFAULT_MAX_RUNS_PER_DAY
+
+
+def _reserve_daily_run() -> Optional[str]:
+    """Atomically reserve one Codex execution from the durable daily budget.
+
+    SQLite in per-user app data: survives restarts, and BEGIN IMMEDIATE
+    serializes concurrent server processes so racing calls can never exceed
+    the cap. Counts local execution attempts only — never an OpenAI usage or
+    billing meter. Cap 0 disables the guardrail. An unusable state DB DENIES
+    new runs (mandated fail-closed posture) with a repairable error.
+    """
+    cap = _daily_run_cap()
     if cap <= 0:
-        return None  # explicitly unlimited
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if _daily_job_count["date"] != today:
-        _daily_job_count["date"] = today
-        _daily_job_count["count"] = 0
-    if _daily_job_count["count"] >= cap:
+        return None  # explicitly disabled
+    today = _utc_day()
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        conn = _quota_conn(timeout=5)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT attempts FROM quota_usage WHERE day_utc = ?", (today,)
+            ).fetchone()
+            if row is not None and row[0] >= cap:
+                conn.rollback()
+                return (
+                    f"{ERROR_PREFIX}Daily local Codex execution cap reached "
+                    f"({cap} runs today). Raise {MAX_RUNS_PER_DAY_ENV}, set it "
+                    "to 0 to disable the guardrail, or wait for the UTC day "
+                    "rollover."
+                )
+            conn.execute(
+                "INSERT INTO quota_usage (day_utc, attempts, updated_at) "
+                "VALUES (?, 1, ?) "
+                "ON CONFLICT(day_utc) DO UPDATE SET "
+                "attempts = attempts + 1, updated_at = excluded.updated_at",
+                (today, now_iso),
+            )
+            conn.commit()
+            return None
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError) as e:
         return (
-            f"{ERROR_PREFIX}Daily Codex job budget reached ({cap}). "
-            f"Raise {MAX_JOBS_PER_DAY_ENV} or wait for the UTC day rollover."
+            f"{ERROR_PREFIX}Quota state unavailable — refusing to run. "
+            f"Cause: {e}. State DB: {_quota_db_path()}. Repair or delete that "
+            f"file, or set {MAX_RUNS_PER_DAY_ENV}=0 to disable the local "
+            "execution cap."
         )
-    _daily_job_count["count"] += 1
-    return None
+
+
+def _run_cap_status_value() -> str:
+    """One-line run-cap state for diagnostics (value only; caller owns its label).
+
+    Always names the state DB path — under 'STATE DB UNAVAILABLE' that path is
+    the actionable part of the message.
+    """
+    cap = _daily_run_cap()
+    if cap <= 0:
+        return "disabled (local guardrail off)"
+    used = _read_daily_run_count()
+    if used is None:
+        return f"STATE DB UNAVAILABLE — executions refused until repaired ({_quota_db_path()})"
+    return f"{used}/{cap} local executions today (state: {_quota_db_path()})"
+
+
+def _read_daily_run_count() -> Optional[int]:
+    """Current day's execution count for diagnostics (no reservation).
+
+    Returns None when the state DB is unusable — the same condition under
+    which _reserve_daily_run refuses to run.
+    """
+    today = _utc_day()
+    try:
+        conn = _quota_conn(timeout=2)
+        try:
+            row = conn.execute(
+                "SELECT attempts FROM quota_usage WHERE day_utc = ?", (today,)
+            ).fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
+        return None
 JOB_WAIT_MAX_SECONDS = 45  # bounded so one poll stays under strict client caps
 JOB_ID_RE = re.compile(r'^job-[0-9a-f]{12}$')
 
@@ -3305,11 +3776,10 @@ async def codex_submit(params: SubmitInput) -> str:
     except Exception as exc:  # pydantic ValidationError and friends
         return f"{ERROR_PREFIX}Invalid arguments for codex_{tool_key}: {exc}"
 
-    project_dir = getattr(tool_params, "project_dir", None) or os.getcwd()
-    try:
-        _validate_project_dir(project_dir)
-    except ValueError as e:
-        return f"{ERROR_PREFIX}{e}"
+    _cwd, _auth_err = _authorized_cwd(getattr(tool_params, "project_dir", None))
+    if _auth_err:
+        return _auth_err
+    project_dir = _cwd  # resolved + authorized — never None, so job persistence is safe
 
     # Admission cap: bound queued+running so a submission flood can't retain
     # unbounded state or burn unbounded ChatGPT quota.
@@ -3391,7 +3861,9 @@ async def codex_result(params: JobResultInput) -> str:
         # Disk fallback — server may have restarted since submit. Parse the
         # persisted record: only terminal states are results; a stale
         # 'queued'/'running' header means the previous server died mid-job.
-        pd = params.project_dir or os.getcwd()
+        pd, _auth_err = _authorized_cwd(params.project_dir)
+        if _auth_err:
+            return _auth_err
         path = _safe_claudex_path(pd, "jobs", f"{params.job_id}.md")
         if path is not None and path.is_file():
             try:
@@ -3450,4 +3922,21 @@ async def codex_result(params: JobResultInput) -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Structured roots transport: `server.py --allowed-roots <path> [<path> ...]`
+    # takes precedence over CLAUDEX_ALLOWED_ROOTS and needs no separator parsing.
+    # NOTE: the shipping launchers still pass roots via the env var — this argv
+    # path is wired by the Windows MCPB launcher (M0 workstream B), not yet by
+    # the current darwin manifest. Consumes paths up to the next --flag.
+    if "--allowed-roots" in sys.argv:
+        _idx = sys.argv.index("--allowed-roots")
+        _roots = []
+        for _a in sys.argv[_idx + 1:]:
+            if _a.startswith("-"):
+                break  # stop at the next flag (single- or double-dash)
+            _roots.append(_a)
+        # Only take over from the env var when the flag actually carried paths —
+        # an empty `--allowed-roots` must NOT suppress CLAUDEX_ALLOWED_ROOTS
+        # (that would deny-all while the error tells the user to set the env var).
+        if _roots:
+            _ARGV_ROOTS = _roots
     mcp.run()

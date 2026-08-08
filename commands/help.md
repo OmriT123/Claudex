@@ -28,6 +28,8 @@ Codex runs in a read-only sandbox and never modifies your files.
 
 ## Get Started
 
+0. Set your allowed project folders first — Claudex is deny-by-default (v2.0):
+   see README → "Workspace confinement (required)"
 1. Run `/codex:status` to verify everything is connected
 2. Try `/codex:plan [describe your task]` for your first collaboration
 3. Each tool call = 1 message from your ChatGPT subscription quota

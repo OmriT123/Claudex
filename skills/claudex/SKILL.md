@@ -49,7 +49,7 @@ What's your situation?
 │   └─ Sessions, artifacts, disk usage    → codex_status (zero cost)
 │
 ├─ "Is Codex even working?"
-│   └─ Connection test                    → codex_ping
+│   └─ Health check / connection test     → codex_ping (model_test=true for a live round-trip)
 │
 └─ "My client caps tool calls / I want fire-and-collect"
     └─ codex_submit → codex_result        (async job layer, v1.7)
@@ -74,7 +74,7 @@ After completing a multi-round collab session → suggest `codex_recap` to gener
 | `codex_evaluate` | Codex analyzes tradeoffs between options. User makes the final call. | **Technical Advisor** — balanced analysis, explicit tradeoffs, no recommendation bias |
 | `codex_recap` | Generate a decision record summarizing a session. | **Technical Writer** — clear, concise, decision-focused documentation |
 | `codex_status` | Show Claudex diagnostics (no Codex call, zero subscription cost). | N/A |
-| `codex_ping` | Verify Codex CLI is installed and working. | N/A |
+| `codex_ping` | Free health check by default (binary, version, auth, quota, confinement — no model call, no quota use). Pass `model_test=true` for a real Codex round-trip (consumes one run + OpenAI usage). | N/A (free) / 1 run (model_test) |
 | `codex_submit` | Run any Codex tool above as a background job — returns job_id in <1s. Same arguments as the synchronous tool, wrapped in `{"tool": ..., "arguments": {...}}`. | (delegates) |
 | `codex_result` | Poll or collect a background job (bounded wait_seconds ≤ 45; zero Codex cost). Results persist to `.claudex/jobs/<job_id>.md` and survive server restarts. | N/A |
 

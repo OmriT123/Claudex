@@ -70,6 +70,18 @@ from server import (
     _FINDING_SCHEMA,
 )
 from pydantic import ValidationError
+
+
+@pytest.fixture(autouse=True)
+def _default_allowed_roots(monkeypatch, tmp_path):
+    """Deny-by-default (v2.0): every test runs with tmp_path as its allowed root.
+
+    Tests exercising the unconfigured/denied states override this inside the
+    test body (later monkeypatching wins over the autouse default). The quota
+    state dir is likewise isolated per-test so no test touches real app-data.
+    """
+    monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+    monkeypatch.setenv("CLAUDEX_STATE_DIR", str(tmp_path / ".claudex-state"))
 from server import (
     SecondOpinionInput,
     ParallelPlanInput,
@@ -1559,6 +1571,23 @@ class TestAsyncJobLayer:
         assert "Status: completed" in job_file.read_text()
 
     @pytest.mark.asyncio
+    async def test_submit_without_project_dir_stores_resolved_cwd(self, clean_jobs, monkeypatch):
+        # Codex #1: omitting project_dir must store the RESOLVED cwd, not None
+        # (None → _write_job_file does Path(None) → crash). Allow cwd as a root
+        # so validation of the defaulted dir passes.
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, os.getcwd())
+        with patch.object(_server, "codex_critique", new=AsyncMock(return_value="ok text")):
+            sub = await codex_submit(SubmitInput(
+                tool="critique",
+                arguments={"plan": "a plan long enough"},  # no project_dir
+            ))
+            assert "Project: None" not in sub  # bug symptom: display showed None
+            job_id = sub.split("Job submitted: ")[1].split("\n")[0]
+            assert _jobs[job_id]["project_dir"] == os.path.realpath(os.getcwd())
+            result = await codex_result(JobResultInput(job_id=job_id, wait_seconds=5))
+        assert result == "ok text"  # lifecycle completed without a Path(None) crash
+
+    @pytest.mark.asyncio
     async def test_error_result_marks_failed(self, clean_jobs, tmp_path):
         with patch.object(_server, "codex_critique", new=AsyncMock(return_value=f"{ERROR_PREFIX}boom")):
             sub = await codex_submit(SubmitInput(
@@ -1754,10 +1783,13 @@ from server import (
     _validate_project_dir,
     _sanitized_codex_env,
     _get_session_lock,
-    _check_daily_budget,
-    _daily_job_count,
+    _reserve_daily_run,
+    _read_daily_run_count,
+    _quota_db_path,
+    _state_dir,
     ALLOWED_ROOTS_ENV,
     MAX_JOBS_PER_DAY_ENV,
+    MAX_RUNS_PER_DAY_ENV,
 )
 
 
@@ -1803,23 +1835,22 @@ class TestHardening:
         assert _get_session_lock("other") is not _get_session_lock("foo bar")
 
     def test_daily_budget_enforced(self, monkeypatch):
-        monkeypatch.setenv(MAX_JOBS_PER_DAY_ENV, "2")
-        _daily_job_count["date"] = ""; _daily_job_count["count"] = 0
-        assert _check_daily_budget() is None
-        assert _check_daily_budget() is None
-        third = _check_daily_budget()
+        # State dir is tmp_path-scoped by the autouse fixture — hermetic per test.
+        monkeypatch.setenv(MAX_RUNS_PER_DAY_ENV, "2")
+        assert _reserve_daily_run() is None
+        assert _reserve_daily_run() is None
+        third = _reserve_daily_run()
         assert third is not None and third.startswith("Error:")
-        _daily_job_count["date"] = ""; _daily_job_count["count"] = 0
 
     def test_daily_budget_unlimited_when_zero(self, monkeypatch):
-        monkeypatch.setenv(MAX_JOBS_PER_DAY_ENV, "0")
-        _daily_job_count["date"] = ""; _daily_job_count["count"] = 0
+        monkeypatch.setenv(MAX_RUNS_PER_DAY_ENV, "0")
         for _ in range(10):
-            assert _check_daily_budget() is None
+            assert _reserve_daily_run() is None
 
     @pytest.mark.asyncio
     async def test_isolation_flags_in_command(self, tmp_path, monkeypatch):
-        monkeypatch.delenv(ALLOWED_ROOTS_ENV, raising=False)
+        # autouse fixture supplies tmp_path as the allowed root (deny-by-default
+        # would otherwise reject before the spawn this test wants to capture)
         import server as srv
         captured = {}
 
@@ -1895,17 +1926,34 @@ class TestGate2Fixes:
         assert "UNTRACKED" in result and "backdoor.py" in result
 
     @pytest.mark.asyncio
-    async def test_budget_counts_synchronous_calls(self, tmp_path, monkeypatch):
+    async def test_budget_reserves_at_subprocess_boundary(self, tmp_path, monkeypatch):
+        # Reservation lives in _run_codex_once (the single real subprocess
+        # boundary) — AFTER validation, so direct callers count and a rejected
+        # dir never spends a reservation. Mock the spawn to fail cleanly after
+        # the reservation runs.
         import server as srv
-        from server import _daily_job_count, MAX_JOBS_PER_DAY_ENV
-        monkeypatch.setenv(MAX_JOBS_PER_DAY_ENV, "1")
-        _daily_job_count["date"] = ""; _daily_job_count["count"] = 0
-        with patch.object(srv, "_run_codex_once", new=AsyncMock(return_value="ok")):
-            first = await srv._run_codex("p", project_dir=str(tmp_path), tool_name="t")
-            second = await srv._run_codex("p", project_dir=str(tmp_path), tool_name="t")
-        assert not first.startswith("Error:")
-        assert second.startswith("Error:") and "budget" in second.lower()
-        _daily_job_count["date"] = ""; _daily_job_count["count"] = 0
+        monkeypatch.setenv(MAX_RUNS_PER_DAY_ENV, "1")
+
+        async def boom(*a, **k):
+            raise FileNotFoundError()
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", boom)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
+        first = await srv._run_codex_once("p", project_dir=str(tmp_path))
+        second = await srv._run_codex_once("p", project_dir=str(tmp_path))
+        assert "not found" in first.lower()          # reservation spent, spawn failed
+        assert "cap reached" in second.lower()        # cap already exhausted
+
+    @pytest.mark.asyncio
+    async def test_rejected_dir_does_not_spend_reservation(self, tmp_path, monkeypatch):
+        # A dir outside the allowed root is rejected BEFORE the reservation.
+        import server as srv
+        root = tmp_path / "allowed"; root.mkdir()
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, str(root))
+        monkeypatch.setenv(MAX_RUNS_PER_DAY_ENV, "5")
+        out = await srv._run_codex_once("p", project_dir=str(tmp_path / "outside"))
+        assert out.startswith("Error:")
+        assert _read_daily_run_count() == 0  # no reservation burned on a rejected dir
 
     def test_proxy_env_preserved(self, monkeypatch):
         from server import _sanitized_codex_env
@@ -1935,20 +1983,23 @@ from server import _allowed_roots
 
 
 class TestAllowedRootsPlaceholder:
-    def test_literal_placeholder_env_is_unrestricted(self, monkeypatch):
+    def test_literal_placeholder_env_yields_no_roots(self, monkeypatch):
         monkeypatch.setenv(ALLOWED_ROOTS_ENV, "${user_config.allowed_roots}")
         assert _allowed_roots() == []
 
     def test_mixed_real_and_placeholder_keeps_real_root_only(self, tmp_path, monkeypatch):
         real = tmp_path / "work"; real.mkdir()
-        monkeypatch.setenv(ALLOWED_ROOTS_ENV, f"{real}:${{user_config.allowed_roots}}")
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, f"{real}{os.pathsep}${{user_config.allowed_roots}}")
         assert _allowed_roots() == [real.resolve()]
 
-    def test_placeholder_env_does_not_deny_all(self, tmp_path, monkeypatch):
-        # The reported failure mode: literal placeholder bricked every call
+    def test_placeholder_env_denies_all(self, tmp_path, monkeypatch):
+        # INVERTED (v2.0, M0-A1): the literal placeholder used to mean
+        # "unrestricted"; deny-by-default now rejects every project directory
+        # until real roots are configured.
         monkeypatch.setenv(ALLOWED_ROOTS_ENV, "${user_config.allowed_roots}")
         project = tmp_path / "repo"; project.mkdir()
-        assert _validate_project_dir(str(project)) == str(project.resolve())
+        with pytest.raises(ValueError, match="No workspace roots configured"):
+            _validate_project_dir(str(project))
 
     def test_non_template_dollar_part_still_fails_closed(self, tmp_path, monkeypatch):
         # Narrow guard: a hand-written unexpanded var like ${HOME}/dev is a
@@ -1992,6 +2043,631 @@ class TestLauncherPlaceholder:
         check = sp.run(["/bin/sh", "-n", "-c", self._launcher_script()],
                        capture_output=True, text=True)
         assert check.returncode == 0, check.stderr
+
+
+# =========================================================================
+# v2.0 (M0-A2): durable SQLite quota store
+# =========================================================================
+
+import sqlite3 as _sq
+import threading as _threading
+
+
+class TestQuotaStore:
+    def test_reservations_persist_in_the_db_file(self, monkeypatch):
+        monkeypatch.setenv(MAX_RUNS_PER_DAY_ENV, "5")
+        assert _reserve_daily_run() is None
+        assert _reserve_daily_run() is None
+        # The count lives in the file, not the process — a restart reads it back.
+        conn = _sq.connect(_quota_db_path())
+        row = conn.execute("SELECT attempts FROM quota_usage").fetchone()
+        conn.close()
+        assert row[0] == 2
+        assert _read_daily_run_count() == 2
+
+    def test_concurrent_reservations_never_exceed_cap(self, monkeypatch):
+        monkeypatch.setenv(MAX_RUNS_PER_DAY_ENV, "5")
+        results = []
+
+        def worker():
+            results.append(_reserve_daily_run())
+
+        threads = [_threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        granted = sum(1 for r in results if r is None)
+        denied = sum(1 for r in results if r is not None)
+        assert granted == 5, f"expected exactly cap grants, got {granted}"
+        assert denied == 5
+
+    def test_utc_rollover_resets(self, monkeypatch):
+        monkeypatch.setenv(MAX_RUNS_PER_DAY_ENV, "1")
+        assert _reserve_daily_run() is None
+        assert _reserve_daily_run() is not None
+        # Simulate the day rolling over: age the stored row.
+        conn = _sq.connect(_quota_db_path())
+        conn.execute("UPDATE quota_usage SET day_utc = '2000-01-01'")
+        conn.commit()
+        conn.close()
+        assert _reserve_daily_run() is None
+
+    def test_corrupt_db_denies_with_repairable_error(self, monkeypatch):
+        monkeypatch.setenv(MAX_RUNS_PER_DAY_ENV, "5")
+        p = _quota_db_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"this is not a sqlite database")
+        err = _reserve_daily_run()
+        assert err is not None and err.startswith("Error:")
+        assert str(p) in err  # names the file to repair
+        assert MAX_RUNS_PER_DAY_ENV in err  # names the disable escape hatch
+
+    def test_legacy_env_alias_still_works(self, monkeypatch):
+        monkeypatch.delenv(MAX_RUNS_PER_DAY_ENV, raising=False)
+        monkeypatch.setenv(MAX_JOBS_PER_DAY_ENV, "1")
+        assert _reserve_daily_run() is None
+        assert _reserve_daily_run() is not None
+
+    def test_wording_is_executions_never_messages(self, monkeypatch):
+        monkeypatch.setenv(MAX_RUNS_PER_DAY_ENV, "1")
+        _reserve_daily_run()
+        err = _reserve_daily_run()
+        assert "message" not in err.lower() and "credit" not in err.lower()
+        assert "execution" in err.lower()
+
+    def test_state_dir_is_outside_project_dirs_and_pure(self, tmp_path, monkeypatch):
+        # CLAUDEX_STATE_DIR (autouse fixture) points under tmp_path/.claudex-state
+        # — the resolver must honor it and never place state in a repo .claudex/.
+        # It is now PURE (no mkdir side-effect) so it's safe in error handlers;
+        # the directory materializes lazily on first _quota_conn use.
+        d = _state_dir()
+        assert d == (tmp_path / ".claudex-state")
+        assert not d.exists()  # pure resolve — no mkdir
+        _reserve_daily_run()   # first real use creates it
+        assert d.is_dir()
+
+    def test_deleting_corrupt_db_repairs_without_restart(self, monkeypatch):
+        # Codex #7: after a DB is initialized, deleting a corrupted file and
+        # letting it recreate must restore a usable schema (DDL every connect).
+        monkeypatch.setenv(MAX_RUNS_PER_DAY_ENV, "5")
+        assert _reserve_daily_run() is None          # initializes DB + cache
+        p = _quota_db_path()
+        p.write_bytes(b"corrupt")                     # simulate corruption
+        assert _reserve_daily_run() is not None       # denied (fail-closed)
+        p.unlink()                                    # user follows the advice: delete
+        # Cache still holds the path, but DDL runs on every connect → repaired.
+        assert _reserve_daily_run() is None           # works again, no restart
+
+    def test_state_dir_mkdir_failure_returns_repairable_error(self, tmp_path, monkeypatch):
+        # Codex #3: if the state dir can't be created, the error handler must
+        # NOT re-invoke the creating resolver and raise — it returns the
+        # repairable error string.
+        monkeypatch.setenv(MAX_RUNS_PER_DAY_ENV, "5")
+        # Point the state dir at a path whose parent is a FILE → mkdir fails.
+        blocker = tmp_path / "blocker"; blocker.write_text("x")
+        monkeypatch.setenv("CLAUDEX_STATE_DIR", str(blocker / "state"))
+        srv_mod = sys.modules["server"]
+        srv_mod._quota_db_initialized.clear()
+        err = _reserve_daily_run()
+        assert err is not None and err.startswith("Error:")  # no exception raised
+
+
+# =========================================================================
+# v2.0 (M0-A3): incremental streaming caps
+# =========================================================================
+
+from server import (
+    _pump_capped,
+    _read_stream_capped,
+    _StreamCapExceeded,
+    MAX_OUTPUT_BYTES,
+    MAX_LINE_BYTES,
+    STDERR_TAIL_BYTES,
+)
+
+
+class _FakeStream:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    async def read(self, n):
+        return self._chunks.pop(0) if self._chunks else b""
+
+
+class _FakeStdin:
+    def write(self, b):
+        pass
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeProc:
+    def __init__(self, out_chunks=(), err_chunks=(), rc=0):
+        self.stdin = _FakeStdin()
+        self.stdout = _FakeStream(out_chunks)
+        self.stderr = _FakeStream(err_chunks)
+        self.returncode = rc
+        self.pid = 999_999_999  # getpgid fails -> _kill_tree falls back to kill()
+        self.killed = False
+
+    async def wait(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+
+    async def communicate(self, input=None):
+        return (b"", b"")
+
+
+class TestStreamCaps:
+    @pytest.mark.asyncio
+    async def test_combined_byte_cap_breach_raises(self):
+        # newline-terminated chunks keep the line cap out of the way,
+        # isolating the combined-bytes cap (5MB > 4MB)
+        proc = _FakeProc(out_chunks=[b"x" * 999_999 + b"\n"] * 5)
+        with pytest.raises(_StreamCapExceeded, match="output exceeded"):
+            await _pump_capped(proc, b"prompt")
+
+    @pytest.mark.asyncio
+    async def test_no_newline_flood_trips_line_cap(self):
+        # 1.2MB with no newline: under the 4MB total cap, over the 1MB line cap
+        proc = _FakeProc(out_chunks=[b"y" * 600_000, b"y" * 600_001])
+        with pytest.raises(_StreamCapExceeded, match="single output line"):
+            await _pump_capped(proc, b"prompt")
+
+    @pytest.mark.asyncio
+    async def test_oversize_line_completing_mid_chunk_trips_cap(self):
+        # Codex #6: a >1MB line that ENDS inside a chunk (prior run + prefix
+        # before the newline) must trip — not slip through because the chunk
+        # also contains a trailing newline.
+        proc = _FakeProc(out_chunks=[b"z" * 983_040, b"z" * 16_961 + b"\ntail"])
+        with pytest.raises(_StreamCapExceeded, match="single output line"):
+            await _pump_capped(proc, b"prompt")
+
+    @pytest.mark.asyncio
+    async def test_newlines_reset_the_line_run(self):
+        chunks = [b"z" * 600_000 + b"\n", b"z" * 600_000 + b"\n"]
+        out, _err = await _pump_capped(_FakeProc(out_chunks=chunks), b"p")
+        assert len(out) == 2 * 600_001
+
+    @pytest.mark.asyncio
+    async def test_stderr_flood_does_not_trip_the_output_cap(self):
+        # Codex/CC #4: trimmed stderr bulk must NOT count against the memory cap
+        # — a small good stdout + huge stderr must still return the stdout.
+        proc = _FakeProc(
+            out_chunks=[b"GOOD RESULT\n"],
+            err_chunks=[b"noise\n" * 100_000] * 8,  # ~4.8MB of stderr, all trimmed
+        )
+        out, err = await _pump_capped(proc, b"prompt")
+        assert out == b"GOOD RESULT\n"
+        assert len(err) <= 2 * STDERR_TAIL_BYTES
+
+    @pytest.mark.asyncio
+    async def test_stderr_keeps_only_the_tail(self):
+        # Amortized trim: bounded at 2×STDERR_TAIL_BYTES, and always the TAIL.
+        # Feed well past the trim threshold so at least one trim has fired.
+        err_chunks = [b"A" * 20_000, b"B" * 20_000, b"C" * 20_000, b"D" * 20_000]
+        _out, err = await _pump_capped(_FakeProc(err_chunks=err_chunks), b"p")
+        assert len(err) <= 2 * STDERR_TAIL_BYTES
+        assert err.endswith(b"D" * STDERR_TAIL_BYTES)  # tail, not head
+        assert b"A" not in err  # oldest bytes trimmed away
+
+    @pytest.mark.asyncio
+    async def test_invalid_utf8_passes_through_bytes(self):
+        out, _err = await _pump_capped(
+            _FakeProc(out_chunks=[b"ok \xff\xfe bytes\n"]), b"p")
+        assert out == b"ok \xff\xfe bytes\n"
+        assert "ok" in out.decode(errors="replace")
+
+    @pytest.mark.asyncio
+    async def test_sink_memory_never_exceeds_cap(self):
+        sink = bytearray()
+        stream = _FakeStream([b"x" * 1_000_000] * 6)
+        with pytest.raises(_StreamCapExceeded):
+            await _read_stream_capped(
+                stream, sink, {"total": 0}, tail_only=False)
+        assert len(sink) <= MAX_OUTPUT_BYTES
+
+    @pytest.mark.asyncio
+    async def test_runner_returns_error_and_kills_on_breach(self, tmp_path, monkeypatch):
+        import server as srv
+        proc = _FakeProc(out_chunks=[b"x" * 1_000_000] * 5)
+
+        async def fake_exec(*cmd, **kwargs):
+            return proc
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
+        result = await srv._run_codex_once("p", project_dir=str(tmp_path))
+        assert result.startswith("Error:")
+        assert "discarded" in result  # never a truncated success
+        assert proc.killed is True
+
+
+# =========================================================================
+# v2.0 (M0-A4): complete subprocess env hygiene + ping split + npm removal
+# =========================================================================
+
+
+class TestEnvHygiene:
+    def test_no_npm_spawn_in_server_source(self):
+        # The npm-registry version lookup is gone for good — an undeclared
+        # runtime outbound call has no place on enterprise machines (R4).
+        src = (PROJECT_ROOT / "server" / "server.py").read_text()
+        assert '"npm",' not in src
+
+    @pytest.mark.asyncio
+    async def test_version_check_sanitized_env_and_pinned_minimum(self, monkeypatch):
+        import server as srv
+        _reset_version_cache(warning="", resolved=False)
+        srv._version_cache["last_failure"] = 0.0  # clear backoff from earlier tests
+        spawns = []
+
+        class _P:
+            returncode = 0
+
+            async def communicate(self, input=None):
+                return (b"codex-cli 0.100.0", b"")
+
+        async def fake_exec(*cmd, **kw):
+            spawns.append((cmd, kw))
+            return _P()
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
+        warn = await srv._check_codex_version()
+        assert "older than the supported minimum" in warn
+        assert len(spawns) == 1, "exactly one spawn — the npm lookup must be gone"
+        cmd, kw = spawns[0]
+        assert cmd[1] == "--version"
+        assert kw.get("env") is not None and "PATH" in kw["env"]
+        _reset_version_cache()
+
+    @pytest.mark.asyncio
+    async def test_version_check_quiet_at_minimum(self, monkeypatch):
+        import server as srv
+        _reset_version_cache(warning="", resolved=False)
+        srv._version_cache["last_failure"] = 0.0  # clear backoff from earlier tests
+
+        class _P:
+            returncode = 0
+
+            async def communicate(self, input=None):
+                return (f"codex-cli {srv.MIN_CODEX_VERSION}".encode(), b"")
+
+        async def fake_exec(*cmd, **kw):
+            return _P()
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
+        assert await srv._check_codex_version() == ""
+        _reset_version_cache()
+
+
+class TestGitConfigExecutionBlocked:
+    @pytest.mark.asyncio
+    async def test_hostile_repo_config_does_not_execute(self, tmp_path, monkeypatch):
+        # Security CRITICAL: repo-local diff.external / core.fsmonitor are
+        # command-execution vectors that live in .git/config (not env), so
+        # sanitizing env alone doesn't stop them. The safe -c flags +
+        # --no-ext-diff/--no-textconv must neutralize them. Probe reaches the
+        # real vulnerable branch (_get_git_diff + _get_git_context).
+        import server as srv
+        import subprocess
+        marker_ext = tmp_path / "MARKER_EXT"
+        marker_fsm = tmp_path / "MARKER_FSM"
+        repo = tmp_path / "repo"; repo.mkdir()
+
+        def g(*a):
+            subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True)
+        g("init", "-q"); g("config", "user.email", "x@x"); g("config", "user.name", "x")
+        (repo / "a.txt").write_text("v1\n"); g("add", "."); g("commit", "-qm", "one")
+        (repo / "a.txt").write_text("v2\n")
+        g("config", "diff.external", f"touch {marker_ext};")
+        g("config", "core.fsmonitor", f"touch {marker_fsm}; true")
+
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, str(tmp_path))
+        await srv._get_git_diff(str(repo), staged=False)
+        await srv._get_git_context(str(repo))
+        # These two ARE closed by --no-ext-diff/--no-textconv + -c core.fsmonitor=false.
+        assert not marker_ext.exists(), "diff.external executed — sandbox escape"
+        assert not marker_fsm.exists(), "core.fsmonitor executed — sandbox escape"
+        # KNOWN RESIDUAL (documented, NOT fixed — descoped per README "Not a sandbox
+        # against a repository you open" + v2.1 git-op-sandbox backlog): git has no
+        # flag to disable attribute-driven clean/smudge filters, so a hostile
+        # .gitattributes + filter.<d>.clean still executes on a worktree diff. This
+        # is inherent git behavior; not asserted closed here on purpose.
+
+    @pytest.mark.asyncio
+    async def test_diff_still_works_on_a_benign_repo(self, tmp_path, monkeypatch):
+        # The safe flags must not break legitimate diff gathering.
+        import server as srv
+        import subprocess
+        repo = tmp_path / "repo2"; repo.mkdir()
+
+        def g(*a):
+            subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True)
+        g("init", "-q"); g("config", "user.email", "x@x"); g("config", "user.name", "x")
+        (repo / "f.txt").write_text("one\n"); g("add", "."); g("commit", "-qm", "c1")
+        (repo / "f.txt").write_text("two\n")
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, str(tmp_path))
+        diff = await srv._get_git_diff(str(repo), staged=False)
+        assert diff and "f.txt" in diff and "-one" in diff and "+two" in diff
+
+
+class TestGitEnvSanitized:
+    @pytest.mark.asyncio
+    async def test_git_spawns_use_sanitized_env(self, tmp_path, monkeypatch):
+        # Codex/security #2: the git spawns must drop GIT_DIR/GIT_EXTERNAL_DIFF
+        # etc. so an env var can't redirect the read outside the allowed cwd or
+        # inject a command.
+        import server as srv
+        captured = {}
+
+        async def fake_exec(*cmd, **kw):
+            captured["cmd"] = cmd
+            captured["env"] = kw.get("env")
+            raise FileNotFoundError()  # short-circuit after capture
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", fake_exec)
+        await srv._git_cmd(str(tmp_path), "rev-parse", "HEAD")
+        assert captured["env"] is not None, "git spawn must pass a sanitized env"
+        assert "GIT_DIR" not in captured["env"]
+        assert "GIT_EXTERNAL_DIFF" not in captured["env"]
+        assert "GIT_SSH_COMMAND" not in captured["env"]
+        assert "PATH" in captured["env"] and "HOME" in captured["env"]
+
+    def test_env_keep_has_windows_essentials(self):
+        import server as srv
+        for var in ("SYSTEMROOT", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "COMSPEC"):
+            assert var in srv._CODEX_ENV_KEEP, f"{var} missing — Codex can't run on Windows"
+
+
+class TestReservationNotBurnedOnMissingBinary:
+    @pytest.mark.asyncio
+    async def test_missing_binary_does_not_spend_reservation(self, tmp_path, monkeypatch):
+        # Security/correctness #9: a missing CLI is not an execution and must
+        # not burn a durable slot (else a broken install spends the whole cap).
+        import server as srv
+        monkeypatch.setenv(MAX_RUNS_PER_DAY_ENV, "5")
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "codex")
+        monkeypatch.setattr(srv.shutil, "which", lambda _x: None)  # not on PATH
+        out = await srv._run_codex_once("p", project_dir=str(tmp_path))
+        assert "not found" in out.lower()
+        assert _read_daily_run_count() == 0  # no reservation burned
+
+
+class TestPingSplit:
+    @pytest.mark.asyncio
+    async def test_health_check_no_model_call_no_quota(self, monkeypatch, tmp_path):
+        import server as srv
+        monkeypatch.setenv(MAX_RUNS_PER_DAY_ENV, "5")
+        _reset_version_cache(warning="", resolved=True)
+        spawned_cmds = []
+
+        class _P:
+            returncode = 0
+
+            async def communicate(self, input=None):
+                return (b"codex-cli 0.146.0", b"")
+
+        async def fake_exec(*cmd, **kw):
+            spawned_cmds.append(cmd)
+            assert kw.get("env") is not None, "every spawn must use the sanitized env"
+            return _P()
+
+        async def no_model(*a, **k):
+            raise AssertionError("model call during health check")
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(srv, "_run_codex", no_model)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
+        out = await srv.codex_ping(srv.PingInput())
+        assert "health check" in out
+        for cmd in spawned_cmds:
+            assert "exec" not in cmd, "health check must never spawn codex exec"
+        assert _read_daily_run_count() == 0, "health check must not consume quota"
+
+    @pytest.mark.asyncio
+    async def test_model_test_routes_through_the_runner(self, monkeypatch, tmp_path):
+        import server as srv
+        called = {}
+
+        async def fake_run(prompt, **kw):
+            called["prompt"] = prompt
+            called.update(kw)
+            return "pong"
+
+        monkeypatch.setattr(srv, "_run_codex", fake_run)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
+        out = await srv.codex_ping(srv.PingInput(model_test=True))
+        assert "round-trip OK" in out
+        assert Path(called["project_dir"]) == Path(str(tmp_path)).resolve()
+        assert called["tool_name"] == "ping"
+
+    @pytest.mark.asyncio
+    async def test_model_test_denied_without_roots(self, monkeypatch):
+        import server as srv
+        monkeypatch.delenv(ALLOWED_ROOTS_ENV, raising=False)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
+        out = await srv.codex_ping(srv.PingInput(model_test=True))
+        assert out.startswith("Error:")
+        assert ALLOWED_ROOTS_ENV in out
+
+
+# =========================================================================
+# v2.0 (M0-A1): deny-by-default confinement + authorization boundary
+# =========================================================================
+
+import server as _srv
+from server import (
+    codex_critique,
+    codex_plan,
+    codex_brainstorm,
+    codex_collab,
+    codex_evaluate,
+    codex_recap,
+    codex_status,
+    BrainstormInput,
+    CollaborateInput,
+    EvaluateInput,
+    RecapInput,
+    StatusInput,
+)
+
+
+class TestDenyByDefault:
+    def test_unset_env_denies_all(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(ALLOWED_ROOTS_ENV, raising=False)
+        project = tmp_path / "repo"; project.mkdir()
+        with pytest.raises(ValueError, match="No workspace roots configured"):
+            _validate_project_dir(str(project))
+
+    def test_whitespace_env_denies_all(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, "   ")
+        project = tmp_path / "repo"; project.mkdir()
+        with pytest.raises(ValueError, match="No workspace roots configured"):
+            _validate_project_dir(str(project))
+
+    def test_deny_message_names_the_fix(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(ALLOWED_ROOTS_ENV, raising=False)
+        project = tmp_path / "repo"; project.mkdir()
+        with pytest.raises(ValueError) as exc:
+            _validate_project_dir(str(project))
+        assert ALLOWED_ROOTS_ENV in str(exc.value)
+        assert "README" in str(exc.value)
+
+    def test_configured_root_allows_inside_denies_outside(self, tmp_path, monkeypatch):
+        root = tmp_path / "allowed"; root.mkdir()
+        inside = root / "proj"; inside.mkdir()
+        outside = tmp_path / "elsewhere"; outside.mkdir()
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, str(root))
+        assert _validate_project_dir(str(inside)) == str(inside.resolve())
+        with pytest.raises(ValueError, match="outside the allowed workspace"):
+            _validate_project_dir(str(outside))
+
+    def test_argv_roots_take_precedence_over_env(self, tmp_path, monkeypatch):
+        argv_root = tmp_path / "argv_root"; argv_root.mkdir()
+        env_root = tmp_path / "env_root"; env_root.mkdir()
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, str(env_root))
+        monkeypatch.setattr(_srv, "_ARGV_ROOTS", [str(argv_root)])
+        assert _allowed_roots() == [argv_root.resolve()]
+        proj = env_root / "p"; proj.mkdir()
+        with pytest.raises(ValueError, match="outside the allowed workspace"):
+            _validate_project_dir(str(proj))
+
+    def test_env_parsing_uses_os_pathsep(self, tmp_path, monkeypatch):
+        r1 = tmp_path / "r1"; r1.mkdir()
+        r2 = tmp_path / "r2"; r2.mkdir()
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, f"{r1}{os.pathsep}{r2}")
+        assert _allowed_roots() == [r1.resolve(), r2.resolve()]
+
+
+class TestAuthorizationBoundary:
+    """M0-A1 contract: every project-bound tool authorizes BEFORE any project op.
+
+    Instrumented, not AST-searched: the project-op primitives are tripwired to
+    record and fail; each tool called with a project_dir OUTSIDE the allowed
+    root must return the confinement error having fired zero tripwires.
+    """
+
+    @pytest.fixture
+    def outside_dir(self, tmp_path, monkeypatch):
+        root = tmp_path / "allowed"; root.mkdir()
+        outside = tmp_path / "outside"; outside.mkdir()
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, str(root))
+        return outside
+
+    @pytest.fixture
+    def tripwires(self, monkeypatch):
+        fired = []
+
+        def _trip(name):
+            def _fn(*a, **k):
+                fired.append(name)
+                raise AssertionError(f"project op '{name}' before authorization")
+            return _fn
+
+        def _atrip(name):
+            async def _fn(*a, **k):
+                fired.append(name)
+                raise AssertionError(f"project op '{name}' before authorization")
+            return _fn
+
+        monkeypatch.setattr(_srv, "_get_git_context", _atrip("_get_git_context"))
+        monkeypatch.setattr(_srv, "_get_git_diff", _atrip("_get_git_diff"))
+        monkeypatch.setattr(_srv, "_run_codex", _atrip("_run_codex"))
+        monkeypatch.setattr(_srv, "_prepare_run_dir", _trip("_prepare_run_dir"))
+        monkeypatch.setattr(_srv, "_safe_claudex_path", _trip("_safe_claudex_path"))
+        monkeypatch.setattr(
+            _srv.asyncio, "create_subprocess_exec", _atrip("create_subprocess_exec")
+        )
+        return fired
+
+    @pytest.mark.asyncio
+    async def test_every_project_bound_tool_denies_before_any_project_op(
+        self, outside_dir, tripwires
+    ):
+        out_dir = str(outside_dir)
+        cases = {
+            "critique": codex_critique(SecondOpinionInput(
+                plan="a plan long enough", project_dir=out_dir)),
+            "plan": codex_plan(ParallelPlanInput(
+                task="a task long enough", project_dir=out_dir)),
+            "brainstorm": codex_brainstorm(BrainstormInput(
+                topic="a topic long enough", project_dir=out_dir)),
+            "collab": codex_collab(CollaborateInput(
+                problem="a problem long enough",
+                cc_analysis="analysis long enough", project_dir=out_dir)),
+            "review": codex_review(QuickReviewInput(
+                files="a.py", project_dir=out_dir)),
+            "evaluate": codex_evaluate(EvaluateInput(
+                options="Option A: aaaa. Option B: bbbb.", project_dir=out_dir)),
+            "recap": codex_recap(RecapInput(
+                session_id="s1", project_dir=out_dir)),
+            "review_diff": codex_review_diff(ReviewDiffInput(project_dir=out_dir)),
+            "result_disk_fallback": codex_result(JobResultInput(
+                job_id="job-abcdef123456", project_dir=out_dir)),
+            "submit": codex_submit(SubmitInput(
+                tool="critique",
+                arguments={"plan": "a plan long enough", "project_dir": out_dir})),
+        }
+        for name, coro in cases.items():
+            out = await coro
+            assert out.startswith("Error: "), f"{name}: expected confinement error, got: {out[:120]}"
+            assert "outside the allowed workspace" in out, f"{name}: wrong error: {out[:160]}"
+        assert tripwires == [], f"project ops before authorization: {tripwires}"
+
+    @pytest.mark.asyncio
+    async def test_status_stays_usable_but_skips_project_state(
+        self, outside_dir, monkeypatch
+    ):
+        async def _no_spawn(*a, **k):
+            raise OSError("no spawn in test")
+        monkeypatch.setattr(_srv.asyncio, "create_subprocess_exec", _no_spawn)
+        monkeypatch.setattr(_srv, "_check_codex_version", AsyncMock(return_value=""))
+        out = await codex_status(StatusInput(project_dir=str(outside_dir)))
+        assert not out.startswith("Error: ")
+        assert "Project state: skipped" in out
+        assert "Sessions" not in out
+
+    @pytest.mark.asyncio
+    async def test_status_shows_deny_all_when_unconfigured(self, monkeypatch):
+        monkeypatch.delenv(ALLOWED_ROOTS_ENV, raising=False)
+
+        async def _no_spawn(*a, **k):
+            raise OSError("no spawn in test")
+        monkeypatch.setattr(_srv.asyncio, "create_subprocess_exec", _no_spawn)
+        monkeypatch.setattr(_srv, "_check_codex_version", AsyncMock(return_value=""))
+        out = await codex_status(StatusInput())
+        assert "DENY-ALL" in out
+        assert "unrestricted" not in out
 
 
 # =========================================================================

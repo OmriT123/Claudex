@@ -19,9 +19,14 @@ Run through these diagnostic checks in order. Stop at the first failure and help
    - Run: `codex --version`
    - If outdated: suggest `npm update -g @openai/codex`
 
-3. **Codex authenticated?**
-   - Run `codex_ping` to test connectivity
-   - If auth error: tell user to run `codex login`
+3. **Codex authenticated + Claudex healthy?**
+   - Run `codex_ping` (default = FREE health check: binary, version, auth
+     status, quota state DB, confinement readiness — no model call)
+   - If auth shows not logged in: tell user to run `codex login`
+   - If roots show NOT CONFIGURED: point to README → "Workspace confinement
+     (required)" — every call is denied until roots are set (v2.0)
+   - Only if the user wants a full round-trip: run `codex_ping` with
+     `model_test=true` (spends one execution + OpenAI-side usage)
 
 4. **MCP server running?**
    - Check if `codex` tools are available via `/mcp`

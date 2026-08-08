@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "claudex",
   "display_name": "Claudex (Codex Teammate)",
-  "version": "1.8.2",
+  "version": "2.0.0",
   "description": "OpenAI Codex as a second-opinion teammate: parallel planning, plan critique, code/diff review, red-teaming, debugging collaboration, tradeoff analysis, and async background jobs. Codex runs in a read-only sandbox via the Codex CLI with your ChatGPT subscription.",
   "author": {
     "name": "Omri Tal",
@@ -44,9 +44,9 @@
     "allowed_roots": {
       "type": "directory",
       "title": "Allowed project folders",
-      "description": "Codex runs only inside these project folders (working-directory confinement; protected locations like ~/.ssh are always denied). Note: OS-level read sandboxing is on the roadmap \u2014 Codex retains user file permissions like any local dev tool. Leave empty for unrestricted power-user mode.",
+      "description": "REQUIRED: Codex runs only inside these project folders (working-directory confinement; protected locations like ~/.ssh are always denied). With no folders selected, every project directory is rejected \u2014 deny-by-default. Note: OS-level read sandboxing is on the roadmap \u2014 Codex retains user file permissions like any local dev tool.",
       "multiple": true,
-      "required": false
+      "required": true
     }
   }
 }

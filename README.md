@@ -1,4 +1,4 @@
-# Claudex — Claude Code Plugin <sup>v1.7.1</sup>
+# Claudex — Claude Code Plugin <sup>v2.0.0</sup>
 
 Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, security-testing, debugging, verification, and decision support.
 
@@ -81,6 +81,62 @@ claude --plugin-dir /path/to/Claudex
 ```
 
 </details>
+
+## Workspace confinement (required)
+
+**Breaking change (v2.0): Claudex is deny-by-default.** Every tool rejects every
+project directory until you configure allowed workspace roots. Earlier versions
+treated missing configuration as "unrestricted" — that mode is gone.
+
+This is **working-directory confinement**, not an OS-level read sandbox: it
+controls the directory Codex is launched in (`cwd`) and which directories you
+may select, and `--sandbox read-only` prevents writes. Codex still runs with
+your normal file permissions, so OS-level read isolation is not claimed here
+(it's on the roadmap). Configure the working directories Codex may run in:
+
+- **Claude Code (plugin)** — set `CLAUDEX_ALLOWED_ROOTS` where the server can see
+  it. Either export it in your shell profile before launching `claude`, or add an
+  `env` block to the plugin entry in your MCP client config:
+
+  ```json
+  {
+    "codex": {
+      "command": "uv",
+      "args": ["run", "${CLAUDE_PLUGIN_ROOT}/server/server.py"],
+      "env": { "CLAUDEX_ALLOWED_ROOTS": "/Users/you/Projects" }
+    }
+  }
+  ```
+
+  Multiple roots are separated by your OS path separator (`:` on macOS/Linux,
+  `;` on Windows). Subdirectories of a root are allowed automatically.
+
+- **Claude Desktop (extension)** — pick your project folders in the extension
+  settings ("Allowed project folders"). The field is required.
+
+- **Advanced** — the server also accepts `--allowed-roots <path> [<path> ...]`
+  on its command line, which takes precedence over the env var and avoids
+  separator parsing entirely.
+
+Protected locations (`~/.ssh`, `~/.aws`, keychains, `~/.codex`, …) cannot be
+selected as a working directory, even inside an allowed root (this bounds where
+Codex runs — it is not a read-time filter on individual files). If a call fails
+with "No workspace roots configured", this section is the fix.
+
+**Not a sandbox against a repository you open.** Claudex runs your local `git`
+against the working directory for diff review and context. A git repository can,
+through its own `.git/config` and `.gitattributes` (clean/smudge filters, and
+historically diff/hook drivers), execute programs on your machine when git
+operates on it — this is inherent to git, exactly as your own shell, editor, or
+build already trigger that tooling. Claudex disables the vectors git lets it
+(`--no-ext-diff`, `--no-textconv`, `core.fsmonitor`, hooks) but git provides no
+switch for attribute-driven filters, so **treat reviewing an untrusted
+repository as running its tooling.** OS-level isolation of git operations is on
+the roadmap.
+
+**Upgrading from ≤1.8.x:** after updating, Claudex will refuse every call until
+you set roots as above — this is intentional. One line of config restores your
+workflow, now with an explicit boundary.
 
 ## Commands
 
