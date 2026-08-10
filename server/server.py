@@ -739,11 +739,12 @@ def _validate_project_dir(project_dir: Optional[str]) -> str:
     roots = _allowed_roots()
     if not roots:
         raise ValueError(
-            "No workspace roots configured — all project directories are denied. "
-            "Claudex is deny-by-default since v2.0 (earlier versions allowed any "
-            f"directory here). Fix: set {ALLOWED_ROOTS_ENV} to your project "
-            f"folder(s), separated by '{os.pathsep}' — e.g. an env block in "
-            ".mcp.json / your MCP client config, or your shell profile. "
+            "No workspace roots configured — all project directories are denied "
+            f"(deny-by-default since v2.0). Fix: set {ALLOWED_ROOTS_ENV} to your "
+            f"project folder(s), separated by '{os.pathsep}', in your shell profile "
+            "or as an env block in your MCP client config, then restart the client "
+            "— roots are read at spawn. If the server was started with --allowed-roots "
+            "<paths>, those win and the env var is ignored; fix that flag instead. "
             "Claude Desktop users: pick folders in the extension settings. "
             "See README → 'Workspace confinement (required)'."
         )

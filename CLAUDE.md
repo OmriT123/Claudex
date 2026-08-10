@@ -99,6 +99,7 @@ Tests (147+ total) cover security-critical helpers (`_safe_claudex_path`, `_norm
 - Codex explores the codebase directly — don't pre-summarize context in prompts
 - Artifact parsing only after the `---FINAL-ANSWER---` delimiter (prevents reasoning trace leakage)
 - `.claudex/` should be in `.gitignore` (server warns if missing)
+- Leave `.mcp.json` in its bare `{"codex": {...}}` shape — the `/mcp` "Failed to parse" banner it causes in this repo is cosmetic and dev-only. Wrapping it registers a broken duplicate server, and moving it into `plugin.json` risks upstream #16143 on older clients (silent zero tools). See `docs/context/system_explanation.md`; guarded by `TestPluginManifest`
 - Each Codex tool call costs 1 message from user's ChatGPT subscription quota
 - Iterative sessions auto-rollover after 4 rounds (recap generated, new chained session created)
 - `codex_evaluate` does NOT arbitrate — Claude Code presents both analyses, user decides

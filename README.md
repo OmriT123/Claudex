@@ -1,4 +1,4 @@
-# Claudex — Claude Code Plugin <sup>v2.0.0</sup>
+# Claudex — Claude Code Plugin <sup>v2.0.1</sup>
 
 Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, security-testing, debugging, verification, and decision support.
 
@@ -94,29 +94,28 @@ may select, and `--sandbox read-only` prevents writes. Codex still runs with
 your normal file permissions, so OS-level read isolation is not claimed here
 (it's on the roadmap). Configure the working directories Codex may run in:
 
-- **Claude Code (plugin)** — set `CLAUDEX_ALLOWED_ROOTS` where the server can see
-  it. Either export it in your shell profile before launching `claude`, or add an
-  `env` block to the plugin entry in your MCP client config:
+- **Claude Code (plugin)** — export `CLAUDEX_ALLOWED_ROOTS` in your shell profile
+  before launching `claude`; the plugin's server inherits Claude Code's process
+  environment.
 
-  ```json
-  {
-    "codex": {
-      "command": "uv",
-      "args": ["run", "${CLAUDE_PLUGIN_ROOT}/server/server.py"],
-      "env": { "CLAUDEX_ALLOWED_ROOTS": "/Users/you/Projects" }
-    }
-  }
+  ```bash
+  export CLAUDEX_ALLOWED_ROOTS="/Users/you/Projects:/Users/you/work"
   ```
 
   Multiple roots are separated by your OS path separator (`:` on macOS/Linux,
-  `;` on Windows). Subdirectories of a root are allowed automatically.
+  `;` on Windows). Subdirectories of a root are allowed automatically. The server
+  reads this at **spawn** time, so after changing it you must quit and relaunch
+  Claude Code — reconnecting from `/mcp` respawns the server from the same stale
+  parent environment.
 
 - **Claude Desktop (extension)** — pick your project folders in the extension
   settings ("Allowed project folders"). The field is required.
 
 - **Advanced** — the server also accepts `--allowed-roots <path> [<path> ...]`
   on its command line, which takes precedence over the env var and avoids
-  separator parsing entirely.
+  separator parsing entirely. Running the server from your own MCP client config
+  rather than the plugin? Set `CLAUDEX_ALLOWED_ROOTS` as an `env` block on that
+  entry.
 
 Protected locations (`~/.ssh`, `~/.aws`, keychains, `~/.codex`, …) cannot be
 selected as a working directory, even inside an allowed root (this bounds where
@@ -305,7 +304,7 @@ echo '.claudex' >> .gitignore
 - **Timeout**: 1200s (20 min) for all tools
 - **Git context**: All tools (except `codex_review_diff`) automatically inject current branch, diff stat, recent commits, and staged changes into the Codex prompt — no manual context needed
 - **Session rollover**: After 4 rounds, sessions auto-rollover (recap generated, new chained session with `-p2`/`-p3` suffix)
-- **Version check**: Auto-checks for Codex CLI updates on first tool invocation (warning shown once per session)
+- **Version check**: Compares the installed Codex CLI against a pinned minimum on first tool invocation — offline, no network call (warning shown once per session)
 - **Metrics**: In-memory per-tool stats (calls, successes, timeouts, errors, avg latency) — visible in `codex_status`, reset on server restart
 
 ## Structured Review Output
@@ -342,7 +341,7 @@ Codex uses your ChatGPT subscription quota:
 
 **Error handling** — The server detects specific Codex CLI errors and returns user-friendly messages for "not authenticated", "rate limit/429", and empty output cases. All error responses use a consistent `[Claudex Error]` prefix.
 
-**Version check** — On the first tool invocation per session, the server checks npm for Codex CLI updates. The warning is shown once and then suppressed. If the check itself fails (timeout, network error), it stays unresolved and retries next time rather than caching a failure.
+**Version check** — On the first tool invocation per session, the server compares the installed Codex CLI against a locally pinned minimum version. This is **offline by design** since v2.0: it runs `codex --version` and compares locally, with no network call (the pre-v2.0 build queried the npm registry at runtime — an undeclared outbound call, removed). The warning is shown once and then suppressed. If the check itself fails, it stays unresolved and retries after a backoff rather than caching a failure.
 
 ## Plugin Structure
 

@@ -1,4 +1,4 @@
-<!-- Last verified: 2026-08-08 -->
+<!-- Last verified: 2026-08-10 -->
 <!-- Update when: architecture, major flows, interfaces, or invariants change -->
 <!-- v2.0.0 (M0-A): confinement is deny-by-default; quota is durable SQLite; streaming is incrementally capped; env sanitized on every spawn incl. git -->>
 
@@ -10,7 +10,12 @@ Plain-English boot map. Every section points at source; verify against code befo
 
 Claudex integrates OpenAI's Codex CLI into Claude Code / Claude Desktop as a read-only second-AI teammate, over MCP. Two shipping surfaces, one server:
 
-- **Claude Code plugin** — `.claude-plugin/plugin.json` + `.mcp.json` launch `server/server.py` via `uv run` (stdio MCP).
+- **Claude Code plugin** — `.mcp.json` (bare `{"codex": {...}}`) declares the stdio server, launching `server/server.py` via `uv run`. **Leave it exactly as it is.** This repo is a plugin *and* a workspace, so Claude Code reads that path a second time as a **project** config, and every "tidier" arrangement is worse. Options 1–2 were observed directly on 2.1.226 (2026-08-10); option 3's failure mode is the upstream report and was **not** reproduced here:
+  - *Bare file (current)* — the project parse fails, printing a cosmetic red "Failed to parse" banner in `/mcp`. Dev-only: it needs the repo to be your cwd, so no installed user ever sees it. **This is the option we keep.**
+  - *Wrapping it in `{"mcpServers": {...}}`* — kills the banner, but the project loader then successfully registers a *second* `codex` server that cannot work (`${CLAUDE_PLUGIN_ROOT}` is undefined outside plugin scope). It renders as `codex · ✘ failed` plus "Failed to reconnect to codex" — indistinguishable from Codex being down. Caused a false outage alarm during concurrent sessions. A repo `.claude/settings.json` with `disabledMcpjsonServers: ["codex"]` suppresses the entry but still leaves a `CLAUDE_PLUGIN_ROOT` warning.
+  - *Moving it into `plugin.json`'s `mcpServers` field* — verified working on 2.1.226, but upstream [#16143](https://github.com/anthropics/claude-code/issues/16143) (OPEN, reported against 2.0.76, no fix comment) says that field is dropped during manifest parsing, so the plugin installs clean with **zero tools and no error**. We could not reproduce that locally and the fixed-in version is unknown, which is exactly the problem: the exposure is every client older than ours, and the symptom is silent. Trading a dev-facing banner for that is the worst of the three.
+
+  Also measured: when a root `.mcp.json` exists it is authoritative — a manifest declaration of a *different* server name silently disappears, and same-name entries resolve to the manifest's value. `TestPluginManifest` in `tests/test_helpers.py` guards the two rules that matter (the file declares `codex`; the manifest declares nothing).
 - **Claude Desktop extension** — `desktop-extension/` packages the same server as a `.mcpb` (manifest v0.3, darwin-only today, `/bin/sh` launcher; Windows track is active — see ROADMAP).
 
 ## The one big file

@@ -2670,6 +2670,42 @@ class TestAuthorizationBoundary:
         assert "unrestricted" not in out
 
 
+class TestPluginManifest:
+    """Guards the MCP declaration — `claude plugin validate` cannot catch this.
+
+    Validation exits 0 when `mcpServers` is absent or misspelled, so a lost
+    declaration ships a plugin that installs clean and silently has no tools.
+    """
+
+    def _manifest(self):
+        import json as _json
+        return _json.loads((PROJECT_ROOT / ".claude-plugin" / "plugin.json").read_text())
+
+    def _mcp_json(self):
+        import json as _json
+        return _json.loads((PROJECT_ROOT / ".mcp.json").read_text())
+
+    def test_declares_codex_server(self):
+        # Bare plugin shape: server name at top level, no "mcpServers" wrapper.
+        # Wrapping it makes the project loader register a second, broken codex
+        # server (CLAUDE_PLUGIN_ROOT is undefined outside plugin scope).
+        mcp = self._mcp_json()
+        assert "mcpServers" not in mcp
+        server = mcp["codex"]
+        assert server["command"] == "uv"
+        assert server["args"][-1].endswith("server/server.py")
+
+    def test_declaration_not_moved_into_manifest(self):
+        # Upstream anthropics/claude-code#16143 (open) drops plugin.json's
+        # mcpServers field during manifest parsing -> zero tools, no error.
+        assert "mcpServers" not in self._manifest()
+
+    def test_version_parity_across_shipped_manifests(self):
+        import json as _json
+        ext = _json.loads((PROJECT_ROOT / "desktop-extension" / "manifest.json").read_text())
+        assert self._manifest()["version"] == ext["version"]
+
+
 # =========================================================================
 # Entry point for uv run --script
 # =========================================================================

@@ -1,8 +1,8 @@
 # Claudex — Roadmap
 
-**Last verified**: 2026-08-08
-**Version**: 2.0.0 (uncommitted; `v1.8.2` tag = pre-V2 baseline) · **Platform**: macOS (Windows track active)
-**State**: M0 Workstream A (local hardening) implemented + verified (202 tests, dual review, /ship 3b passed — no introduced vuln); pending commit. Windows port (B), supply chain (C), dossier (D) still ahead.
+**Last verified**: 2026-08-11
+**Version**: 2.0.1 (`v1.8.2` tag = pre-V2 baseline) · **Platform**: macOS (Windows track active)
+**State**: M0 Workstream A (local hardening) shipped 2026-08-08 in `7694469` (202 tests, dual review, /ship 3b passed — no introduced vuln). Windows port (B), supply chain (C), dossier (D) still ahead.
 
 ## Active
 
@@ -19,6 +19,7 @@
 
 ## Completed
 
+- [x] 2026-08-11 — v2.0.1: doc-accuracy pass + `TestPluginManifest` guards. Locked the MCP declaration in place after empirically rejecting both "tidier" shapes (upstream #16143 drops a `plugin.json` `mcpServers` field silently; wrapping `.mcp.json` registers a broken duplicate server). Corrected the README's false "checks npm" claim and the confinement error's `--allowed-roots` precedence wording.
 - [x] 2026-08-08 — M0 Workstream A shipped (v2.0.0): deny-by-default confinement, durable SQLite quota, streaming caps, env hygiene, git-config-exec hardening; 202 tests, dual review + /ship 3b (no introduced vuln)
 - [x] 2026-08-01 — v1.8.2 baseline tagged + pushed; `docs/v2-plan/` gitignored (business docs stay out of public history)
 - [x] 2026-08-01 — ADR-017 drafted; M0 task breakdown drafted (private)
@@ -32,4 +33,4 @@
 ## Notes
 
 - Repo is **public** — client names, budgets, and strategy stay in local-only `docs/v2-plan/`; `docs/adr/` is gitignored too (ADR-017 carries budgets/kill criteria/incident detail) until Omri picks a publish path: sanitized public ADR variant, or repo goes private.
-- Loose files at `docs/` root (`initial-plan.md`, `server-changes-spec-18.2.26.md`) predate this structure — classify into `docs/plans|context|archive` in a future doc pass.
+- Doc structure is clean as of 2026-08-11: `docs/` root holds ROADMAP.md only (the former loose files were archived in `d27f317`).
