@@ -19,8 +19,9 @@ Run through these diagnostic checks in order. Stop at the first failure and help
    - Run: `codex --version`
    - Outdated = below `MIN_CODEX_VERSION` (0.153.1). Below that floor the API rejects the
      default `gpt-6-astra` model on every call ("requires a newer version of Codex").
-   - If outdated: suggest `npm i -g @openai/codex@latest`, then restart the Claude Code
-     session — the server caches the version check once per process lifetime
+   - If outdated: suggest `npm i -g @openai/codex@latest`, then `/reload-plugins` (or a
+     session restart) — the server caches the version check once per process lifetime,
+     and a reload respawns it. The same applies after `/plugin update codex`.
 
 3. **Codex authenticated + Claudex healthy?**
    - Run `codex_ping` (default = FREE health check: binary, version, auth
@@ -33,7 +34,7 @@ Run through these diagnostic checks in order. Stop at the first failure and help
 
 4. **MCP server running?**
    - Check if `codex` tools are available via `/mcp`
-   - If not: suggest restarting Claude Code session
+   - If not: suggest `/reload-plugins`, then a full Claude Code session restart if still missing
 
 5. **uv available?**
    - Run: `which uv`
