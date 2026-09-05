@@ -31,11 +31,11 @@ There is no build system, no linter configured. Dependencies are declared inline
 uv run --script tests/test_helpers.py
 ```
 
-Tests (147+ total) cover security-critical helpers (`_safe_claudex_path`, `_normalize_file_list`), session management, Pydantic model validation, auto-session-ID generation, timeout constants, model/reasoning_summary validation, metrics, session chaining, `ReviewDiffInput`, backward compatibility, structured output schemas, review formatters, `_build_review_system` toggle, `structured_output` field validation, structured output integration (mock-based), temp file lifecycle, formatter edge cases, and error handling fixes (stderr fallback, timeout cleanup, OSError catch, version warning masking, schema write errors). Test file uses PEP 723 inline metadata (same pattern as `server.py`).
+Tests (221 total) cover GPT-6 Astra alignment (defaults, effort ladder, operating contract, CLI-floor error mapping), security-critical helpers (`_safe_claudex_path`, `_normalize_file_list`), session management, Pydantic model validation, auto-session-ID generation, timeout constants, model/reasoning_summary validation, metrics, session chaining, `ReviewDiffInput`, backward compatibility, structured output schemas, review formatters, `_build_review_system` toggle, `structured_output` field validation, structured output integration (mock-based), temp file lifecycle, formatter edge cases, and error handling fixes (stderr fallback, timeout cleanup, OSError catch, version warning masking, schema write errors). Test file uses PEP 723 inline metadata (same pattern as `server.py`).
 
 ## Architecture
 
-**Single-file server** — all logic lives in `server/server.py` (~3200 lines). It's a FastMCP server (`FastMCP("codex")`) that exposes 12 tools:
+**Single-file server** — all logic lives in `server/server.py` (~4000 lines). It's a FastMCP server (`FastMCP("codex")`) that exposes 12 tools:
 
 | Tool | Purpose | Codex Persona |
 |------|---------|---------------|
@@ -81,8 +81,8 @@ Tests (147+ total) cover security-critical helpers (`_safe_claudex_path`, `_norm
 
 ## Defaults
 
-- Model: `gpt-5.6-sol` (overridable per-call via `model` param)
-- Reasoning effort: `high` (overridable per-call)
+- Model: `gpt-6-astra` (overridable per-call via `model` param; requires Codex CLI ≥ `MIN_CODEX_VERSION` 0.153.1)
+- Reasoning effort: `high` on every tool (`low`…`max`; `ultra` not exposed)
 - Reasoning summary: `detailed` (overridable per-call)
 - Timeout: 1200s (20 min) for all tools
 - No timeout auto-retry (removed v1.8.0): timeouts return honest errors; callers retry deliberately
@@ -97,6 +97,7 @@ Tests (147+ total) cover security-critical helpers (`_safe_claudex_path`, `_norm
 - Claude Code must verify Codex's claims before presenting to the user — never relay without first-hand investigation
 - Codex subprocess must always use `--sandbox read-only` — security invariant
 - Codex explores the codebase directly — don't pre-summarize context in prompts
+- Every system prompt inherits `_OPERATING_CONTRACT` (GPT-6 Astra tuning; the clauses live in `server/server.py` — docs point there rather than restating them)
 - Artifact parsing only after the `---FINAL-ANSWER---` delimiter (prevents reasoning trace leakage)
 - `.claudex/` should be in `.gitignore` (server warns if missing)
 - Leave `.mcp.json` in its bare `{"codex": {...}}` shape — the `/mcp` "Failed to parse" banner it causes in this repo is cosmetic and dev-only. Wrapping it registers a broken duplicate server, and moving it into `plugin.json` risks upstream #16143 on older clients (silent zero tools). See `docs/context/system_explanation.md`; guarded by `TestPluginManifest`

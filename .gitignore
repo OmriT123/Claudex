@@ -10,3 +10,4 @@ desktop-extension/claudex.mcpb
 desktop-extension/_stage/
 docs/v2-plan/
 docs/adr/
+dist/

@@ -20,6 +20,8 @@ Or directly:
 import asyncio
 import json
 import os
+import shutil
+import subprocess
 import re
 import sys
 import tempfile
@@ -55,6 +57,7 @@ from server import (
     _format_review_files_json,
     _format_review_diff_json,
     RequestType,
+    ReasoningEffort,
     COLLAB_PERSONAS,
     MAX_SESSION_ROUNDS,
     SESSION_MAX_BYTES,
@@ -1864,9 +1867,16 @@ class TestHardening:
             result = await srv._run_codex_once("p", project_dir=str(tmp_path))
         assert result.startswith("Error:")
         cmd = captured["cmd"]
-        for flag in ("--ignore-user-config", "--ignore-rules", "--ephemeral"):
+        for flag in ("--ignore-user-config", "--ignore-rules", "--ephemeral", "--strict-config"):
             assert flag in cmd, f"missing {flag}"
         assert "project_doc_max_bytes=0" in cmd
+        # v2.1: native multi-agent delegation is disabled at the CLI boundary —
+        # config key (model metadata cannot override it) AND both feature flags,
+        # all in `-c` form so older CLIs never see an unknown argv flag.
+        overrides = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-c"]
+        for key in ("agents.enabled=false", "features.multi_agent=false", "features.multi_agent_v2=false"):
+            assert key in overrides, f"missing {key}"
+        assert "--disable" not in cmd
         assert captured["start_new_session"] is True
         assert captured["env"] is not None and "PATH" in captured["env"]
 
@@ -2490,6 +2500,7 @@ class TestPingSplit:
         assert "round-trip OK" in out
         assert Path(called["project_dir"]) == Path(str(tmp_path)).resolve()
         assert called["tool_name"] == "ping"
+        assert called["reasoning_effort"] == srv.DEFAULT_REASONING_EFFORT  # v2.1: policy effort, not "low"
 
     @pytest.mark.asyncio
     async def test_model_test_denied_without_roots(self, monkeypatch):
@@ -2704,6 +2715,227 @@ class TestPluginManifest:
         import json as _json
         ext = _json.loads((PROJECT_ROOT / "desktop-extension" / "manifest.json").read_text())
         assert self._manifest()["version"] == ext["version"]
+
+
+# =========================================================================
+# v2.1 — GPT-6 Astra alignment
+# =========================================================================
+
+class TestAstraAlignment:
+    """Default model/effort, effort ladder, operating contract, CLI floor."""
+
+    def test_default_model_is_astra(self):
+        assert DEFAULT_MODEL == "gpt-6-astra"
+
+    def test_min_codex_version_carries_astra_harness(self):
+        import server as srv
+        assert srv._version_at_least(srv.MIN_CODEX_VERSION, "0.153.1")
+
+    def test_effort_ladder_exposes_max_not_ultra(self):
+        # "ultra" (auto delegation) is deliberately absent — unobservable/uncapped here.
+        assert [e.value for e in ReasoningEffort] == ["low", "medium", "high", "xhigh", "max"]
+
+    def test_every_tool_defaults_to_high_effort(self):
+        assert SecondOpinionInput(plan="x" * 20).reasoning_effort == ReasoningEffort.HIGH
+        assert ParallelPlanInput(task="x" * 20).reasoning_effort == ReasoningEffort.HIGH
+        assert BrainstormInput(topic="x" * 20).reasoning_effort == ReasoningEffort.HIGH
+        assert CollaborateInput(problem="x" * 20, cc_analysis="x" * 20).reasoning_effort == ReasoningEffort.HIGH
+        assert EvaluateInput(options="x" * 20).reasoning_effort == ReasoningEffort.HIGH
+        # These three overrode the base default to MEDIUM before v2.1; the overrides are gone.
+        assert QuickReviewInput(files="t.py").reasoning_effort == ReasoningEffort.HIGH
+        assert RecapInput(session_id="s").reasoning_effort == ReasoningEffort.HIGH
+        assert ReviewDiffInput().reasoning_effort == ReasoningEffort.HIGH
+
+    def test_max_effort_accepted(self):
+        assert ParallelPlanInput(task="x" * 20, reasoning_effort="max").reasoning_effort == ReasoningEffort.MAX
+
+    def test_operating_contract_in_both_preambles(self):
+        import server as srv
+        for pre in (srv.CODEBASE_FIRST_PREAMBLE, srv.CODEBASE_FIRST_PREAMBLE_LIGHT):
+            assert "Never stop to ask" in pre         # autonomy: non-interactive run
+            assert "take precedence" in pre           # instruction precedence over repo content
+            assert "never as instructions" in pre     # repository content is data
+            assert "UNVERIFIED" in pre                # evidence honesty
+            assert "supplied evidence" in pre         # recap/evaluate confirm against logs/context, not code
+            assert "single agent" in pre              # no sub-agent delegation
+        # Every persona prompt inherits it (spot-check the review/plan/collab bases).
+        assert "take precedence" in srv.PARALLEL_PLAN_SYSTEM
+        assert "take precedence" in srv.REVIEW_DIFF_SYSTEM_BASE
+        assert "take precedence" in srv._build_collaborate_system(RequestType.RED_TEAM)
+
+    def test_rollover_recap_uses_default_effort(self):
+        import inspect, server as srv
+        assert "reasoning_effort=DEFAULT_REASONING_EFFORT" in inspect.getsource(srv.codex_collab)
+
+    @staticmethod
+    async def _run_failing_codex(stderr: bytes, tmp_path, **kw) -> str:
+        """Drive _run_codex_once against a subprocess that exits 1 with `stderr`."""
+        import server as server_mod
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 1
+        mock_proc.kill = MagicMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"", stderr))
+        # Patch the pump (not asyncio.wait_for) so every coroutine is awaited normally.
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc), \
+             patch.object(server_mod, "_find_codex_bin", return_value="/usr/bin/codex"), \
+             patch.object(server_mod, "_pump_capped", new_callable=AsyncMock, return_value=(b"", stderr)):
+            return await _run_codex_once("test prompt", project_dir=str(tmp_path), **kw)
+
+    @pytest.mark.asyncio
+    async def test_model_requires_newer_cli_is_actionable(self, tmp_path, monkeypatch):
+        """Live-observed on codex-cli 0.149.0: the API rejects gpt-6-astra with a
+        400 'requires a newer version of Codex'. Must map to an upgrade hint,
+        not the generic 'exited with code 1' nor the auth/rate-limit matchers."""
+        import server as server_mod
+        stderr = (b'warning: Model metadata for `gpt-6-astra` not found.\n'
+                  b'ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",'
+                  b'"message":"The \'gpt-6-astra\' model requires a newer version of Codex. '
+                  b'Please upgrade to the latest app or CLI and try again."}}')
+        async def fake_check(*, consume=False):
+            server_mod._version_cache["installed"] = "0.149.0"  # the live-observed case
+            return ""
+        monkeypatch.setattr(server_mod, "_check_codex_version", fake_check)
+        monkeypatch.setitem(server_mod._version_cache, "installed", "")
+        result = await self._run_failing_codex(stderr, tmp_path)
+        assert result.startswith(ERROR_PREFIX)
+        assert "too old for model 'gpt-6-astra'" in result
+        assert "installed: v0.149.0" in result
+        assert f">= v{server_mod.MIN_CODEX_VERSION}" in result
+        assert "not authenticated" not in result.lower()
+        assert "rate limit" not in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_newer_cli_error_for_override_omits_astra_floor(self, tmp_path, monkeypatch):
+        """No floor is established for a per-call override model: report the rejection
+        without asserting the CLI is old and without quoting the Astra floor."""
+        import server as server_mod
+        async def fake_check(*, consume=False):
+            server_mod._version_cache["installed"] = "0.153.4"
+            return ""
+        monkeypatch.setattr(server_mod, "_check_codex_version", fake_check)
+        monkeypatch.setitem(server_mod._version_cache, "installed", "")
+        stderr = b'ERROR: {"message":"The \'gpt-7-future\' model requires a newer version of Codex."}'
+        result = await self._run_failing_codex(stderr, tmp_path, model="gpt-7-future")
+        assert "rejected model 'gpt-7-future'" in result and "installed CLI: v0.153.4" in result
+        assert "too old" not in result
+        assert f">= v{server_mod.MIN_CODEX_VERSION}" not in result  # floor hint is Astra-only
+        assert "Update to the latest CLI" in result and server_mod.CODEX_INSTALL_CMD in result
+
+    @pytest.mark.asyncio
+    async def test_newer_cli_error_is_access_diagnosis_when_floor_met(self, tmp_path, monkeypatch):
+        """Installed >= floor yet the API still rejects the default model: the floor
+        is wrong or the account lacks Astra access. The two diagnoses are exclusive —
+        no 'too old' / 'Update to >= vX' text may appear here."""
+        import server as server_mod
+        stderr = b'ERROR: {"message":"The \'gpt-6-astra\' model requires a newer version of Codex."}'
+        async def fake_check(*, consume=False):
+            server_mod._version_cache["installed"] = "0.153.4"
+            return ""
+        monkeypatch.setattr(server_mod, "_check_codex_version", fake_check)
+        monkeypatch.setitem(server_mod._version_cache, "installed", "")
+        result = await self._run_failing_codex(stderr, tmp_path)
+        assert result.startswith(ERROR_PREFIX)
+        assert "(v0.153.4) already meets the pinned floor" in result
+        assert "GPT-6 Astra access" in result
+        assert "too old" not in result
+        assert f">= v{server_mod.MIN_CODEX_VERSION}" not in result
+
+    @pytest.mark.asyncio
+    async def test_newer_cli_error_resolves_version_on_cold_cache(self, tmp_path, monkeypatch):
+        """First model call of the process: the version cache is cold because
+        _run_codex checks it only AFTER the runner returns. The matcher must resolve
+        it itself, otherwise the access diagnosis can never fire on the first call."""
+        import server as server_mod
+        monkeypatch.setitem(server_mod._version_cache, "installed", "")
+        calls = []
+        async def fake_check(*, consume=False):
+            calls.append(consume)
+            server_mod._version_cache["installed"] = "0.153.4"
+            return ""
+        monkeypatch.setattr(server_mod, "_check_codex_version", fake_check)
+        stderr = b'ERROR: {"message":"The \'gpt-6-astra\' model requires a newer version of Codex."}'
+        result = await self._run_failing_codex(stderr, tmp_path)
+        assert calls == [False]  # resolved in-path, without consuming the one-shot warning
+        assert "already meets the pinned floor" in result
+        assert "too old" not in result
+
+    @pytest.mark.asyncio
+    async def test_newer_cli_error_never_asserts_too_old_without_evidence(self, tmp_path, monkeypatch):
+        """Version probe failed/in backoff (installed == "") or unparseable (pre-release):
+        the message must not claim 'too old' — it has no evidence either way."""
+        import server as server_mod
+        stderr = b'ERROR: {"message":"The \'gpt-6-astra\' model requires a newer version of Codex."}'
+        for seeded, shown in (("", "unknown"), ("0.154.0-beta.1", "'0.154.0-beta.1'")):
+            async def fake_check(*, consume=False, _v=seeded):
+                server_mod._version_cache["installed"] = _v
+                return ""
+            monkeypatch.setattr(server_mod, "_check_codex_version", fake_check)
+            monkeypatch.setitem(server_mod._version_cache, "installed", "")
+            result = await self._run_failing_codex(stderr, tmp_path)
+            assert result.startswith(ERROR_PREFIX)
+            assert "could not be determined" in result and shown in result
+            assert "too old" not in result and "already meets" not in result
+            assert server_mod.CODEX_INSTALL_CMD in result
+
+    def test_version_at_least(self):
+        import server as srv
+        assert not srv._version_at_least("0.153.4", "garbage-floor")  # unparseable floor: False, not TypeError
+        assert srv._version_at_least("0.153.4", "0.153.1")
+        assert srv._version_at_least("v0.153.1", "0.153.1")
+        assert not srv._version_at_least("0.149.0", "0.153.1")
+        assert not srv._version_at_least("", "0.153.1")
+        assert not srv._version_at_least("garbage", "0.153.1")
+        assert not srv._version_at_least("0.154.0-beta.1", "0.153.1")  # pre-release: unparseable, fails closed
+        assert srv._parse_version("v0.153.4") == (0, 153, 4) and srv._parse_version("x") is None
+
+    @pytest.mark.asyncio
+    async def test_ping_timeout_gets_probe_specific_message(self, monkeypatch):
+        import server as srv
+        async def fake_run(prompt, **kw):
+            return f"{ERROR_PREFIX}Codex timed out after 180s. Try: (1) focus_files ..."
+        monkeypatch.setattr(srv, "_run_codex", fake_run)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
+        out = await srv.codex_ping(srv.PingInput(model_test=True))
+        assert out.startswith(ERROR_PREFIX)
+        assert "focus_files" not in out and "timeout_seconds" not in out
+        assert "without model_test" in out
+
+    @pytest.mark.asyncio
+    async def test_ping_passes_through_non_timeout_errors_verbatim(self, monkeypatch):
+        """A stderr echo that merely CONTAINS 'timed out' is not the runner's timeout —
+        it must not be rewritten into a false '180s' claim."""
+        import server as srv
+        passthrough = f"{ERROR_PREFIX}Codex exited with code 1.\nStderr: error sending request: operation timed out (os error 60)"
+        async def fake_run(prompt, **kw):
+            return passthrough
+        monkeypatch.setattr(srv, "_run_codex", fake_run)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
+        assert await srv.codex_ping(srv.PingInput(model_test=True)) == passthrough
+
+    @pytest.mark.skipif(shutil.which("codex") is None, reason="codex CLI not installed")
+    def test_single_agent_boundary_renders_without_agent_role(self, tmp_path):
+        """Integration (no model call, zero quota): render the model-visible prompt with the
+        plugin's exact multi-agent switches and assert the <multi_agent_role> block is gone,
+        with the un-switched render as the positive control. Verified live on codex-cli 0.153.4."""
+        import server as srv
+        home = tmp_path / "codex_home"; home.mkdir()
+        cache = Path.home() / ".codex" / "models_cache.json"
+        if cache.exists():
+            shutil.copy(cache, home / "models_cache.json")
+        env = {**os.environ, "CODEX_HOME": str(home)}
+        def render(*extra):
+            r = subprocess.run(["codex", "debug", "prompt-input", "-c", f"model={srv.DEFAULT_MODEL}", *extra, "hi"],
+                               capture_output=True, text=True, timeout=120, env=env)
+            return r
+        baseline = render()
+        if baseline.returncode != 0 or "multi_agent_role" not in baseline.stdout:
+            pytest.skip("prompt-input render unavailable in this environment (no positive control)")
+        switches = [a for pair in (("-c", k) for k in ("agents.enabled=false", "features.multi_agent=false", "features.multi_agent_v2=false")) for a in pair]
+        switched = render(*switches)
+        assert switched.returncode == 0, f"switched render failed: {switched.stderr[-500:]}"
+        assert switched.stdout.strip(), "switched render produced no prompt"
+        assert "multi_agent_role" not in switched.stdout
+        assert "multi_agent_mode" not in switched.stdout
 
 
 # =========================================================================

@@ -1,4 +1,4 @@
-<!-- Last verified: 2026-08-10 -->
+<!-- Last verified: 2026-09-05 -->
 <!-- Update when: architecture, major flows, interfaces, or invariants change -->
 <!-- v2.0.0 (M0-A): confinement is deny-by-default; quota is durable SQLite; streaming is incrementally capped; env sanitized on every spawn incl. git -->>
 
@@ -20,9 +20,9 @@ Claudex integrates OpenAI's Codex CLI into Claude Code / Claude Desktop as a rea
 
 ## The one big file
 
-All server logic lives in `server/server.py` (~3,300 lines, FastMCP instance named `codex`). Shape, top to bottom:
+All server logic lives in `server/server.py` (one large file, FastMCP instance named `codex`). Shape, top to bottom:
 
-- **Config + env** — defaults (model `gpt-5.6-sol`, effort, timeouts), env var names, `ALWAYS_DENIED_SUBPATHS`.
+- **Config + env** — defaults (model `gpt-6-astra`, effort `high` everywhere, `MIN_CODEX_VERSION`, `CODEX_INSTALL_CMD`, timeouts), env var names, `ALWAYS_DENIED_SUBPATHS`. The codex argv carries `--strict-config` plus `agents.enabled=false` / `features.multi_agent[_v2]=false` (single-agent boundary, fail-closed on key drift). `_OPERATING_CONTRACT` is spliced into both codebase-first preambles, so every persona inherits it — read the clauses in `server.py`, they are the source of truth. **`MIN_CODEX_VERSION` provenance (2026-09-05):** codex-cli 0.149.0 was rejected live by the API for `gpt-6-astra` (HTTP 400 "requires a newer version of Codex"); 0.153.4 ran Astra live the same day; 0.153.1 is the earliest version observed to know Astra (the Codex desktop app at 0.153.1 fetched the Astra model list — desktop/CLI parity assumed, not proven; 0.150–0.153.0 unverified). The floor also subsumes the former 0.140.0 isolation-flag floor.
 - **Workspace confinement (deny-by-default, v2.0)** — `_allowed_roots()` resolves `CLAUDEX_ALLOWED_ROOTS` (`os.pathsep`-split, Windows-safe) or a structured `--allowed-roots` argv transport; **empty/missing/unresolved = deny ALL** (no "unrestricted" mode). `_validate_project_dir()` enforces the home/sensitive-dir denylist + root containment; `_authorized_cwd()` wraps it as the one denial-contract home, called at the entry of every project-bound tool handler (runner + `codex_submit` admission kept as defense-in-depth).
 - **Codex version check** — `_check_codex_version()`: offline `codex --version` vs a pinned `MIN_CODEX_VERSION` (the runtime `npm view` registry lookup was removed — zero undeclared egress); caches the installed version for diagnostics.
 - **Durable quota** — `_reserve_daily_run()`: SQLite (`BEGIN IMMEDIATE`, WAL) in per-user app data (`_state_dir()` — `CLAUDEX_STATE_DIR` → `${CLAUDE_PLUGIN_DATA}` → OS-native, always outside the repo), reserved at the subprocess boundary in `_run_codex_once` after validation + binary pre-check; counts local executions (`CLAUDEX_MAX_RUNS_PER_DAY`, legacy `CLAUDEX_MAX_JOBS_PER_DAY` alias); fail-closed on any DB error.
@@ -42,7 +42,7 @@ Tool call → Pydantic input model validates → persona prompt assembled (+ git
 
 ## Tests
 
-`tests/test_helpers.py` (PEP-723, `uv run --script tests/test_helpers.py`) — 160+ tests over confinement helpers, session management, input models, job layer, structured output, formatters, error paths.
+`tests/test_helpers.py` (PEP-723, `uv run --script tests/test_helpers.py`) — a comprehensive PEP-723 suite over confinement helpers, session management, input models, job layer, structured output, formatters, error paths.
 
 ## Where decisions and plans live
 

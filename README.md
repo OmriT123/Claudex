@@ -1,4 +1,4 @@
-# Claudex — Claude Code Plugin <sup>v2.0.1</sup>
+# Claudex — Claude Code Plugin <sup>v2.1.0</sup>
 
 Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, security-testing, debugging, verification, and decision support.
 
@@ -36,9 +36,9 @@ with clear CC/Codex attribution
 
 ## Prerequisites
 
-1. **Codex CLI** — the bridge to OpenAI:
+1. **Codex CLI ≥ 0.153.1** — the bridge to OpenAI. Older CLIs are rejected by the API for the default `gpt-6-astra` model (`requires a newer version of Codex`). Your ChatGPT account must also have GPT-6 Astra access (OpenAI is rolling it out in stages; Enterprise workspaces enable it explicitly) — Claudex never falls back to another model silently:
    ```bash
-   npm i -g @openai/codex
+   npm i -g @openai/codex@latest
    codex login
    ```
 
@@ -297,8 +297,8 @@ echo '.claudex' >> .gitignore
 
 ## Defaults
 
-- **Model**: `gpt-5.6-sol` (overridable per-call via `model` parameter)
-- **Reasoning effort**: `high` (override per-call: `low`, `medium`, `high`, `xhigh`)
+- **Model**: `gpt-6-astra` — OpenAI's GPT-6 Astra, the only sanctioned default (overridable per-call via `model` parameter for deliberate one-offs). Requires Codex CLI ≥ 0.153.1 (see Prerequisites)
+- **Reasoning effort**: `high` on **every** tool, reviews and recaps included (override per-call: `low`, `medium`, `high`, `xhigh`, `max` — reserve `xhigh`/`max` for hard architectural decisions; Astra's `ultra` delegation tier is intentionally not exposed)
 - **Reasoning summary**: `detailed` (overridable: `detailed`, `concise`, `none`)
 - **Sandbox**: `read-only` — Codex reads your repo but never modifies it
 - **Timeout**: 1200s (20 min) for all tools
@@ -331,7 +331,7 @@ Codex uses your ChatGPT subscription quota:
 - **Pro ($200/mo)**: ~300–1,500 messages per 5-hour window
 - Each tool call = 1 message from quota
 - Structured output auto-fallback costs 1 extra message if it triggers
-- If rate-limited: wait for window reset or lower `reasoning_effort`
+- If rate-limited: wait for window reset (lowering `reasoning_effort` is a last resort — `high` is the standing policy)
 
 ## Under the Hood
 
@@ -339,7 +339,7 @@ Codex uses your ChatGPT subscription quota:
 
 **Session context management** — Session documents are capped at 32KB. When a session exceeds this, the oldest rounds are dropped first to stay within the limit. Sessions expire after 24 hours of inactivity.
 
-**Error handling** — The server detects specific Codex CLI errors and returns user-friendly messages for "not authenticated", "rate limit/429", and empty output cases. All error responses use a consistent `[Claudex Error]` prefix.
+**Error handling** — The server detects specific Codex CLI errors and returns user-friendly messages for "not authenticated", "rate limit/429", "model requires a newer version of Codex" (CLI too old for `gpt-6-astra` — upgrade hint with the pinned floor), and empty output cases. All error responses use a consistent `[Claudex Error]` prefix.
 
 **Version check** — On the first tool invocation per session, the server compares the installed Codex CLI against a locally pinned minimum version. This is **offline by design** since v2.0: it runs `codex --version` and compares locally, with no network call (the pre-v2.0 build queried the npm registry at runtime — an undeclared outbound call, removed). The warning is shown once and then suppressed. If the check itself fails, it stays unresolved and retries after a backoff rather than caching a failure.
 
@@ -385,9 +385,10 @@ Claudex/
 | Symptom | Fix |
 |---------|-----|
 | "Codex CLI not found" | `npm i -g @openai/codex` |
+| "Codex CLI is too old for model 'gpt-6-astra'" | `npm i -g @openai/codex@latest` — needs ≥ 0.153.1 |
 | "Not authenticated" | `codex login` |
 | "Rate limit reached" | Wait for 5-hour window reset |
-| Timeout | Lower `reasoning_effort` to `medium` |
+| Timeout | Narrow `focus_files` or raise `timeout_seconds` (lowering `reasoning_effort` is a last resort) |
 | Empty response | Be more specific about the task |
 | Tools not showing | Check `/mcp`, restart CC session |
 

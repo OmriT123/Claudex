@@ -118,7 +118,7 @@ All analysis tools (`codex_plan`, `codex_critique`, `codex_brainstorm`, `codex_c
 
 ### Response Metadata Footer
 
-Every successful Codex response includes a footer: `_Codex: {model}, {effort}, {elapsed}s_`. Reference this for transparency when reporting to the user, e.g.: "Codex (gpt-5.6-sol, high, 45s) suggests..."
+Every successful Codex response includes a footer: `_Codex: {model}, {effort}, {elapsed}s_`. Reference this for transparency when reporting to the user, e.g.: "Codex (gpt-6-astra, high, 45s) suggests..."
 
 ---
 
@@ -360,15 +360,20 @@ When Codex disagrees with your approach:
 
 ## Model & Reasoning
 
-**Model:** `gpt-5.6-sol` by default. Overridable per-call via `model` parameter on any tool.
+**Model:** `gpt-6-astra` (GPT-6 Astra) by default — the only sanctioned model. Overridable per-call via `model` parameter for deliberate one-offs. Needs Codex CLI ≥ 0.153.1; older CLIs get an actionable upgrade error.
 
-**Reasoning effort:** `high` by default. Override with `reasoning_effort` parameter:
+**Reasoning effort:** `high` by default on **every** tool (reviews and recaps too). Override with `reasoning_effort` parameter:
 - `low` — minimal reasoning, fast
-- `medium` — faster, good for reviews and recaps
-- `high` — default, good for most analysis
-- `xhigh` — maximum depth, slower but more thorough
+- `medium` — faster; only when speed matters more than depth
+- `high` — default for all analysis, reviews, recaps
+- `xhigh` — deeper, slower — hard architectural decisions
+- `max` — Astra's maximum depth for the hardest problems (slowest)
 
-**No hidden retries (v1.8):** a timeout returns an honest error and spends no extra quota. Retry deliberately — same effort with a longer `timeout_seconds`, or a lower effort if speed matters.
+`ultra` (Astra's auto-delegation tier) is not exposed, and native multi-agent delegation is disabled at the CLI boundary (`-c agents.enabled=false -c features.multi_agent=false -c features.multi_agent_v2=false`; verified on 0.153.4 by rendering the model-visible prompt — the config key is the load-bearing switch, a feature flag alone is not) — and `--strict-config` makes an unrecognized key a hard error before any model call, so a CLI that renames a key fails closed instead of silently re-enabling delegation. Rationale lives on the argv in `_run_codex_once`.
+
+**Operating contract (Astra tuning):** every persona prompt inherits `_OPERATING_CONTRACT` (non-interactive autonomy, prompt-over-repo precedence, proportionate verification, single agent, UNVERIFIED marking) — the clauses live in `server/server.py`; read them there.
+
+**No hidden retries (v1.8):** a timeout returns an honest error and spends no extra quota. Retry deliberately — same effort with a longer `timeout_seconds` or narrower `focus_files`; lowering effort is a last resort.
 
 **Reasoning summary:** `detailed` by default. Overridable per-call (`detailed`, `concise`, `none`).
 

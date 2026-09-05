@@ -39,4 +39,4 @@ Codex runs in a read-only sandbox and never modifies your files.
 - Codex reads your codebase directly — no need to paste code
 - Use `focus_files` to point Codex at relevant files
 - Claude always verifies Codex's claims before presenting them to you
-- Set `reasoning_effort` to `medium` for faster, cheaper responses
+- Depth is `high` on every tool by default; reserve `xhigh`/`max` for hard architectural decisions
