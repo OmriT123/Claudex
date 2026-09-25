@@ -1,4 +1,4 @@
-# Claudex — Claude Code Plugin <sup>v2.1.0</sup>
+# Claudex — Claude Code Plugin <sup>v2.2.0</sup>
 
 Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, security-testing, debugging, verification, and decision support.
 
@@ -117,6 +117,11 @@ your normal file permissions, so OS-level read isolation is not claimed here
   rather than the plugin? Set `CLAUDEX_ALLOWED_ROOTS` as an `env` block on that
   entry.
 
+- **Claude Code cloud sessions** — nothing to configure: with no roots set, the
+  session's project directory (`CLAUDE_PROJECT_DIR`) becomes the one root, only when
+  Claude Code reports a cloud session (`CLAUDE_CODE_REMOTE=true`). An explicit
+  `CLAUDEX_ALLOWED_ROOTS` still wins. See "Claude Code cloud sessions" below.
+
 Protected locations (`~/.ssh`, `~/.aws`, keychains, `~/.codex`, …) cannot be
 selected as a working directory, even inside an allowed root (this bounds where
 Codex runs — it is not a read-time filter on individual files). If a call fails
@@ -136,6 +141,43 @@ the roadmap.
 **Upgrading from ≤1.8.x:** after updating, Claudex will refuse every call until
 you set roots as above — this is intentional. One line of config restores your
 workflow, now with an explicit boundary.
+
+## Claude Code cloud sessions (claude.ai/code, mobile)
+
+Cloud sessions run in a fresh VM: nothing from your machine is there, MCP tool
+calls are capped at 60s, egress goes through an allowlisting proxy, and untracked
+files block the session's end. Since v2.2 Claudex handles its side: a 30-min
+per-server tool timeout in `.mcp.json`, the project directory as the default
+workspace root, `.claudex/` that ignores itself, fail-fast network errors that
+name the blocked host, and `CODEX_API_KEY` passed through to Codex. You configure
+the environment once (claude.ai/code → environment settings):
+
+1. **Network access** → Custom, keep "Also include default list", and add
+   `api.openai.com` (API-key auth) or `chatgpt.com` + `auth.openai.com`
+   (ChatGPT-plan login). Codex telemetry and plugin traffic are switched off, so
+   no other OpenAI host is needed.
+2. **Setup script**:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/OmriT123/Claudex/main/cloud/setup.sh | bash
+   ```
+   Installs the Codex CLI and this plugin (cached with the environment snapshot).
+3. **Codex auth**, one of:
+   - **API key** — environment variable `CODEX_API_KEY=sk-...`. No per-session
+     step; billed to your OpenAI API account. Anyone who uses the environment,
+     Claude included, can read environment variables.
+   - **ChatGPT plan** — per session, ask Claude to run `codex login --device-auth`
+     in the background and give you the URL and code to approve (enable device
+     code login under ChatGPT Settings → Security first). Don't copy your local
+     `~/.codex/auth.json` instead: refresh tokens are single-use, so the second
+     machine to refresh logs the other one out.
+
+Then start a new session and run `/codex:doctor` or `codex_ping`. In the VM Codex
+runs as root with a read-only sandbox that can read any file there, so keep
+secrets you don't want sent to OpenAI out of the environment.
+
+Only want the phone/web UI, not cloud compute? `claude remote-control` in your
+local project drives your local session (and your local Claudex) from claude.ai
+with no setup.
 
 ## Commands
 
@@ -290,10 +332,8 @@ Codex can produce file artifacts — code snippets, test drafts, analysis docs �
 - Artifacts > 100KB are skipped
 - Run directories are cleaned up after 1 hour
 
-**Setup:** Add `.claudex` to your `.gitignore`:
-```bash
-echo '.claudex' >> .gitignore
-```
+**Git:** no setup needed. Since v2.2 `.claudex/` contains a `*` `.gitignore`, so its
+files never show up as untracked or get committed (your own `.gitignore` is left alone).
 
 ## Defaults
 
@@ -301,7 +341,7 @@ echo '.claudex' >> .gitignore
 - **Reasoning effort**: `high` on **every** tool, reviews and recaps included (override per-call: `low`, `medium`, `high`, `xhigh`, `max` — reserve `xhigh`/`max` for hard architectural decisions; Astra's `ultra` delegation tier is intentionally not exposed)
 - **Reasoning summary**: `detailed` (overridable: `detailed`, `concise`, `none`)
 - **Sandbox**: `read-only` — Codex reads your repo but never modifies it
-- **Timeout**: 1200s (20 min) for all tools
+- **Timeout**: 1200s (20 min) for all tools; the plugin's `.mcp.json` sets a 30-min per-server MCP timeout so clients with a shorter default cap (Claude Code cloud: 60s) don't cut calls
 - **Git context**: All tools (except `codex_review_diff`) automatically inject current branch, diff stat, recent commits, and staged changes into the Codex prompt — no manual context needed
 - **Session rollover**: After 4 rounds, sessions auto-rollover (recap generated, new chained session with `-p2`/`-p3` suffix)
 - **Version check**: Compares the installed Codex CLI against a pinned minimum on first tool invocation — offline, no network call (warning shown once per session)
@@ -326,7 +366,7 @@ Set `structured_output=False` to get free-form text analysis instead.
 
 ## Rate Limits
 
-Codex uses your ChatGPT subscription quota:
+Codex uses your ChatGPT subscription quota (with `CODEX_API_KEY`, usage is billed to your OpenAI API account instead):
 - **Plus ($20/mo)**: ~30–150 messages per 5-hour window
 - **Pro ($200/mo)**: ~300–1,500 messages per 5-hour window
 - Each tool call = 1 message from quota
@@ -339,7 +379,9 @@ Codex uses your ChatGPT subscription quota:
 
 **Session context management** — Session documents are capped at 32KB. When a session exceeds this, the oldest rounds are dropped first to stay within the limit. Sessions expire after 24 hours of inactivity.
 
-**Error handling** — The server detects specific Codex CLI errors and returns user-friendly messages for "not authenticated", "rate limit/429", "model requires a newer version of Codex" (CLI too old for `gpt-6-astra` — upgrade hint with the pinned floor), and empty output cases. All error responses use a consistent `[Claudex Error]` prefix.
+**Error handling** — The server detects specific Codex CLI errors and returns user-friendly messages for "not authenticated", "rate limit/429", "model requires a newer version of Codex" (CLI too old for `gpt-6-astra` — upgrade hint with the pinned floor), a proxy/network policy blocking the OpenAI host (names the host), connection failures, and empty output cases. Codex runs with bounded connection retries, so an unreachable endpoint fails in under a minute instead of hanging until the timeout. All error responses use a consistent `[Claudex Error]` prefix.
+
+**Environment** — Codex gets an allowlisted environment (`PATH`, `HOME`, proxy and CA variables, …); everything else is stripped. Codex's own credentials (`CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`) are passed to codex spawns only (never to git) and are hidden from the commands Codex's model runs. Codex telemetry, plugin and app traffic are disabled.
 
 **Version check** — On the first tool invocation per session, the server compares the installed Codex CLI against a locally pinned minimum version. This is **offline by design** since v2.0: it runs `codex --version` and compares locally, with no network call (the pre-v2.0 build queried the npm registry at runtime — an undeclared outbound call, removed). The warning is shown once and then suppressed. If the check itself fails, it stays unresolved and retries after a backoff rather than caching a failure.
 
@@ -373,6 +415,8 @@ Claudex/
 │   ├── sessions/            # Iterative session documents
 │   └── recaps/              # Decision records from codex_recap
 ├── install.sh               # One-liner installer
+├── cloud/
+│   └── setup.sh             # Claude Code cloud environment setup script
 ├── docs/
 │   └── initial-plan.md      # Original design document
 ├── CLAUDE.md
@@ -386,11 +430,13 @@ Claudex/
 |---------|-----|
 | "Codex CLI not found" | `npm i -g @openai/codex` |
 | "Codex CLI is too old for model 'gpt-6-astra'" | `npm i -g @openai/codex@latest` — needs ≥ 0.153.1 |
-| "Not authenticated" | `codex login` |
+| "Not authenticated" | `codex login` (cloud session: set `CODEX_API_KEY`, or `codex login --device-auth`) |
+| "A network policy blocked Codex's connection to <host>" | Allow that host in your sandbox's network settings (Claude Code cloud: environment → Network access), then start a new session |
 | "Rate limit reached" | Wait for 5-hour window reset |
 | Timeout | Narrow `focus_files` or raise `timeout_seconds` (lowering `reasoning_effort` is a last resort) |
 | Empty response | Be more specific about the task |
 | Tools not showing | Check `/mcp`, restart CC session |
+| Calls cut off after 60s (cloud session) | Update to Claudex ≥ 2.2.0 (adds the per-server MCP timeout) |
 
 ## Credits
 

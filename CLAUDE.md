@@ -31,7 +31,7 @@ There is no build system, no linter configured. Dependencies are declared inline
 uv run --script tests/test_helpers.py
 ```
 
-Tests (221 total) cover GPT-6 Astra alignment (defaults, effort ladder, operating contract, CLI-floor error mapping), security-critical helpers (`_safe_claudex_path`, `_normalize_file_list`), session management, Pydantic model validation, auto-session-ID generation, timeout constants, model/reasoning_summary validation, metrics, session chaining, `ReviewDiffInput`, backward compatibility, structured output schemas, review formatters, `_build_review_system` toggle, `structured_output` field validation, structured output integration (mock-based), temp file lifecycle, formatter edge cases, and error handling fixes (stderr fallback, timeout cleanup, OSError catch, version warning masking, schema write errors). Test file uses PEP 723 inline metadata (same pattern as `server.py`).
+Tests (240 total) cover GPT-6 Astra alignment (defaults, effort ladder, operating contract, CLI-floor error mapping), security-critical helpers (`_safe_claudex_path`, `_normalize_file_list`), session management, Pydantic model validation, auto-session-ID generation, timeout constants, model/reasoning_summary validation, metrics, session chaining, `ReviewDiffInput`, backward compatibility, structured output schemas, review formatters, `_build_review_system` toggle, `structured_output` field validation, structured output integration (mock-based), temp file lifecycle, formatter edge cases, and error handling fixes (stderr fallback, timeout cleanup, OSError catch, version warning masking, schema write errors), and Claude Code cloud sessions (cloud-default roots, codex-auth env passthrough, network-hygiene flags, proxy-block error mapping, self-ignoring `.claudex/`, `.mcp.json` timeout). Test file uses PEP 723 inline metadata (same pattern as `server.py`).
 
 ## Architecture
 
@@ -84,7 +84,7 @@ Tests (221 total) cover GPT-6 Astra alignment (defaults, effort ladder, operatin
 - Model: `gpt-6-astra` (overridable per-call via `model` param; requires Codex CLI ≥ `MIN_CODEX_VERSION` 0.153.1)
 - Reasoning effort: `high` on every tool (`low`…`max`; `ultra` not exposed)
 - Reasoning summary: `detailed` (overridable per-call)
-- Timeout: 1200s (20 min) for all tools
+- Timeout: 1200s (20 min) for all tools; `.mcp.json` declares a 30-min per-server MCP `timeout` (Claude Code cloud sessions cap MCP calls at 60s otherwise)
 - No timeout auto-retry (removed v1.8.0): timeouts return honest errors; callers retry deliberately
 - Artifact max size: 100KB
 - Run directory cleanup: 1 hour
@@ -96,11 +96,13 @@ Tests (221 total) cover GPT-6 Astra alignment (defaults, effort ladder, operatin
 
 - Claude Code must verify Codex's claims before presenting to the user — never relay without first-hand investigation
 - Codex subprocess must always use `--sandbox read-only` — security invariant
+- Codex env is an allowlist (`_CODEX_ENV_KEEP`); only codex spawns also get Codex's own credentials (`_CODEX_AUTH_ENV`: `CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`), and `shell_environment_policy.ignore_default_excludes=false` hides them from the commands Codex's model runs. Git spawns never get them
+- Workspace roots are deny-by-default; the only implicit root is `CLAUDE_PROJECT_DIR` in a Claude Code cloud session (`CLAUDE_CODE_REMOTE=true`, never the home dir or `/`), and any explicit roots win
 - Codex explores the codebase directly — don't pre-summarize context in prompts
 - Every system prompt inherits `_OPERATING_CONTRACT` (GPT-6 Astra tuning; the clauses live in `server/server.py` — docs point there rather than restating them)
 - Artifact parsing only after the `---FINAL-ANSWER---` delimiter (prevents reasoning trace leakage)
-- `.claudex/` should be in `.gitignore` (server warns if missing)
-- Leave `.mcp.json` in its bare `{"codex": {...}}` shape — the `/mcp` "Failed to parse" banner it causes in this repo is cosmetic and dev-only. Wrapping it registers a broken duplicate server, and moving it into `plugin.json` risks upstream #16143 on older clients (silent zero tools). See `docs/context/system_explanation.md`; guarded by `TestPluginManifest`
+- `.claudex/` ignores itself: the server writes `.claudex/.gitignore` (`*`) when it creates the dir (never overwrites, never follows symlinks)
+- Leave `.mcp.json` in its bare `{"codex": {...}}` shape (keys inside the `codex` entry, like `timeout`, are fine) — the `/mcp` "Failed to parse" banner it causes in this repo is cosmetic and dev-only. Wrapping it registers a broken duplicate server, and moving it into `plugin.json` risks upstream #16143 on older clients (silent zero tools). See `docs/context/system_explanation.md`; guarded by `TestPluginManifest`
 - Each Codex tool call costs 1 message from user's ChatGPT subscription quota
 - Iterative sessions auto-rollover after 4 rounds (recap generated, new chained session created)
 - `codex_evaluate` does NOT arbitrate — Claude Code presents both analyses, user decides

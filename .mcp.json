@@ -1,6 +1,7 @@
 {
   "codex": {
     "command": "uv",
-    "args": ["run", "${CLAUDE_PLUGIN_ROOT}/server/server.py"]
+    "args": ["run", "${CLAUDE_PLUGIN_ROOT}/server/server.py"],
+    "timeout": 1800000
   }
 }
