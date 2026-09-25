@@ -89,12 +89,12 @@ fi
 # Install the plugin
 echo ""
 echo "Installing Claudex plugin..."
-claude plugin install codex
+claude plugin install "claudex@$MARKETPLACE_NAME"
 
 # Pre-warm uv dependencies so the MCP server starts instantly on first launch.
 # Without this, uv downloads packages on first startup, which can exceed
 # Claude Code's MCP connection timeout and leave the server in a failed state.
-CACHE_DIR="$PLUGIN_DIR/cache/omri-plugins/codex"
+CACHE_DIR="$PLUGIN_DIR/cache/$MARKETPLACE_NAME/claudex"
 SERVER_PY=$(find "$CACHE_DIR" -name "server.py" -path "*/server/server.py" 2>/dev/null | head -1)
 if [ -n "$SERVER_PY" ]; then
   echo "Pre-warming dependencies (first run may take a few seconds)..."

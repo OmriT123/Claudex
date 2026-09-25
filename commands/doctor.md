@@ -26,11 +26,21 @@ Run through these diagnostic checks in order. Stop at the first failure and help
 3. **Codex authenticated + Claudex healthy?**
    - Run `codex_ping` (default = FREE health check: binary, version, auth
      status, quota state DB, confinement readiness — no model call)
-   - If auth shows not logged in: tell user to run `codex login`
+   - If auth shows not logged in: tell user to run `codex login`. In a Claude Code
+     cloud session (`CLAUDE_CODE_REMOTE=true`) there is no browser: either the
+     environment sets `CODEX_API_KEY` (ping then shows "API key from CODEX_API_KEY"),
+     or run `codex login --device-auth` in the background and give the user the URL
+     and one-time code it prints (device code login must be enabled in their
+     ChatGPT security settings). Never print an API key.
    - If roots show NOT CONFIGURED: point to README → "Workspace confinement
-     (required)" — every call is denied until roots are set (v2.0)
+     (required)" — every call is denied until roots are set (v2.0). Cloud sessions
+     default to the project directory ("cloud session default")
    - Only if the user wants a full round-trip: run `codex_ping` with
      `model_test=true` (spends one execution + OpenAI-side usage)
+   - If it reports "A network policy blocked Codex's connection to <host>": the
+     sandbox's egress allowlist lacks that host. In a cloud session the user adds
+     it under environment settings → Network access (Custom), then starts a new
+     session; don't try to route around the block
 
 4. **MCP server running?**
    - Check if `codex` tools are available via `/mcp`
@@ -44,9 +54,10 @@ Run through these diagnostic checks in order. Stop at the first failure and help
    - Check if plugin appears in Claude Code's plugin list
    - If not: provide manual install steps
 
-7. **.claudex in .gitignore?**
-   - Check if `.claudex` is in the project's `.gitignore`
-   - If not: suggest adding it
+7. **.claudex kept out of git?**
+   - Since v2.2 `.claudex/` holds its own `.gitignore` (`*`); nothing to add
+   - Only if `.claudex/` files show as untracked in `git status`: check that
+     `.claudex/.gitignore` exists and isn't a symlink
 
 8. **Disk usage?**
    - Check `.claudex/` directory size

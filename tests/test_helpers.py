@@ -85,6 +85,10 @@ def _default_allowed_roots(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
     monkeypatch.setenv("CLAUDEX_STATE_DIR", str(tmp_path / ".claudex-state"))
+    # v2.2: the suite may itself run inside a Claude Code cloud session; the
+    # cloud-default root must never leak into tests that expect deny-all.
+    monkeypatch.delenv("CLAUDE_CODE_REMOTE", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
 from server import (
     SecondOpinionInput,
     ParallelPlanInput,
@@ -1863,6 +1867,9 @@ class TestHardening:
             captured["start_new_session"] = kwargs.get("start_new_session")
             raise FileNotFoundError()  # short-circuit after capture
 
+        # without this the runner returns "Codex CLI not found" before spawning
+        # on machines with no codex on PATH (CI, fresh cloud VMs)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
         with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
             result = await srv._run_codex_once("p", project_dir=str(tmp_path))
         assert result.startswith("Error:")
@@ -1980,6 +1987,7 @@ class TestGate2Fixes:
         async def fake_exec(*cmd, **kwargs):
             captured["cmd"] = list(cmd)
             raise FileNotFoundError()
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
         with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
             await srv._run_codex_once("p", project_dir=str(tmp_path))
         assert "skills.include_instructions=false" in captured["cmd"]
@@ -2936,6 +2944,259 @@ class TestAstraAlignment:
         assert switched.stdout.strip(), "switched render produced no prompt"
         assert "multi_agent_role" not in switched.stdout
         assert "multi_agent_mode" not in switched.stdout
+
+# =========================================================================
+# v2.2 — Claude Code cloud sessions (claude.ai/code)
+# =========================================================================
+
+class TestCloudSessions:
+    """Cloud sessions cap MCP calls at 60s, have no shell profile for roots,
+    route egress through a policy proxy, and flag untracked files."""
+
+    def _cloud(self, monkeypatch, project):
+        monkeypatch.delenv(ALLOWED_ROOTS_ENV, raising=False)
+        monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(project))
+
+    # --- MCP declaration ---
+
+    def test_mcp_json_declares_tool_timeout(self):
+        # Cloud sessions set MCP_TOOL_TIMEOUT=60000; a per-server timeout wins
+        # over it. Must cover the longest sync call (timeout_seconds <= 1800).
+        server = json.loads((PROJECT_ROOT / ".mcp.json").read_text())["codex"]
+        assert server["timeout"] >= 1_800_000
+
+    # --- workspace roots ---
+
+    def test_cloud_default_root_is_the_project_dir(self, tmp_path, monkeypatch):
+        import server as srv
+        project = tmp_path / "repo"; (project / "sub").mkdir(parents=True)
+        outside = tmp_path / "other"; outside.mkdir()
+        self._cloud(monkeypatch, project)
+        assert srv._allowed_roots() == [project.resolve()]
+        assert srv._roots_are_cloud_default()
+        assert _validate_project_dir(str(project / "sub")) == str((project / "sub").resolve())
+        with pytest.raises(ValueError, match="outside the allowed workspace"):
+            _validate_project_dir(str(outside))
+
+    @pytest.mark.parametrize("remote", [None, "", "1", "True", "false"])
+    def test_no_cloud_default_outside_cloud_sessions(self, tmp_path, monkeypatch, remote):
+        import server as srv
+        monkeypatch.delenv(ALLOWED_ROOTS_ENV, raising=False)
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+        if remote is None:
+            monkeypatch.delenv("CLAUDE_CODE_REMOTE", raising=False)
+        else:
+            monkeypatch.setenv("CLAUDE_CODE_REMOTE", remote)
+        assert srv._allowed_roots() == []
+        with pytest.raises(ValueError, match="No workspace roots configured"):
+            _validate_project_dir(str(tmp_path))
+
+    def test_cloud_default_never_home_root_relative_or_missing(self, tmp_path, monkeypatch):
+        import server as srv
+        for bad in (str(Path.home()), "/", "relative/dir", str(tmp_path / "missing"), ""):
+            self._cloud(monkeypatch, bad)
+            assert srv._allowed_roots() == [], bad
+
+    def test_explicit_roots_win_over_cloud_default(self, tmp_path, monkeypatch):
+        import server as srv
+        project = tmp_path / "repo"; project.mkdir()
+        other = tmp_path / "other"; other.mkdir()
+        self._cloud(monkeypatch, project)
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, str(other))
+        assert srv._allowed_roots() == [other.resolve()]
+        assert not srv._roots_are_cloud_default()
+        # an explicitly set value that yields nothing stays deny-all
+        monkeypatch.setenv(ALLOWED_ROOTS_ENV, "${user_config.allowed_roots}")
+        assert srv._allowed_roots() == []
+        monkeypatch.delenv(ALLOWED_ROOTS_ENV)
+        monkeypatch.setattr(srv, "_ARGV_ROOTS", [str(other)])
+        assert srv._allowed_roots() == [other.resolve()]
+
+    @pytest.mark.asyncio
+    async def test_status_and_ping_label_the_cloud_default(self, tmp_path, monkeypatch):
+        import server as srv
+        project = tmp_path / "repo"; project.mkdir()
+        self._cloud(monkeypatch, project)
+        _reset_version_cache(warning="", resolved=True)
+
+        class _P:
+            returncode = 0
+
+            async def communicate(self, input=None):
+                return (b"codex-cli 0.157.0", b"")
+
+        async def fake_exec(*cmd, **kw):
+            return _P()
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
+        status = await srv.codex_status(srv.StatusInput(project_dir=str(project)))
+        assert "cloud session default" in status
+        ping = await srv.codex_ping(srv.PingInput())
+        assert "cloud session default" in ping and "confinement active" in ping
+        _reset_version_cache()
+
+    # --- Codex credentials ---
+
+    def test_codex_auth_env_reaches_codex_spawns_only(self, monkeypatch):
+        import server as srv
+        monkeypatch.setenv("CODEX_API_KEY", "sk-codex")
+        monkeypatch.setenv("CODEX_ACCESS_TOKEN", "at-codex")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+        plain = srv._sanitized_codex_env()
+        assert "CODEX_API_KEY" not in plain and "CODEX_ACCESS_TOKEN" not in plain
+        auth = srv._sanitized_codex_env(codex_auth=True)
+        assert auth["CODEX_API_KEY"] == "sk-codex"
+        assert auth["CODEX_ACCESS_TOKEN"] == "at-codex"
+        assert "OPENAI_API_KEY" not in auth  # codex exec ignores it; keep stripping
+
+    @pytest.mark.asyncio
+    async def test_git_spawns_never_get_codex_auth(self, tmp_path, monkeypatch):
+        import server as srv
+        monkeypatch.setenv("CODEX_API_KEY", "sk-codex")
+        envs = []
+
+        class _P:
+            returncode = 0
+
+            async def communicate(self, input=None):
+                return (b"", b"")
+
+        async def fake_exec(*cmd, **kw):
+            envs.append((cmd, kw.get("env")))
+            return _P()
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", fake_exec)
+        await srv._get_git_context(str(tmp_path))
+        assert envs, "git context must spawn git"
+        for cmd, env in envs:
+            assert cmd[0] == "git"
+            assert env is not None and "CODEX_API_KEY" not in env
+
+    @pytest.mark.asyncio
+    async def test_exec_gets_codex_auth_and_network_hygiene_flags(self, tmp_path, monkeypatch):
+        import server as srv
+        monkeypatch.setenv("CODEX_API_KEY", "sk-codex")
+        captured = {}
+
+        async def fake_exec(*cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["env"] = kwargs.get("env")
+            raise FileNotFoundError()
+
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            await srv._run_codex_once("p", project_dir=str(tmp_path))
+        cmd = captured["cmd"]
+        overrides = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-c"]
+        for key in (
+            "features.unbounded_connection_retries=false",
+            "analytics.enabled=false",
+            'otel.metrics_exporter="none"',
+            "features.plugins=false",
+            "features.apps=false",
+            "shell_environment_policy.ignore_default_excludes=false",
+        ):
+            assert key in overrides, f"missing {key}"
+        assert "--strict-config" in cmd
+        assert captured["env"]["CODEX_API_KEY"] == "sk-codex"
+
+    @pytest.mark.asyncio
+    async def test_ping_reports_env_api_key(self, monkeypatch):
+        import server as srv
+        monkeypatch.setenv("CODEX_API_KEY", "sk-codex")
+        _reset_version_cache(warning="", resolved=True)
+
+        class _P:
+            returncode = 1  # `codex login status` never reads CODEX_API_KEY
+
+            async def communicate(self, input=None):
+                return (b"", b"Not logged in")
+
+        async def fake_exec(*cmd, **kw):
+            return _P()
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
+        out = await srv.codex_ping(srv.PingInput())
+        assert "API key from CODEX_API_KEY" in out
+        assert "sk-codex" not in out
+        _reset_version_cache()
+
+    # --- network errors ---
+
+    PROXY_403 = (
+        "ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: "
+        "URL error: Proxy connection failed: HTTP CONNECT failed with status 403, "
+        "url: wss://api.openai.com/v1/responses\n"
+        "ERROR: Reconnecting... 2/5\n"
+        "ERROR: Connection failed: error sending request\n"
+    )
+
+    def test_network_error_messages(self):
+        import server as srv
+        blocked = srv._network_error_message(self.PROXY_403)
+        assert blocked.startswith("Error:") and "api.openai.com" in blocked
+        assert "Network access" in blocked
+        offline = srv._network_error_message("ERROR: Connection failed: error sending request")
+        assert offline.startswith("Error:") and "could not reach OpenAI" in offline
+        assert srv._network_error_message("unexpected status 401 Unauthorized") is None
+
+    @pytest.mark.asyncio
+    async def test_proxy_block_is_reported_as_network_not_auth(self, tmp_path, monkeypatch):
+        # the stderr also mentions "login"; the network cause must win
+        import server as srv
+        stderr = (self.PROXY_403 + "hint: codex login\n").encode()
+
+        async def fake_exec(*cmd, **kwargs):
+            return _FakeProc(err_chunks=[stderr], rc=1)
+
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", fake_exec)
+        out = await srv._run_codex_once("p", project_dir=str(tmp_path))
+        assert "network policy blocked" in out and "api.openai.com" in out
+
+    # --- .claudex/ stays out of git ---
+
+    def test_claudex_dir_ignores_itself(self, tmp_path):
+        import subprocess as sp
+        from server import _prepare_run_dir
+        sp.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        run_dir = _prepare_run_dir(str(tmp_path))
+        (run_dir / "artifact.py").write_text("x = 1\n")
+        assert (tmp_path / ".claudex" / ".gitignore").read_text().splitlines()[-1] == "*"
+        untracked = sp.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=tmp_path, capture_output=True, text=True, check=True,
+        ).stdout
+        assert untracked == ""
+
+    def test_claudex_ignore_never_overwrites_or_follows_symlinks(self, tmp_path):
+        import server as srv
+        claudex = tmp_path / ".claudex"; claudex.mkdir()
+        (claudex / ".gitignore").write_text("mine\n")
+        srv._ensure_claudex_ignored(claudex)
+        assert (claudex / ".gitignore").read_text() == "mine\n"
+        other = tmp_path / "other"; other.mkdir()
+        claudex2 = other / ".claudex"; claudex2.mkdir()
+        target = tmp_path / "target.txt"
+        (claudex2 / ".gitignore").symlink_to(target)
+        srv._ensure_claudex_ignored(claudex2)
+        assert not target.exists()
+
+    def test_job_files_land_in_an_ignored_dir(self, tmp_path):
+        import server as srv
+        job_id = "job-test123"
+        srv._jobs[job_id] = {
+            "project_dir": str(tmp_path), "tool": "review", "status": "done", "result": "ok",
+        }
+        try:
+            srv._write_job_file(job_id)
+        finally:
+            srv._jobs.pop(job_id, None)
+        assert (tmp_path / ".claudex" / "jobs" / f"{job_id}.md").is_file()
+        assert (tmp_path / ".claudex" / ".gitignore").is_file()
 
 
 # =========================================================================

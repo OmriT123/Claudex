@@ -81,6 +81,13 @@ _ARGV_ROOTS: Optional[list[str]] = None  # set by the __main__ argv parser
 # the setting is absent. Only this exact shape is neutralized — any other
 # unexpanded ${...} is a user misconfiguration and still fails closed.
 _UNEXPANDED_TEMPLATE_RE = re.compile(r"\$\{user_config\.[^}]*\}")
+# Claude Code cloud sessions (claude.ai/code, v2.2): Claude Code puts
+# CLAUDE_CODE_REMOTE=true and CLAUDE_PROJECT_DIR in every MCP server's env. With
+# no roots configured there, the session's project dir becomes the one root: the
+# VM is ephemeral and single-purpose, and has no shell profile to hold the env
+# var. Never applies locally; an explicit env var or --allowed-roots always wins.
+CLOUD_SESSION_ENV = "CLAUDE_CODE_REMOTE"
+PROJECT_DIR_ENV = "CLAUDE_PROJECT_DIR"
 ALWAYS_DENIED_SUBPATHS = (
     ".ssh", ".aws", ".gnupg", ".codex", ".config/gh",
     "Library/Keychains", "Library/Application Support/Claude",
@@ -690,7 +697,7 @@ def _allowed_roots() -> list[Path]:
     else:
         raw = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
         if not raw:
-            return []
+            return _cloud_default_roots()
         # os.pathsep, not a literal ':' — a ':' split corrupts C:\ paths on Windows.
         parts = raw.split(os.pathsep)
     roots = []
@@ -711,6 +718,36 @@ def _allowed_roots() -> list[Path]:
         except OSError:
             pass
     return roots
+
+
+def _cloud_default_roots() -> list[Path]:
+    """[CLAUDE_PROJECT_DIR] in a Claude Code cloud session, else [] (deny-all).
+
+    Only when CLAUDE_CODE_REMOTE is exactly "true" and the project dir is an
+    existing absolute directory that is neither the home dir nor a filesystem
+    root. Protected locations stay denied by _validate_project_dir as usual.
+    """
+    if os.environ.get(CLOUD_SESSION_ENV) != "true":
+        return []
+    raw = os.environ.get(PROJECT_DIR_ENV, "").strip()
+    if not raw or not os.path.isabs(raw):
+        return []
+    try:
+        root = Path(raw).resolve()
+    except OSError:
+        return []
+    if not root.is_dir() or root == Path.home().resolve() or root == root.parent:
+        return []
+    return [root]
+
+
+def _roots_are_cloud_default() -> bool:
+    """True when the active roots come from _cloud_default_roots()."""
+    return (
+        _ARGV_ROOTS is None
+        and not os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
+        and bool(_cloud_default_roots())
+    )
 
 
 def _authorized_cwd(
@@ -804,14 +841,24 @@ _CODEX_ENV_KEEP = frozenset((
 ))
 
 
-def _sanitized_codex_env() -> dict:
+# Codex's own credentials (v2.2): `codex exec` reads CODEX_API_KEY (ahead of
+# auth.json) and CODEX_ACCESS_TOKEN (workspace access token). They reach codex
+# spawns only, never git, and the exec argv hides them from the shell commands
+# Codex's model runs (shell_environment_policy.ignore_default_excludes=false).
+# OPENAI_API_KEY stays stripped: codex exec ignores it anyway.
+_CODEX_AUTH_ENV = frozenset(("CODEX_API_KEY", "CODEX_ACCESS_TOKEN"))
+
+
+def _sanitized_codex_env(*, codex_auth: bool = False) -> dict:
     """Minimal environment for the Codex subprocess.
 
     Prevents leaking server-process env vars (tokens, API keys) into a child
     that sends context to a third-party model. Codex needs HOME (auth in
-    ~/.codex), PATH, and little else.
+    ~/.codex), PATH, and little else. codex_auth=True also passes Codex's own
+    credential variables (_CODEX_AUTH_ENV) for spawns of the codex binary.
     """
-    return {k: v for k, v in os.environ.items() if k in _CODEX_ENV_KEEP}
+    keep = _CODEX_ENV_KEEP | _CODEX_AUTH_ENV if codex_auth else _CODEX_ENV_KEEP
+    return {k: v for k, v in os.environ.items() if k in keep}
 
 
 def _safe_claudex_path(
@@ -891,13 +938,68 @@ def _cleanup_old_sessions(claudex_dir: Path) -> None:
                 pass  # best-effort
 
 
+def _ensure_claudex_ignored(claudex_dir: Path) -> None:
+    """Make .claudex/ ignore itself: a `*` .gitignore inside it (v2.2).
+
+    Keeps Claudex's scratch files out of `git status` and commits without
+    touching the user's own .gitignore (the same trick virtualenvs and tool
+    caches use). Best-effort: never follows symlinks, never overwrites.
+    """
+    if claudex_dir.is_symlink() or not claudex_dir.is_dir():
+        return
+    path = claudex_dir / ".gitignore"
+    if path.is_symlink() or path.exists():
+        return
+    try:
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o644,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("# Created by Claudex: keeps its scratch files out of git.\n*\n")
+    except OSError:
+        pass
+
+
+_PROXY_403_RE = re.compile(
+    r"http connect failed with status 403(?:, url: (?:wss?|https?)://([^/\s:,]+))?"
+)
+
+
+def _network_error_message(stderr_text: str) -> Optional[str]:
+    """Map Codex's connection failures to an actionable error (v2.2), or None.
+
+    With unbounded retries off, a blocked or unreachable endpoint ends the run
+    with "Connection failed"; a sandbox proxy that refuses the host answers
+    CONNECT with 403 on the way there.
+    """
+    lowered = stderr_text.lower()
+    blocked = _PROXY_403_RE.search(lowered)
+    if blocked:
+        host = blocked.group(1) or "the OpenAI endpoint"
+        return (
+            f"{ERROR_PREFIX}A network policy blocked Codex's connection to {host} "
+            "(the proxy refused it with 403). Allow that host in your sandbox's "
+            "network settings; in Claude Code cloud sessions: environment settings "
+            "-> Network access -> Custom, then start a new session."
+        )
+    if "connection failed" in lowered:
+        tail = stderr_text.strip()[-1500:]
+        return (
+            f"{ERROR_PREFIX}Codex could not reach OpenAI (connection failed after "
+            f"its retries). Check network access and proxy settings.\nStderr: {tail}"
+        )
+    return None
+
+
 def _prepare_run_dir(project_dir: str) -> Path:
     """Create an isolated per-run artifact directory under .claudex/.
 
     Returns the Path to the run directory (e.g. <project>/.claudex/run-<uuid>/).
     Rejects .claudex being a symlink (same symlink guard as _safe_claudex_path).
-    Also performs best-effort cleanup of stale run dirs and sessions, and warns
-    if .claudex is not in .gitignore.
+    Also performs best-effort cleanup of stale run dirs and sessions, and makes
+    .claudex/ ignore itself in git.
     """
     root = Path(project_dir)
     claudex_dir = root / ".claudex"
@@ -909,25 +1011,9 @@ def _prepare_run_dir(project_dir: str) -> Path:
     _cleanup_old_run_dirs(claudex_dir)
     _cleanup_old_sessions(claudex_dir)
 
-    # Warn if .claudex not in .gitignore
-    gitignore = root / ".gitignore"
-    if gitignore.is_file():
-        try:
-            content = gitignore.read_text()
-            if ".claudex" not in content:
-                logger.warning(
-                    ".claudex is not in .gitignore — artifact dirs may be committed. "
-                    "Add '.claudex' to your .gitignore."
-                )
-        except OSError:
-            pass
-    else:
-        logger.warning(
-            "No .gitignore found — .claudex artifact dirs may be committed."
-        )
-
     run_dir = claudex_dir / f"run-{uuid.uuid4()}"
     run_dir.mkdir(parents=True, exist_ok=False)
+    _ensure_claudex_ignored(claudex_dir)
     return run_dir
 
 
@@ -1055,6 +1141,7 @@ def _auto_session_id(problem: str) -> str:
 def _init_session(session_path: Path, session_id: str) -> None:
     """Create a new session document with structured header."""
     session_path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_claudex_ignored(session_path.parent.parent)
     timestamp = datetime.now(timezone.utc).isoformat()
     session_path.write_text(
         f"# Session: {session_id}\n"
@@ -1857,6 +1944,25 @@ async def _run_codex_once(
         "-c", "agents.enabled=false",
         "-c", "features.multi_agent=false",
         "-c", "features.multi_agent_v2=false",
+        # --- Network + secrets hygiene (v2.2; every key verified on 0.153.1 and
+        # 0.157.0 under --strict-config) ---
+        # Fail fast when OpenAI is unreachable (blocked egress, proxy policy,
+        # outage). By default Codex retries forever ("Reconnecting... waiting
+        # for network"), so a blocked host burned the full timeout and surfaced
+        # as a generic timeout instead of the network error.
+        "-c", "features.unbounded_connection_retries=false",
+        # No telemetry, plugin-catalog or app traffic: the model endpoint is the
+        # only host Codex needs, which keeps sandbox/proxy allowlists minimal.
+        # Plugins and apps are also instruction/tool surfaces this boundary
+        # keeps out, like the user config ignored above.
+        "-c", "analytics.enabled=false",
+        "-c", 'otel.metrics_exporter="none"',
+        "-c", "features.plugins=false",
+        "-c", "features.apps=false",
+        # Codex hands its whole env to the commands its model runs unless told
+        # otherwise; this drops *KEY*/*SECRET*/*TOKEN* vars (CODEX_API_KEY,
+        # CODEX_ACCESS_TOKEN) from them.
+        "-c", "shell_environment_policy.ignore_default_excludes=false",
         "-m", model,
         "-c", f"model_reasoning_effort={reasoning_effort}",
         "-c", f"model_reasoning_summary={reasoning_summary}",
@@ -1912,7 +2018,7 @@ async def _run_codex_once(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
-            env=_sanitized_codex_env(),
+            env=_sanitized_codex_env(codex_auth=True),
             start_new_session=True,  # own process group -> clean tree termination
         )
         stdout, stderr = await asyncio.wait_for(
@@ -2014,6 +2120,9 @@ async def _run_codex_once(
                 f"rejected it; installed: v{installed}). Update to >= v{MIN_CODEX_VERSION}:\n"
                 f"  {CODEX_INSTALL_CMD}\nthen retry."
             )
+        network_error = _network_error_message(err_msg)
+        if network_error:
+            return network_error
         if "not authenticated" in err_msg.lower() or "login" in err_msg.lower():
             return (
                 f"{ERROR_PREFIX}Codex is not authenticated. Run:\n"
@@ -2677,6 +2786,7 @@ async def codex_collab(params: CollaborateInput) -> str:
                 if recap_path and not recap_result.startswith(ERROR_PREFIX):
                     try:
                         recap_path.parent.mkdir(parents=True, exist_ok=True)
+                        _ensure_claudex_ignored(recap_path.parent.parent)
                         recap_path.write_text(recap_result)
                         logger.info("Auto-recap saved: %s", recap_path.name)
                     except OSError as exc:
@@ -2994,6 +3104,7 @@ async def codex_recap(params: RecapInput) -> str:
         if recap_path:
             try:
                 recap_path.parent.mkdir(parents=True, exist_ok=True)
+                _ensure_claudex_ignored(recap_path.parent.parent)
                 recap_path.write_text(result)
                 result += f"\n\nDecision record saved to: .claudex/recaps/{recap_path.name}"
             except OSError as exc:
@@ -3228,6 +3339,11 @@ async def codex_status(params: StatusInput) -> str:
     active_roots = _allowed_roots()
     if active_roots:
         lines.append(f"Roots:         {os.pathsep.join(str(r) for r in active_roots)}")
+        if _roots_are_cloud_default():
+            lines.append(
+                f"               (Claude Code cloud session default: {PROJECT_DIR_ENV}; "
+                f"set {ALLOWED_ROOTS_ENV} to override)"
+            )
         if _roots_span_filesystem():
             lines.append("               (confinement NOMINAL — a root spans the whole filesystem or home; narrow it)")
         if any(_UNEXPANDED_TEMPLATE_RE.fullmatch(p.strip()) for p in raw_roots.split(os.pathsep)):
@@ -3417,11 +3533,17 @@ async def codex_ping(params: Optional[PingInput] = None) -> str:
                 codex_path, "login", "status",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=_sanitized_codex_env(),
+                env=_sanitized_codex_env(codex_auth=True),
             )
             out, err = await asyncio.wait_for(auth_proc.communicate(), timeout=10)
             if auth_proc.returncode == 0:
                 auth = "logged in"
+            elif os.environ.get("CODEX_API_KEY"):
+                # `codex login status` never reads CODEX_API_KEY; `codex exec` does.
+                auth = (
+                    "API key from CODEX_API_KEY (environment; model_test=true "
+                    "validates it)"
+                )
             else:
                 text = (out + err).decode(errors="replace").strip()
                 detail = text.splitlines()[-1] if text else "not logged in"
@@ -3448,6 +3570,10 @@ async def codex_ping(params: Optional[PingInput] = None) -> str:
             lines.append(
                 f"Roots:       {len(roots)} configured — confinement NOMINAL "
                 "(a root spans the whole filesystem or home; narrow it)"
+            )
+        elif roots and _roots_are_cloud_default():
+            lines.append(
+                f"Roots:       cloud session default ({roots[0]}) — confinement active"
             )
         elif roots:
             lines.append(f"Roots:       {len(roots)} configured — confinement active")
@@ -3728,6 +3854,7 @@ def _write_job_file(job_id: str, *, status_only: bool = False) -> None:
         return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_claudex_ignored(path.parent.parent)
         try:
             os.chmod(path.parent, 0o700)
         except OSError:
