@@ -1,4 +1,4 @@
-# Claudex — Claude Code Plugin <sup>v2.2.0</sup>
+# Claudex — Claude Code Plugin <sup>v2.3.0</sup>
 
 Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, security-testing, debugging, verification, and decision support.
 
@@ -165,8 +165,8 @@ the environment once (claude.ai/code → environment settings):
    - **API key** — environment variable `CODEX_API_KEY=sk-...`. No per-session
      step; billed to your OpenAI API account. Anyone who uses the environment,
      Claude included, can read environment variables.
-   - **ChatGPT plan** — per session, ask Claude to run `codex login --device-auth`
-     in the background and give you the URL and code to approve (enable device
+   - **ChatGPT plan** — once per session, run **`/codex:login`**: you get a link and
+     a one-time code to approve on your phone, and Codex is ready (enable device
      code login under ChatGPT Settings → Security first). Don't copy your local
      `~/.codex/auth.json` instead: refresh tokens are single-use, so the second
      machine to refresh logs the other one out.
@@ -190,6 +190,7 @@ with no setup.
 | `/codex:recap [session_id]` | Generate a decision record from a collaboration session |
 | `/codex:review [files]` | Get a focused code review from Codex on specific files |
 | `/codex:review-diff [focus]` | Get Codex to review your git diff before committing |
+| `/codex:login` | Sign Codex in to ChatGPT with a one-time code — no browser needed (cloud sessions, SSH) |
 | `/codex:status` | Show Claudex diagnostics (zero Codex cost) |
 | `/codex:help` | Quick start guide |
 | `/codex:doctor` | Diagnose and fix Claudex issues |
@@ -240,6 +241,7 @@ to 60s): use `codex_submit` / `codex_result` — see Async jobs below.
 | `codex_recap` | Generate decision record from a session | Technical Writer |
 | `codex_status` | Show Claudex diagnostics (no Codex call, zero cost) | — |
 | `codex_ping` | Test that Codex is installed and working | — |
+| `codex_login` | Sign Codex in with a device code (link + one-time code; completes in the background) | — |
 | `codex_submit` | Run any tool above as a background job — returns a job_id in <1s | (delegates) |
 | `codex_result` | Collect a background job's status/result (zero Codex cost) | — |
 
@@ -404,7 +406,8 @@ Claudex/
 │   ├── review-diff.md       # /codex:review-diff
 │   ├── status.md            # /codex:status
 │   ├── help.md              # /codex:help
-│   └── doctor.md            # /codex:doctor
+│   ├── doctor.md            # /codex:doctor
+│   └── login.md             # /codex:login
 ├── skills/
 │   └── claudex/
 │       └── SKILL.md         # Auto-triggers during plan mode
@@ -430,7 +433,7 @@ Claudex/
 |---------|-----|
 | "Codex CLI not found" | `npm i -g @openai/codex` |
 | "Codex CLI is too old for model 'gpt-6-astra'" | `npm i -g @openai/codex@latest` — needs ≥ 0.153.1 |
-| "Not authenticated" | `codex login` (cloud session: set `CODEX_API_KEY`, or `codex login --device-auth`) |
+| "Codex is not signed in" | `/codex:login` (or `codex login` in a terminal; cloud: `CODEX_API_KEY` also works) |
 | "A network policy blocked Codex's connection to <host>" | Allow that host in your sandbox's network settings (Claude Code cloud: environment → Network access), then start a new session |
 | "Rate limit reached" | Wait for 5-hour window reset |
 | Timeout | Narrow `focus_files` or raise `timeout_seconds` (lowering `reasoning_effort` is a last resort) |

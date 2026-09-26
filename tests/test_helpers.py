@@ -3200,6 +3200,158 @@ class TestCloudSessions:
 
 
 # =========================================================================
+# v2.3 — /codex:login (device-code sign-in without a browser)
+# =========================================================================
+
+class TestCodexLogin:
+    PROMPT = (
+        "\nWelcome to Codex [v\x1b[90m0.157.0\x1b[0m]\n"
+        "\x1b[90mOpenAI's command-line coding agent\x1b[0m\n\n"
+        "Follow these steps to sign in with ChatGPT using device code authorization:\n\n"
+        "1. Open this link in your browser and sign in to your account\n"
+        "   \x1b[94mhttps://auth.openai.com/codex/device\x1b[0m\n\n"
+        "2. Enter this one-time code \x1b[90m(expires in 15 minutes)\x1b[0m\n"
+        "   \x1b[94mXPVP-N3KGO\x1b[0m\n\n"
+        "\x1b[90mContinue only if you started this login in Codex.\x1b[0m\n"
+    )
+
+    def _fake_codex(self, tmp_path, device_body=None):
+        """A `codex` that answers `login status` from a marker file (the user's
+        approval) and prints the real device prompt for `login --device-auth`."""
+        approved = tmp_path / "approved"
+        prompt = tmp_path / "prompt.txt"
+        prompt.write_text(self.PROMPT)
+        body = device_body or f'cat "{prompt}"; sleep 30'
+        script = tmp_path / "codex"
+        script.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = login ] && [ "$2" = status ]; then\n'
+            f'  if [ -f "{approved}" ]; then echo "Logged in using ChatGPT"; exit 0; fi\n'
+            '  echo "Not logged in" >&2; exit 1\n'
+            "fi\n"
+            'if [ "$1" = login ] && [ "$2" = --device-auth ]; then\n'
+            f"  {body}\n"
+            "fi\n"
+            "exit 2\n"
+        )
+        script.chmod(0o755)
+        return str(script), approved
+
+    def test_parse_device_prompt(self):
+        import server as srv
+        url, code = srv._parse_device_prompt(self.PROMPT)
+        assert url == "https://auth.openai.com/codex/device"
+        assert code == "XPVP-N3KGO"
+
+    def test_parse_refuses_foreign_urls(self):
+        import server as srv
+        for bad in ("https://evil.example/codex/device",
+                    "https://auth.openai.com.evil.example/codex/device",
+                    "http://auth.openai.com/codex/device"):
+            url, _ = srv._parse_device_prompt(self.PROMPT.replace("https://auth.openai.com/codex/device", bad))
+            assert url is None, bad
+
+    @pytest.mark.asyncio
+    async def test_full_flow_code_then_pending_then_signed_in(self, tmp_path, monkeypatch):
+        import server as srv
+        monkeypatch.delenv("CODEX_API_KEY", raising=False)
+        codex, approved = self._fake_codex(tmp_path)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: codex)
+        try:
+            first = await srv.codex_login(srv.LoginInput())
+            assert "https://auth.openai.com/codex/device" in first
+            assert "XPVP-N3KGO" in first
+            assert not first.startswith("Error:")
+            proc = srv._device_login["proc"]
+            assert proc is not None and proc.returncode is None
+
+            again = await srv.codex_login(srv.LoginInput())
+            assert "Still waiting" in again and "XPVP-N3KGO" in again
+            assert srv._device_login["proc"] is proc, "a pending login is reused, not restarted"
+
+            approved.write_text("yes")  # the user approved on their phone
+            done = await srv.codex_login(srv.LoginInput())
+            assert "signed in" in done and "Logged in using ChatGPT" in done
+            assert srv._device_login["proc"] is None
+            assert proc.returncode is not None, "the device login is stopped once signed in"
+        finally:
+            await srv._stop_device_login()
+
+    @pytest.mark.asyncio
+    async def test_restart_gives_a_fresh_login(self, tmp_path, monkeypatch):
+        import server as srv
+        monkeypatch.delenv("CODEX_API_KEY", raising=False)
+        codex, _ = self._fake_codex(tmp_path)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: codex)
+        try:
+            await srv.codex_login(srv.LoginInput())
+            old = srv._device_login["proc"]
+            out = await srv.codex_login(srv.LoginInput(restart=True))
+            assert "Sign Codex in" in out
+            new = srv._device_login["proc"]
+            assert new is not old and old.returncode is not None
+        finally:
+            await srv._stop_device_login()
+
+    @pytest.mark.asyncio
+    async def test_already_signed_in_starts_nothing(self, tmp_path, monkeypatch):
+        import server as srv
+        codex, approved = self._fake_codex(tmp_path)
+        approved.write_text("yes")
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: codex)
+        out = await srv.codex_login(srv.LoginInput())
+        assert "signed in" in out and srv._device_login["proc"] is None
+
+    @pytest.mark.asyncio
+    async def test_env_api_key_needs_no_sign_in(self, tmp_path, monkeypatch):
+        import server as srv
+        monkeypatch.setenv("CODEX_API_KEY", "sk-codex")
+        codex, _ = self._fake_codex(tmp_path)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: codex)
+        out = await srv.codex_login(srv.LoginInput())
+        assert "CODEX_API_KEY" in out and "sk-codex" not in out
+        assert srv._device_login["proc"] is None
+
+    @pytest.mark.asyncio
+    async def test_blocked_auth_host_names_the_fix(self, tmp_path, monkeypatch):
+        import server as srv
+        monkeypatch.delenv("CODEX_API_KEY", raising=False)
+        codex, _ = self._fake_codex(tmp_path, device_body=(
+            'echo "Error logging in with device code: error sending request for url '
+            '(https://auth.openai.com/api/accounts/deviceauth/usercode)"; exit 1'
+        ))
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: codex)
+        out = await srv.codex_login(srv.LoginInput())
+        assert out.startswith("Error:") and "auth.openai.com" in out and "Network access" in out
+        assert srv._device_login["proc"] is None
+
+    @pytest.mark.asyncio
+    async def test_missing_cli(self, monkeypatch):
+        import server as srv
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: "codex")
+        monkeypatch.setattr(srv.shutil, "which", lambda name: None)
+        out = await srv.codex_login(srv.LoginInput())
+        assert out.startswith("Error:") and "/codex:login" in out
+
+    @pytest.mark.asyncio
+    async def test_ping_points_to_codex_login(self, tmp_path, monkeypatch):
+        import server as srv
+        monkeypatch.delenv("CODEX_API_KEY", raising=False)
+        codex, _ = self._fake_codex(tmp_path)
+        monkeypatch.setattr(srv, "_find_codex_bin", lambda: codex)
+        _reset_version_cache(warning="", resolved=True)
+        out = await srv.codex_ping(srv.PingInput())
+        assert "Not logged in — run /codex:login" in out
+        _reset_version_cache()
+
+    def test_command_is_wired_to_the_tool(self):
+        text = (PROJECT_ROOT / "commands" / "login.md").read_text()
+        front = text.split("---")[1]
+        assert "name: login" in front
+        assert "mcp__plugin_codex_codex__codex_login" in front
+
+
+# =========================================================================
 # Entry point for uv run --script
 # =========================================================================
 

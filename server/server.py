@@ -31,6 +31,7 @@ Requires:
 """
 
 import asyncio
+import atexit
 import json
 import math
 import os
@@ -1900,8 +1901,7 @@ async def _run_codex_once(
         return (
             f"{ERROR_PREFIX}Codex CLI not found. Install it with:\n"
             "  npm i -g @openai/codex\n"
-            "Then authenticate:\n"
-            "  codex login"
+            "Then sign in: /codex:login (or `codex login` in a terminal)"
         )
 
     # Reserve one execution from the durable daily cap at the SINGLE real
@@ -2053,8 +2053,7 @@ async def _run_codex_once(
         return (
             f"{ERROR_PREFIX}Codex CLI not found. Install it with:\n"
             "  npm i -g @openai/codex\n"
-            "Then authenticate:\n"
-            "  codex login"
+            "Then sign in: /codex:login (or `codex login` in a terminal)"
         )
     except OSError as exc:
         return f"{ERROR_PREFIX}Failed to start Codex: {exc}"
@@ -2125,9 +2124,8 @@ async def _run_codex_once(
             return network_error
         if "not authenticated" in err_msg.lower() or "login" in err_msg.lower():
             return (
-                f"{ERROR_PREFIX}Codex is not authenticated. Run:\n"
-                "  codex login\n"
-                "to sign in with your ChatGPT subscription."
+                f"{ERROR_PREFIX}Codex is not signed in. Run /codex:login (a one-time "
+                "code, no browser needed), or `codex login` in a terminal."
             )
         if "rate limit" in err_msg.lower() or "429" in err_msg:
             return (
@@ -3332,7 +3330,7 @@ async def codex_status(params: StatusInput) -> str:
         f"(levels: {', '.join(e.value for e in ReasoningEffort)})"
     )
     lines.append(f"Timeout:       {EXEC_TIMEOUT_SECONDS}s (default, per-tool overrides available)")
-    lines.append(f"Tools:         12 (8 Codex-calling + codex_submit/codex_result + codex_status + codex_ping)")
+    lines.append(f"Tools:         13 (8 Codex-calling + codex_submit/codex_result + codex_status + codex_ping + codex_login)")
 
     # --- Workspace confinement (v1.8.2) ---
     raw_roots = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
@@ -3512,7 +3510,7 @@ async def codex_ping(params: Optional[PingInput] = None) -> str:
         return (
             "Codex CLI not found in PATH.\n"
             "Install: npm i -g @openai/codex\n"
-            "Auth:    codex login"
+            "Sign in: /codex:login"
         )
 
     if not params.model_test:
@@ -3526,41 +3524,15 @@ async def codex_ping(params: Optional[PingInput] = None) -> str:
         if min_warn:
             lines.append(min_warn.strip())
 
-        auth = "unknown"
-        auth_proc = None
-        try:
-            auth_proc = await asyncio.create_subprocess_exec(
-                codex_path, "login", "status",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_sanitized_codex_env(codex_auth=True),
-            )
-            out, err = await asyncio.wait_for(auth_proc.communicate(), timeout=10)
-            if auth_proc.returncode == 0:
-                auth = "logged in"
-            elif os.environ.get("CODEX_API_KEY"):
-                # `codex login status` never reads CODEX_API_KEY; `codex exec` does.
-                auth = (
-                    "API key from CODEX_API_KEY (environment; model_test=true "
-                    "validates it)"
-                )
-            else:
-                text = (out + err).decode(errors="replace").strip()
-                detail = text.splitlines()[-1] if text else "not logged in"
-                auth = f"{detail} — run: codex login"  # always carry the fix
-        except asyncio.TimeoutError:
-            auth = "check timed out (codex login status hung)"
-        except OSError as e:
-            auth = f"check failed ({e})"
-        finally:
-            # A timed-out communicate() leaves the child running — kill + reap it
-            # so repeated health checks can't accumulate orphaned processes.
-            if auth_proc is not None and auth_proc.returncode is None:
-                try:
-                    auth_proc.kill()
-                    await asyncio.wait_for(auth_proc.wait(), timeout=2)
-                except (ProcessLookupError, OSError, asyncio.TimeoutError):
-                    pass
+        state, detail = await _codex_auth_state(codex_path)
+        if state == "ok":
+            auth = "logged in"
+        elif state == "env-key":
+            auth = "API key from CODEX_API_KEY (environment; model_test=true validates it)"
+        elif state == "missing":
+            auth = f"{detail} — run /codex:login"  # always carry the fix
+        else:
+            auth = detail
         lines.append(f"Auth:        {auth}")
 
         lines.append(f"Run cap:     {_run_cap_status_value()}")
@@ -3615,6 +3587,244 @@ async def codex_ping(params: Optional[PingInput] = None) -> str:
             )
         return result
     return f"Codex model round-trip OK.\nResponse: {result.strip()[:200]}"
+
+
+# ---------------------------------------------------------------------------
+# Codex sign-in without a browser — device code (v2.3)
+# ---------------------------------------------------------------------------
+# `codex login` opens a browser, which a Claude Code cloud session (or an SSH
+# box) doesn't have. `codex login --device-auth` prints a URL + one-time code
+# and polls until the user approves it on another device, for up to 15 min.
+# codex_login runs that in the background of this persistent server process and
+# returns the URL + code as soon as Codex prints them. Codex writes its own
+# auth.json on approval; Claudex never touches it.
+
+DEVICE_LOGIN_TTL_SECONDS = 15 * 60   # Codex's device-code lifetime
+DEVICE_PROMPT_WAIT_SECONDS = 20      # max wait for Codex to print the code
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# The URL the user is told to open comes from whatever `codex` resolves to, so
+# only OpenAI's own domains are relayed.
+_DEVICE_URL_RE = re.compile(
+    r"https://(?:[a-z0-9-]+\.)*(?:openai\.com|chatgpt\.com)/[^\s]*"
+)
+_DEVICE_CODE_RE = re.compile(
+    r"one-time code[^\n]*\n\s*([A-Z0-9]{3,12}(?:-[A-Z0-9]{3,12})+)\s*$", re.MULTILINE
+)
+_device_login: dict = {"proc": None, "task": None, "url": None, "code": None,
+                       "started": 0.0, "output": ""}
+
+
+async def _codex_auth_state(codex_path: str) -> tuple[str, str]:
+    """(state, detail) from `codex login status`, without a model call.
+
+    state: "ok" (logged in), "env-key" (CODEX_API_KEY set; `codex login status`
+    never reads it but `codex exec` does), "missing" (not logged in; detail is
+    Codex's own message) or "unknown" (the check itself failed).
+    """
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            codex_path, "login", "status",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_sanitized_codex_env(codex_auth=True),
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=10)
+        text = _ANSI_RE.sub("", (out + err).decode(errors="replace")).strip()
+        lines = [ln for ln in text.splitlines() if ln and not ln.startswith("WARNING:")]
+        if proc.returncode == 0:
+            return "ok", lines[-1] if lines else "logged in"
+        if os.environ.get("CODEX_API_KEY"):
+            return "env-key", "CODEX_API_KEY"
+        return "missing", lines[-1] if lines else "not logged in"
+    except asyncio.TimeoutError:
+        return "unknown", "check timed out (codex login status hung)"
+    except OSError as e:
+        return "unknown", f"check failed ({e})"
+    finally:
+        # A timed-out communicate() leaves the child running — kill + reap it
+        # so repeated checks can't accumulate orphaned processes.
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except (ProcessLookupError, OSError, asyncio.TimeoutError):
+                pass
+
+
+def _parse_device_prompt(text: str) -> tuple[Optional[str], Optional[str]]:
+    """(url, code) from `codex login --device-auth` output; None where absent."""
+    clean = _ANSI_RE.sub("", text)
+    url = _DEVICE_URL_RE.search(clean)
+    code = _DEVICE_CODE_RE.search(clean)
+    return (url.group(0) if url else None, code.group(1) if code else None)
+
+
+def _device_login_pending() -> bool:
+    proc = _device_login["proc"]
+    return (
+        proc is not None
+        and proc.returncode is None
+        and bool(_device_login["code"])
+        and time.monotonic() - _device_login["started"] < DEVICE_LOGIN_TTL_SECONDS
+    )
+
+
+async def _drain_device_login(proc) -> None:
+    """Keep reading the login's output (the pipe must never fill) until it exits."""
+    try:
+        while True:
+            chunk = await proc.stdout.read(4096)
+            if not chunk:
+                break
+            _device_login["output"] = (
+                _device_login["output"] + chunk.decode(errors="replace")
+            )[-16_384:]
+        await proc.wait()
+    except (OSError, ValueError, asyncio.CancelledError):
+        pass
+
+
+async def _stop_device_login() -> None:
+    """Kill a running device login (its whole process group) and forget it."""
+    proc = _device_login["proc"]
+    if proc is not None and proc.returncode is None:
+        try:
+            if proc.pid > 1:
+                os.killpg(proc.pid, 9)  # start_new_session=True: pgid == pid
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except (ProcessLookupError, OSError):
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except (asyncio.TimeoutError, ProcessLookupError, OSError):
+            pass
+    task = _device_login["task"]
+    if task is not None and not task.done():
+        task.cancel()
+    _device_login.update(proc=None, task=None, url=None, code=None, started=0.0, output="")
+
+
+def _kill_device_login_at_exit() -> None:
+    """Don't leave a pending sign-in polling after the server exits."""
+    proc = _device_login["proc"]
+    if proc is not None and proc.returncode is None and proc.pid > 1:
+        try:
+            os.killpg(proc.pid, 9)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+atexit.register(_kill_device_login_at_exit)
+
+
+def _device_prompt_message(pending: bool) -> str:
+    left = max(1, math.ceil(
+        (DEVICE_LOGIN_TTL_SECONDS - (time.monotonic() - _device_login["started"])) / 60
+    ))
+    head = f"Still waiting for approval ({left} min left):" if pending else "Sign Codex in to ChatGPT:"
+    return (
+        f"{head}\n"
+        f"  1. Open {_device_login['url']}\n"
+        f"  2. Enter code: {_device_login['code']}   (expires in {left} min)\n"
+        "Codex is ready once you approve. If the page rejects the code, enable device "
+        "code login in ChatGPT -> Settings -> Security."
+    )
+
+
+class LoginInput(BaseModel):
+    """Input for codex_login — device-code sign-in (no model call)."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    restart: bool = Field(
+        default=False,
+        description="Cancel a pending sign-in and start over with a new code.",
+    )
+
+
+@mcp.tool(
+    name="codex_login",
+    annotations={
+        "title": "Sign Codex in (device code)",
+        "readOnlyHint": False,  # starts a background sign-in; Codex writes auth.json
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,  # talks to auth.openai.com
+    },
+)
+async def codex_login(params: Optional[LoginInput] = None) -> str:
+    """Sign Codex in to a ChatGPT account with a one-time code — no browser needed.
+
+    Use when Codex is not logged in: always in a fresh Claude Code cloud session.
+    Returns a link and a code for the user to approve on any device; the sign-in
+    then completes in the background. Free: no model call, no quota use. Call it
+    again to check progress or re-show a pending code; restart=true for a new code.
+    """
+    params = params or LoginInput()
+    codex_path = _find_codex_bin()
+    if codex_path == "codex" and not shutil.which("codex"):
+        return (
+            f"{ERROR_PREFIX}Codex CLI not found. Install it with:\n"
+            f"  {CODEX_INSTALL_CMD}\nthen run /codex:login again."
+        )
+
+    if params.restart:
+        await _stop_device_login()
+    else:
+        if _device_login_pending():
+            state, _ = await _codex_auth_state(codex_path)
+            if state != "ok":
+                return _device_prompt_message(pending=True)
+            await _stop_device_login()
+        state, detail = await _codex_auth_state(codex_path)
+        if state == "ok":
+            return f"Codex is signed in ({detail}). Nothing to do."
+        if state == "env-key":
+            return (
+                "Codex uses the API key in CODEX_API_KEY, so no sign-in is needed. "
+                "(Pass restart=true to sign in with ChatGPT anyway; the env key "
+                "still takes precedence while it is set.)"
+            )
+        await _stop_device_login()  # clear a finished/expired attempt
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            codex_path, "login", "--device-auth",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=_sanitized_codex_env(),
+            start_new_session=True,  # own process group -> clean kill on restart
+        )
+    except OSError as exc:
+        return f"{ERROR_PREFIX}Failed to start Codex sign-in: {exc}"
+    _device_login.update(proc=proc, url=None, code=None,
+                         started=time.monotonic(), output="")
+    _device_login["task"] = asyncio.create_task(_drain_device_login(proc))
+
+    deadline = time.monotonic() + DEVICE_PROMPT_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        url, code = _parse_device_prompt(_device_login["output"])
+        if url and code:
+            _device_login.update(url=url, code=code)
+            return _device_prompt_message(pending=False)
+        if proc.returncode is not None:
+            break
+        await asyncio.sleep(0.2)
+
+    tail = _ANSI_RE.sub("", _device_login["output"]).strip()[-1500:]
+    await _stop_device_login()
+    lowered = tail.lower()
+    if "error sending request" in lowered or "connect" in lowered or "403" in lowered:
+        return (
+            f"{ERROR_PREFIX}Codex couldn't reach auth.openai.com to start the "
+            "sign-in. Allow auth.openai.com and chatgpt.com in your sandbox's "
+            "network settings (Claude Code cloud: environment settings -> Network "
+            f"access -> Custom), then start a new session.\nCodex said: {tail}"
+        )
+    return f"{ERROR_PREFIX}Codex didn't print a sign-in code.\nCodex said: {tail or '(nothing)'}"
 
 
 # ---------------------------------------------------------------------------
