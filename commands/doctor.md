@@ -2,7 +2,7 @@
 name: doctor
 description: "Diagnose and fix Claudex issues — checks prerequisites, auth, connectivity, and common problems"
 argument-hint: ""
-allowed-tools: Read, Glob, Grep, Bash(which:*), Bash(codex --version), Bash(du:*), mcp__plugin_codex_codex__codex_ping
+allowed-tools: Read, Glob, Grep, Bash(which:*), Bash(codex --version), Bash(du:*), mcp__plugin_codex_codex__codex_ping, mcp__plugin_codex_codex__codex_login
 ---
 
 # Claudex Doctor
@@ -26,12 +26,11 @@ Run through these diagnostic checks in order. Stop at the first failure and help
 3. **Codex authenticated + Claudex healthy?**
    - Run `codex_ping` (default = FREE health check: binary, version, auth
      status, quota state DB, confinement readiness — no model call)
-   - If auth shows not logged in: tell user to run `codex login`. In a Claude Code
-     cloud session (`CLAUDE_CODE_REMOTE=true`) there is no browser: either the
-     environment sets `CODEX_API_KEY` (ping then shows "API key from CODEX_API_KEY"),
-     or run `codex login --device-auth` in the background and give the user the URL
-     and one-time code it prints (device code login must be enabled in their
-     ChatGPT security settings). Never print an API key.
+   - If auth shows not logged in: run `/codex:login` (calls `codex_login`: a link and
+     a one-time code the user approves on any device; works without a browser, e.g.
+     in Claude Code cloud sessions). In a terminal, `codex login` also works. If the
+     environment sets `CODEX_API_KEY`, ping shows "API key from CODEX_API_KEY" and no
+     sign-in is needed. Never print an API key.
    - If roots show NOT CONFIGURED: point to README → "Workspace confinement
      (required)" — every call is denied until roots are set (v2.0). Cloud sessions
      default to the project directory ("cloud session default")

@@ -31,11 +31,11 @@ There is no build system, no linter configured. Dependencies are declared inline
 uv run --script tests/test_helpers.py
 ```
 
-Tests (240 total) cover GPT-6 Astra alignment (defaults, effort ladder, operating contract, CLI-floor error mapping), security-critical helpers (`_safe_claudex_path`, `_normalize_file_list`), session management, Pydantic model validation, auto-session-ID generation, timeout constants, model/reasoning_summary validation, metrics, session chaining, `ReviewDiffInput`, backward compatibility, structured output schemas, review formatters, `_build_review_system` toggle, `structured_output` field validation, structured output integration (mock-based), temp file lifecycle, formatter edge cases, and error handling fixes (stderr fallback, timeout cleanup, OSError catch, version warning masking, schema write errors), and Claude Code cloud sessions (cloud-default roots, codex-auth env passthrough, network-hygiene flags, proxy-block error mapping, self-ignoring `.claudex/`, `.mcp.json` timeout). Test file uses PEP 723 inline metadata (same pattern as `server.py`).
+Tests (250 total) cover GPT-6 Astra alignment (defaults, effort ladder, operating contract, CLI-floor error mapping), security-critical helpers (`_safe_claudex_path`, `_normalize_file_list`), session management, Pydantic model validation, auto-session-ID generation, timeout constants, model/reasoning_summary validation, metrics, session chaining, `ReviewDiffInput`, backward compatibility, structured output schemas, review formatters, `_build_review_system` toggle, `structured_output` field validation, structured output integration (mock-based), temp file lifecycle, formatter edge cases, and error handling fixes (stderr fallback, timeout cleanup, OSError catch, version warning masking, schema write errors), and Claude Code cloud sessions (cloud-default roots, codex-auth env passthrough, network-hygiene flags, proxy-block error mapping, self-ignoring `.claudex/`, `.mcp.json` timeout), and `codex_login` (device-prompt parsing + URL allowlist, pending/restart/approved flow against a fake CLI, network-failure mapping). Test file uses PEP 723 inline metadata (same pattern as `server.py`).
 
 ## Architecture
 
-**Single-file server** — all logic lives in `server/server.py` (~4000 lines). It's a FastMCP server (`FastMCP("codex")`) that exposes 12 tools:
+**Single-file server** — all logic lives in `server/server.py` (~4000 lines). It's a FastMCP server (`FastMCP("codex")`) that exposes 13 tools:
 
 | Tool | Purpose | Codex Persona |
 |------|---------|---------------|
@@ -49,6 +49,7 @@ Tests (240 total) cover GPT-6 Astra alignment (defaults, effort ladder, operatin
 | `codex_recap` | Decision record generation from a session | Technical Writer |
 | `codex_status` | Diagnostics dashboard (no Codex call, zero cost) | N/A |
 | `codex_ping` | Connectivity test | N/A |
+| `codex_login` | Device-code sign-in (link + one-time code; background process in the server, v2.3) | N/A |
 | `codex_submit` | Run any Codex tool as a background job (async layer, v1.7) | (delegates) |
 | `codex_result` | Poll/collect a background job; disk fallback after restart | N/A |
 

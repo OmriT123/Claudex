@@ -75,6 +75,7 @@ After completing a multi-round collab session → suggest `codex_recap` to gener
 | `codex_recap` | Generate a decision record summarizing a session. | **Technical Writer** — clear, concise, decision-focused documentation |
 | `codex_status` | Show Claudex diagnostics (no Codex call, zero subscription cost). | N/A |
 | `codex_ping` | Free health check by default (binary, version, auth, quota, confinement — no model call, no quota use). Pass `model_test=true` for a real Codex round-trip (consumes one run + OpenAI usage). | N/A (free) / 1 run (model_test) |
+| `codex_login` | Sign Codex in to ChatGPT with a one-time code, no browser needed (Claude Code cloud sessions, SSH). Returns a link + code for the user; completes in the background. Also `/codex:login`. | N/A (free) |
 | `codex_submit` | Run any Codex tool above as a background job — returns job_id in <1s. Same arguments as the synchronous tool, wrapped in `{"tool": ..., "arguments": {...}}`. | (delegates) |
 | `codex_result` | Poll or collect a background job (bounded wait_seconds ≤ 45; zero Codex cost). Results persist to `.claudex/jobs/<job_id>.md` and survive server restarts. | N/A |
 
@@ -319,6 +320,9 @@ Codex may produce file artifacts (code snippets, tests, analysis docs) written b
 4. Reference specific artifacts when presenting findings to the user
 
 ## Error Handling
+
+If a Codex tool says Codex is **not signed in**: call `codex_login` and give the user
+the link and code it returns verbatim; once they approve, retry the original call.
 
 If Codex fails (timeout, rate limit, empty response, error):
 1. **Inform the user** — be specific about what happened
