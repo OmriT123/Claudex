@@ -128,8 +128,9 @@ whichever way fits:
   account rather than from `HOME`/`APPDATA`, so a project that sets those
   variables cannot point Claudex at another file. It is never read from a
   project, and no MCP tool can change it. On macOS and Linux the file and its
-  folder must belong to you and must not be symlinks, and no folder leading to
-  it may be writable by other accounts; otherwise every folder is denied. On
+  folder must belong to you and must not be symlinks, and no folder traversed
+  on the way to it (through any symlink) may be writable by other accounts;
+  otherwise every folder is denied. On
   Windows only the file itself is checked, until the Windows port. Your home folder itself, filesystem roots
   and protected locations are refused. Revoking stops new calls and withholds
   job results still held in memory; a Codex run already in progress finishes.

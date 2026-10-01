@@ -899,33 +899,57 @@ def _check_private(st, what: str) -> None:
         raise OSError(errno.EPERM, f"{what} is writable by other accounts")
 
 
+def _check_safe_dir(d: Path, uid: int) -> None:
+    st = os.stat(d)
+    if st.st_uid not in (uid, 0):
+        raise OSError(errno.EPERM, f"{d} belongs to another account")
+    if st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX:
+        raise OSError(errno.EPERM, f"{d} is writable by other accounts")
+
+
 def _check_config_ancestors(path: Path) -> None:
-    """POSIX: every directory leading to the config folder, by name and after
-    resolving symlinks, must belong to this account or root and must not be
-    writable by other accounts (sticky directories such as /tmp excepted),
-    as ssh's StrictModes requires. Otherwise another account could move the
-    folder away (a revocation would read as "absent") or swap it (v2.4).
-    Checked even when the file does not exist yet.
+    """POSIX: resolve the config folder's path one component at a time from
+    `/`, following every symlink, and require each directory traversed to
+    belong to this account or root and not be writable by other accounts
+    (sticky directories such as /tmp excepted), as ssh's StrictModes does.
+    Otherwise another account could move the folder or a symlink hop away
+    (a revocation would read as "absent") or swap it (v2.4). A missing
+    component ends the walk: its parent was checked, so the absence is real.
     """
     if os.name == "nt":
         return
     uid = os.getuid()
-    start = path.parent
-    while not os.path.lexists(start) and start != start.parent:
-        start = start.parent
-    chain = [start, *start.parents]
-    real = Path(os.path.realpath(start))
-    chain += [real, *real.parents]
-    seen = set()
-    for d in chain:
-        if d in seen:
+    pending = list(Path(os.path.abspath(path.parent)).parts[1:])
+    cur = Path("/")
+    _check_safe_dir(cur, uid)
+    hops = 0
+    while pending:
+        name = pending.pop(0)
+        if name in ("", "."):
             continue
-        seen.add(d)
-        st = os.stat(d)
-        if st.st_uid not in (uid, 0):
-            raise OSError(errno.EPERM, f"{d} belongs to another account")
-        if st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX:
-            raise OSError(errno.EPERM, f"{d} is writable by other accounts")
+        if name == "..":
+            cur = cur.parent
+            continue
+        nxt = cur / name
+        try:
+            st = os.lstat(nxt)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(st.st_mode):
+            hops += 1
+            if hops > 40:
+                raise OSError(errno.ELOOP, "too many symlinks", str(path))
+            target = Path(os.readlink(nxt))
+            if target.is_absolute():
+                cur = Path("/")
+                pending = list(target.parts[1:]) + pending
+            else:
+                pending = list(target.parts) + pending
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(errno.ENOTDIR, "not a directory", str(nxt))
+        cur = nxt
+        _check_safe_dir(cur, uid)
 
 
 def _read_roots_config_bytes(path: Path) -> bytes:
@@ -1547,11 +1571,21 @@ def _claudex_ignore_state(claudex_dir: Path) -> str:
             return "missing"
         except OSError:
             return "unverified"
-        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
-            rules = [ln.strip() for ln in f.read(65_536).splitlines()
-                     if ln.strip() and not ln.strip().startswith("#")]
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read(65_537)
     finally:
         os.close(claudex_fd)
+    if len(raw) > 65_536:
+        return "unverified"
+    # Git semantics: '#' starts a comment only in column 0, leading spaces are
+    # part of a pattern, unescaped trailing spaces are ignored.
+    rules = []
+    for line in raw.decode("utf-8", errors="replace").split("\n"):
+        if line.startswith("#"):
+            continue
+        rule = line.rstrip(" ")
+        if rule:
+            rules.append(rule)
     return "ok" if rules == ["*"] else "unverified"
 
 

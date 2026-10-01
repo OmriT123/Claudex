@@ -30,8 +30,9 @@ neither a restart nor `/reload-plugins` clears it).
   or `APPDATA`, which a project's Claude Code settings could set for the
   server. Protected-folder checks cover both the account's home and `HOME`.
 - The config file and its folder must not be symlinks and must belong to
-  you, and no folder leading to it (by name or after resolving symlinks) may
-  be writable by other accounts, so nobody else can move a revocation away;
+  you, and no folder traversed on the way to it (through every symlink hop)
+  may be writable by other accounts, so nobody else can move a revocation
+  away;
   reads are bounded and non-blocking. A symlinked, dangling, oversized or
   otherwise unusable file, or an unsafe folder chain, denies every folder
   instead of counting as absent. The terminal command writes it relative to
@@ -63,8 +64,8 @@ neither a restart nor `/reload-plugins` clears it).
 - Prompts label the forwarded user request "as forwarded by Claude" (it may
   be an approved, task-specific version), not "verbatim".
 - `codex_status` warns when `.claudex/.gitignore` is missing or has any rule
-  other than `*` (a repository can bring its own, which Claudex never
-  overwrites).
+  other than `*`, read with git's own whitespace and comment rules (a
+  repository can bring its own, which Claudex never overwrites).
 
 ### Upgrading
 - Run `uv self update` first (all surfaces).

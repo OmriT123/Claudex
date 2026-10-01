@@ -4450,6 +4450,11 @@ class TestV24ConfigIntegrity:
         ("*\n!*\n", "unverified"),
         ("*\n!sessions/\n", "unverified"),
         ("# Created by Claudex\n*\n", "ok"),
+        (" *\n", "unverified"),
+        ("*  \n", "ok"),
+        ("*\r\n", "unverified"),
+        ("  # not a comment\n*\n", "unverified"),
+        ("*\n" + "#" * 70_000 + "\n", "unverified"),
     ])
     def test_gitignore_state_is_ok_only_for_exactly_star(self, tmp_path, body, state):
         import server as srv
@@ -4496,6 +4501,38 @@ class TestV24ConfigIntegrity:
         assert res.source == "config-error" and "writable by other accounts" in res.detail
         with pytest.raises(OSError):
             srv._write_roots_config({"deny_all": False, "allowed_roots": [str(tmp_path)]})
+
+    def test_chained_symlink_through_a_writable_folder_denies(self, tmp_path, monkeypatch):
+        # Codex red team 3: home/.config -> shared/hop -> safe/configs, with
+        # shared writable by others; removing hop used to read as "absent".
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        safe = tmp_path / "safe" / "configs" / "botique-claudex"; safe.mkdir(parents=True)
+        os.chmod(safe, 0o700)
+        shared = tmp_path / "shared"; shared.mkdir(); os.chmod(shared, 0o777)
+        (shared / "hop").symlink_to(tmp_path / "safe" / "configs")
+        home = tmp_path / "home"; home.mkdir()
+        (home / ".config").symlink_to(shared / "hop")
+        monkeypatch.setattr(srv, "_config_path", lambda: home / ".config" / "botique-claudex" / "config.json")
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        assert srv._roots_resolution().source == "config-error"
+        (shared / "hop").unlink()  # the other account removes the hop
+        res = srv._roots_resolution()
+        assert res.source == "config-error" and "writable by other accounts" in res.detail
+
+    def test_safe_symlinked_dotfiles_still_work(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        dots = tmp_path / "dotfiles" / "config"; dots.mkdir(parents=True)
+        home = tmp_path / "home"; home.mkdir()
+        (home / ".config").symlink_to(dots)
+        monkeypatch.setattr(srv, "_config_path", lambda: home / ".config" / "botique-claudex" / "config.json")
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        assert srv._load_roots_config()[0] == "absent"
+        srv._write_roots_config({"deny_all": False, "allowed_roots": [str(tmp_path)]})
+        assert srv._roots_resolution().source == "config-file"
 
     def test_symlink_inside_a_writable_folder_denies(self, tmp_path, monkeypatch):
         import server as srv
