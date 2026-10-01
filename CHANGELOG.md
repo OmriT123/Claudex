@@ -2,6 +2,44 @@
 
 All notable changes to Claudex. Versions follow the plugin manifest.
 
+## 3.0.0 (2026-10-01) - plugin renamed to `claudex`
+
+### Breaking
+- The plugin's name is now **`claudex`** (was `codex`), because OpenAI's own
+  Claude Code plugin is named `codex` and also ships `/codex:review` and
+  `/codex:status`. As a result:
+  - commands are **`/claudex:plan`, `/claudex:review-diff`, ...** (were `/codex:*`);
+  - plugin MCP tools are named **`mcp__plugin_claudex_codex__codex_*`** (were
+    `mcp__plugin_codex_codex__codex_*`);
+  - the skill registers as `claudex:codex`.
+- Unchanged: the tool names (`codex_plan`, `codex_submit`, ...), the MCP server
+  name `codex`, the skill name `codex`, `.claudex/`, every `CLAUDEX_*`
+  variable, the marketplace entry `claudex@omri-plugins`, your roots config,
+  and asking in plain words ("use Codex to review this").
+
+### Migration
+1. Update every copy you use, then reload:
+   - Claude Code: `/plugin marketplace update omri-plugins`, then
+     `/plugin update claudex@omri-plugins`, then `/reload-plugins`.
+   - claude.ai account plugin: syncs from GitHub; check Customize > Plugins
+     shows 3.0.0.
+   - Desktop extension: install `claudex.mcpb` 3.0.0, replacing the old one.
+2. If both `/codex:*` and `/claudex:*` appear, an old copy is still loaded:
+   update or remove it.
+3. Rename references in your own files: `/codex:` to `/claudex:` in notes and
+   CLAUDE.md, and `mcp__plugin_codex_codex__` to `mcp__plugin_claudex_codex__`
+   in permission rules (`permissions.allow`/`deny` in `~/.claude/settings.json`
+   and project settings), hook matchers and saved instructions. Bare tool names
+   (`codex_plan`) need no change.
+4. Claude Code keeps a daily execution counter per installed plugin: the copy
+   synced from your claude.ai account changes data folder with the rename
+   (`codex-synced` to `claudex-synced`), so its counter starts fresh. A local
+   `claudex@omri-plugins` install keeps its counter.
+
+### Added
+- README: three reproducible examples, Support section, troubleshooting for
+  the rename and the uv floor.
+
 ## 2.4.0 (2026-10-01) - folder setup for every Claude app, locked dependencies
 
 **Before updating: run `uv self update`.** Claudex now needs uv 0.11.4 or

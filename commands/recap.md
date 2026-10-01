@@ -1,8 +1,8 @@
 ---
 name: recap
 description: "Generate a decision record from a Codex collaboration session"
-argument-hint: "[session_id from /codex:status]"
-allowed-tools: Read, Glob, Bash(ls:*), mcp__plugin_codex_codex__codex_recap
+argument-hint: "[session_id from /claudex:status]"
+allowed-tools: Read, Glob, Bash(ls:*), mcp__plugin_claudex_codex__codex_recap
 ---
 
 # Recap a Session

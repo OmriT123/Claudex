@@ -2,7 +2,7 @@
 name: setup
 description: "Choose the folders Codex may work in (workspace roots) and check that Claudex is ready"
 argument-hint: "[folder ...]"
-allowed-tools: Bash(uv run --locked --script ${CLAUDE_PLUGIN_ROOT}/server/server.py --show-roots), Bash(uv --version), mcp__plugin_codex_codex__codex_status, mcp__plugin_codex_codex__codex_ping
+allowed-tools: Bash(uv run --locked --script ${CLAUDE_PLUGIN_ROOT}/server/server.py --show-roots), Bash(uv --version), mcp__plugin_claudex_codex__codex_status, mcp__plugin_claudex_codex__codex_ping
 ---
 
 # Claudex Setup
@@ -34,7 +34,7 @@ Help the user choose them once. Folders: $ARGUMENTS
 
 4. **Verify.** Call `codex_status` again and confirm the `Roots:` line lists the
    folders. Then `codex_ping` (free) for the Codex CLI and sign-in. If it says
-   not logged in, run `/codex:login`.
+   not logged in, run `/claudex:login`.
 
 5. **Tell the user how to switch Claudex off** on this computer at any time:
    `uv run --locked --script ${CLAUDE_PLUGIN_ROOT}/server/server.py --revoke-roots`

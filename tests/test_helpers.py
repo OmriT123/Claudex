@@ -3217,7 +3217,7 @@ class TestCloudSessions:
 
 
 # =========================================================================
-# v2.3 — /codex:login (device-code sign-in without a browser)
+# v2.3 — /claudex:login (device-code sign-in without a browser)
 # =========================================================================
 
 class TestCodexLogin:
@@ -3348,7 +3348,7 @@ class TestCodexLogin:
         monkeypatch.setattr(srv, "_find_codex_bin", lambda: "codex")
         monkeypatch.setattr(srv.shutil, "which", lambda name: None)
         out = await srv.codex_login(srv.LoginInput())
-        assert out.startswith("Error:") and "/codex:login" in out
+        assert out.startswith("Error:") and "/claudex:login" in out
 
     @pytest.mark.asyncio
     async def test_ping_points_to_codex_login(self, tmp_path, monkeypatch):
@@ -3358,14 +3358,14 @@ class TestCodexLogin:
         monkeypatch.setattr(srv, "_find_codex_bin", lambda: codex)
         _reset_version_cache(warning="", resolved=True)
         out = await srv.codex_ping(srv.PingInput())
-        assert "Not logged in — run /codex:login" in out
+        assert "Not logged in — run /claudex:login" in out
         _reset_version_cache()
 
     def test_command_is_wired_to_the_tool(self):
         text = (PROJECT_ROOT / "commands" / "login.md").read_text()
         front = text.split("---")[1]
         assert "name: login" in front
-        assert "mcp__plugin_codex_codex__codex_login" in front
+        assert "mcp__plugin_claudex_codex__codex_login" in front
 
 
 # =========================================================================
@@ -4805,6 +4805,44 @@ class TestV24Lockfile:
         r = subprocess.run(["bash", str(work / "desktop-extension" / "build.sh")],
                            capture_output=True, text=True, env=env)
         assert r.returncode != 0 and "server.py.lock missing" in r.stderr
+
+
+# =========================================================================
+# v3.0: plugin renamed codex -> claudex
+# =========================================================================
+
+class TestV3Rename:
+    def test_manifest_name_is_claudex(self):
+        pj = json.loads((PROJECT_ROOT / ".claude-plugin" / "plugin.json").read_text())
+        assert pj["name"] == "claudex"
+
+    def test_server_key_and_tool_names_unchanged(self):
+        import server as srv
+        mcp = json.loads((PROJECT_ROOT / ".mcp.json").read_text())
+        assert list(mcp) == ["codex"]
+        assert srv.mcp.name == "codex"
+        names = {t.name for t in srv.mcp._tool_manager.list_tools()}
+        assert {"codex_plan", "codex_submit", "codex_result", "codex_login"} <= names
+
+    def test_every_command_uses_the_new_tool_prefix(self):
+        for cmd in sorted((PROJECT_ROOT / "commands").glob("*.md")):
+            front = cmd.read_text().split("---")[1]
+            assert "mcp__plugin_codex_codex__" not in front, cmd.name
+            for tool in re.findall(r"mcp__plugin_[a-z]+_[a-z]+__\w+", front):
+                assert tool.startswith("mcp__plugin_claudex_codex__"), (cmd.name, tool)
+
+    def test_no_old_command_names_in_shipped_runtime_files(self):
+        shipped = [PROJECT_ROOT / "server" / "server.py", PROJECT_ROOT / "install.sh",
+                   PROJECT_ROOT / "cloud" / "setup.sh",
+                   *sorted((PROJECT_ROOT / "commands").glob("*.md")),
+                   *sorted((PROJECT_ROOT / "skills").rglob("SKILL.md"))]
+        for f in shipped:
+            assert "/codex:" not in f.read_text(), f.name
+
+    def test_skill_lives_in_skills_codex_and_keeps_its_name(self):
+        skill = PROJECT_ROOT / "skills" / "codex" / "SKILL.md"
+        assert skill.is_file() and not (PROJECT_ROOT / "skills" / "claudex").exists()
+        assert "\nname: codex\n" in skill.read_text().split("---")[1] + "\n"
 
 
 # =========================================================================

@@ -109,4 +109,4 @@ echo "  or: export CLAUDEX_ALLOWED_ROOTS=\"\$HOME/Projects\"  in your shell prof
 echo ""
 echo "  /mcp                            : verify codex tools are loaded"
 echo "  use codex_ping to test codex    : verify Codex connectivity"
-echo "  /codex:plan <your task>         : parallel planning with Codex"
+echo "  /claudex:plan <your task>         : parallel planning with Codex"

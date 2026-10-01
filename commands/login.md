@@ -2,7 +2,7 @@
 name: login
 description: "Sign Codex in to your ChatGPT account with a one-time code — no browser needed (Claude Code cloud sessions, SSH)"
 argument-hint: "[restart]"
-allowed-tools: mcp__plugin_codex_codex__codex_login
+allowed-tools: mcp__plugin_claudex_codex__codex_login
 ---
 
 # Codex Login

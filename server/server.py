@@ -64,7 +64,7 @@ from pydantic import BaseModel, Field, ConfigDict
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = "gpt-6-astra"  # GPT-6 Astra (v2.1); per-call `model` override stays
-SERVER_VERSION = "2.4.0"  # kept equal to plugin.json + desktop-extension/manifest.json (tested)
+SERVER_VERSION = "3.0.0"  # kept equal to plugin.json + desktop-extension/manifest.json (tested)
 DEFAULT_REASONING_EFFORT = "high"  # on every tool; Astra's own default is "medium"
 EXEC_TIMEOUT_SECONDS = 1200  # 20 min max per Codex call
 # Floor for the default model: older CLIs are rejected by the API (HTTP 400
@@ -2987,7 +2987,7 @@ async def _run_codex_once(
         return (
             f"{ERROR_PREFIX}Codex CLI not found. Install it with:\n"
             "  npm i -g @openai/codex\n"
-            "Then sign in: /codex:login (or `codex login` in a terminal)"
+            "Then sign in: /claudex:login (or `codex login` in a terminal)"
         )
 
     # Reserve one execution from the durable daily cap at the SINGLE real
@@ -3129,7 +3129,7 @@ async def _run_codex_once(
         return (
             f"{ERROR_PREFIX}Codex CLI not found. Install it with:\n"
             "  npm i -g @openai/codex\n"
-            "Then sign in: /codex:login (or `codex login` in a terminal)"
+            "Then sign in: /claudex:login (or `codex login` in a terminal)"
         )
     except OSError as exc:
         return f"{ERROR_PREFIX}Failed to start Codex: {exc}"
@@ -3200,7 +3200,7 @@ async def _run_codex_once(
             return network_error
         if "not authenticated" in err_msg.lower() or "login" in err_msg.lower():
             return (
-                f"{ERROR_PREFIX}Codex is not signed in. Run /codex:login (a one-time "
+                f"{ERROR_PREFIX}Codex is not signed in. Run /claudex:login (a one-time "
                 "code, no browser needed), or `codex login` in a terminal."
             )
         if "rate limit" in err_msg.lower() or "429" in err_msg:
@@ -4673,7 +4673,7 @@ async def codex_ping(params: Optional[PingInput] = None) -> str:
         return (
             "Codex CLI not found in PATH.\n"
             "Install: npm i -g @openai/codex\n"
-            "Sign in: /codex:login"
+            "Sign in: /claudex:login"
         )
 
     if not params.model_test:
@@ -4693,7 +4693,7 @@ async def codex_ping(params: Optional[PingInput] = None) -> str:
         elif state == "env-key":
             auth = "API key from CODEX_API_KEY (environment; model_test=true validates it)"
         elif state == "missing":
-            auth = f"{detail} — run /codex:login"  # always carry the fix
+            auth = f"{detail} — run /claudex:login"  # always carry the fix
         else:
             auth = detail
         lines.append(f"Auth:        {auth}")
@@ -4930,7 +4930,7 @@ async def codex_login(params: Optional[LoginInput] = None) -> str:
     if codex_path == "codex" and not shutil.which("codex"):
         return (
             f"{ERROR_PREFIX}Codex CLI not found. Install it with:\n"
-            f"  {CODEX_INSTALL_CMD}\nthen run /codex:login again."
+            f"  {CODEX_INSTALL_CMD}\nthen run /claudex:login again."
         )
 
     if params.restart:

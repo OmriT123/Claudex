@@ -15,25 +15,25 @@ Codex runs in a read-only sandbox and never modifies your files.
 
 | Command | What It Does | Cost |
 |---------|-------------|------|
-| `/codex:plan [task]` | Claude and Codex independently plan, then synthesize | 1 msg |
-| `/codex:brainstorm [topic]` | Explore approaches from two AI perspectives | 1 msg |
-| `/codex:collab [problem]` | Targeted collaboration — debug, security-test, verify | 1 msg |
-| `/codex:evaluate [A vs B]` | Tradeoff analysis — you decide | 1 msg |
-| `/codex:review [files]` | Focused code review on specific files | 1 msg |
-| `/codex:review-diff [focus]` | Review your git diff before committing | 1 msg |
-| `/codex:recap [session_id]` | Generate decision record from a session | 1 msg |
-| `/codex:setup [folders]` | Choose the folders Codex may work in, then check readiness | free |
-| `/codex:login` | Sign Codex in to ChatGPT with a one-time code (no browser needed) | free |
-| `/codex:status` | Diagnostics dashboard | free |
-| `/codex:help` | This guide | free |
-| `/codex:doctor` | Diagnose & fix issues | free |
+| `/claudex:plan [task]` | Claude and Codex independently plan, then synthesize | 1 msg |
+| `/claudex:brainstorm [topic]` | Explore approaches from two AI perspectives | 1 msg |
+| `/claudex:collab [problem]` | Targeted collaboration — debug, security-test, verify | 1 msg |
+| `/claudex:evaluate [A vs B]` | Tradeoff analysis — you decide | 1 msg |
+| `/claudex:review [files]` | Focused code review on specific files | 1 msg |
+| `/claudex:review-diff [focus]` | Review your git diff before committing | 1 msg |
+| `/claudex:recap [session_id]` | Generate decision record from a session | 1 msg |
+| `/claudex:setup [folders]` | Choose the folders Codex may work in, then check readiness | free |
+| `/claudex:login` | Sign Codex in to ChatGPT with a one-time code (no browser needed) | free |
+| `/claudex:status` | Diagnostics dashboard | free |
+| `/claudex:help` | This guide | free |
+| `/claudex:doctor` | Diagnose & fix issues | free |
 
 ## Get Started
 
 0. Set your allowed project folders first — Claudex is deny-by-default (v2.0):
    see README → "Workspace confinement (required)"
-1. Run `/codex:status` to verify everything is connected
-2. Try `/codex:plan [describe your task]` for your first collaboration
+1. Run `/claudex:status` to verify everything is connected
+2. Try `/claudex:plan [describe your task]` for your first collaboration
 3. Each tool call = 1 message from your ChatGPT subscription quota
 
 ## Tips

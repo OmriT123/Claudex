@@ -1,6 +1,15 @@
-# Claudex — Claude Code Plugin <sup>v2.4.0</sup>
+# Claudex — Claude Code Plugin <sup>v3.0.0</sup>
 
 Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, security-testing, debugging, verification, and decision support.
+
+Ask in plain words ("use Codex to review this independently") or run a command
+such as `/claudex:plan`. Works in Claude Code and, through your claude.ai
+account, in chat and Cowork. Codex runs on your computer under your own OpenAI
+sign-in; see [What Claudex sends, runs and stores](#what-claudex-sends-runs-and-stores).
+
+> **Upgrading from 2.x?** Commands are now `/claudex:*` (were `/codex:*`) and
+> plugin tools are `mcp__plugin_claudex_codex__*`. Natural requests like "use
+> Codex" work as before. See [CHANGELOG.md](CHANGELOG.md#300).
 
 ## How It Works
 
@@ -70,12 +79,12 @@ Codex tools themselves run on your computer: in the desktop app while it is
 open, in Claude Code locally. If they don't appear in the desktop app, install
 the desktop extension below.
 
-Then choose the folders Codex may work in: run `/codex:setup`, or see
+Then choose the folders Codex may work in: run `/claudex:setup`, or see
 [Workspace confinement](#workspace-confinement-required).
 
 ### Verify
 
-- `/mcp` — should show `codex` with its tools
+- `/mcp` — should show `plugin:claudex:codex` with its tools
 - `codex_status` (free) — shows the version, build and where the roots come from
 - Type: `use codex_ping to check if Codex is working`
 
@@ -177,7 +186,7 @@ whichever way fits:
 Protected locations (`~/.ssh`, `~/.aws`, keychains, `~/.codex`, …) cannot be
 selected as a working directory, even inside an allowed root (this bounds where
 Codex runs — it is not a read-time filter on individual files). If a call fails
-because no folders are allowed, this section (or `/codex:setup`) is the fix.
+because no folders are allowed, this section (or `/claudex:setup`) is the fix.
 
 **Not a sandbox against a repository you open.** Claudex runs your local `git`
 against the working directory for diff review and context. A git repository can,
@@ -234,13 +243,13 @@ the environment once (claude.ai/code → environment settings):
    - **API key** — environment variable `CODEX_API_KEY=sk-...`. No per-session
      step; billed to your OpenAI API account. Anyone who uses the environment,
      Claude included, can read environment variables.
-   - **ChatGPT plan** — once per session, run **`/codex:login`**: you get a link and
+   - **ChatGPT plan** — once per session, run **`/claudex:login`**: you get a link and
      a one-time code to approve on your phone, and Codex is ready (enable device
      code login under ChatGPT Settings → Security first). Don't copy your local
      `~/.codex/auth.json` instead: refresh tokens are single-use, so the second
      machine to refresh logs the other one out.
 
-Then start a new session and run `/codex:doctor` or `codex_ping`. In the VM Codex
+Then start a new session and run `/claudex:doctor` or `codex_ping`. In the VM Codex
 runs as root with a read-only sandbox that can read any file there, so keep
 secrets you don't want sent to OpenAI out of the environment.
 
@@ -252,33 +261,49 @@ with no setup.
 
 | Command | What It Does |
 |---------|-------------|
-| `/codex:plan [task]` | Claude Code and Codex independently plan the same task, then synthesize |
-| `/codex:brainstorm [topic]` | Explore approaches from two AI perspectives |
-| `/codex:collab [problem]` | Claude Code shares its analysis, Codex provides targeted suggestions |
-| `/codex:evaluate [A vs B]` | Codex analyzes tradeoffs between approaches — user decides |
-| `/codex:recap [session_id]` | Generate a decision record from a collaboration session |
-| `/codex:review [files]` | Get a focused code review from Codex on specific files |
-| `/codex:review-diff [focus]` | Get Codex to review your git diff before committing |
-| `/codex:setup [folders]` | Choose the folders Codex may work in (workspace roots), then check readiness |
-| `/codex:login` | Sign Codex in to ChatGPT with a one-time code — no browser needed (cloud sessions, SSH) |
-| `/codex:status` | Show Claudex diagnostics (zero Codex cost) |
-| `/codex:help` | Quick start guide |
-| `/codex:doctor` | Diagnose and fix Claudex issues |
+| `/claudex:plan [task]` | Claude Code and Codex independently plan the same task, then synthesize |
+| `/claudex:brainstorm [topic]` | Explore approaches from two AI perspectives |
+| `/claudex:collab [problem]` | Claude Code shares its analysis, Codex provides targeted suggestions |
+| `/claudex:evaluate [A vs B]` | Codex analyzes tradeoffs between approaches — user decides |
+| `/claudex:recap [session_id]` | Generate a decision record from a collaboration session |
+| `/claudex:review [files]` | Get a focused code review from Codex on specific files |
+| `/claudex:review-diff [focus]` | Get Codex to review your git diff before committing |
+| `/claudex:setup [folders]` | Choose the folders Codex may work in (workspace roots), then check readiness |
+| `/claudex:login` | Sign Codex in to ChatGPT with a one-time code — no browser needed (cloud sessions, SSH) |
+| `/claudex:status` | Show Claudex diagnostics (zero Codex cost) |
+| `/claudex:help` | Quick start guide |
+| `/claudex:doctor` | Diagnose and fix Claudex issues |
 
 ### Examples
 
+Three end-to-end examples you can reproduce on any small git repository inside
+an allowed folder:
+
+1. **Independent plan.** Ask "Use Codex independently to plan adding rate limiting
+   to the API", or run `/claudex:plan Add rate limiting to all API endpoints`. Claude
+   writes its own plan, Codex reads the repo and writes another, and you get one
+   synthesized plan with who-suggested-what.
+2. **Pre-commit review.** Stage a change, then run `/claudex:review-diff security`.
+   You get findings with severity, file and line, and a ship / fix-first verdict
+   bound to the exact HEAD and diff hash.
+3. **Decision support.** Run `/claudex:evaluate Redis vs PostgreSQL pub/sub for
+   real-time events`. Codex lays out the tradeoffs; Claude presents both analyses;
+   you decide.
+
+More:
+
 ```
-/codex:plan Add rate limiting to all API endpoints
+/claudex:plan Add rate limiting to all API endpoints
 
-/codex:brainstorm How should we handle caching for the dashboard?
+/claudex:brainstorm How should we handle caching for the dashboard?
 
-/codex:collab I'm getting a race condition in the worker queue
+/claudex:collab I'm getting a race condition in the worker queue
 
-/codex:evaluate Redis vs PostgreSQL pub/sub for real-time events
+/claudex:evaluate Redis vs PostgreSQL pub/sub for real-time events
 
-/codex:review-diff security
+/claudex:review-diff security
 
-/codex:review src/auth.py, src/middleware.py
+/claudex:review src/auth.py, src/middleware.py
 ```
 
 ## Install as a Claude Desktop Extension (Cowork / desktop app)
@@ -473,21 +498,21 @@ Claudex/
 │   ├── server.py            # Python MCP server (runs via uv)
 │   └── server.py.lock       # Pinned dependencies (uv run --locked)
 ├── commands/
-│   ├── plan.md              # /codex:plan
-│   ├── brainstorm.md        # /codex:brainstorm
-│   ├── collab.md            # /codex:collab
-│   ├── evaluate.md          # /codex:evaluate
-│   ├── recap.md             # /codex:recap
-│   ├── review.md            # /codex:review
-│   ├── review-diff.md       # /codex:review-diff
-│   ├── status.md            # /codex:status
-│   ├── help.md              # /codex:help
-│   ├── doctor.md            # /codex:doctor
-│   ├── login.md             # /codex:login
-│   └── setup.md             # /codex:setup
+│   ├── plan.md              # /claudex:plan
+│   ├── brainstorm.md        # /claudex:brainstorm
+│   ├── collab.md            # /claudex:collab
+│   ├── evaluate.md          # /claudex:evaluate
+│   ├── recap.md             # /claudex:recap
+│   ├── review.md            # /claudex:review
+│   ├── review-diff.md       # /claudex:review-diff
+│   ├── status.md            # /claudex:status
+│   ├── help.md              # /claudex:help
+│   ├── doctor.md            # /claudex:doctor
+│   ├── login.md             # /claudex:login
+│   └── setup.md             # /claudex:setup
 ├── skills/
-│   └── claudex/
-│       └── SKILL.md         # When and how Claude consults Codex
+│   └── codex/
+│       └── SKILL.md         # When and how Claude consults Codex (claudex:codex)
 ├── tests/
 │   └── test_helpers.py      # Test suite (uv run --script)
 ├── .claudex/                # Scratchpad (gitignored)
@@ -512,14 +537,22 @@ Claudex/
 |---------|-----|
 | "Codex CLI not found" | `npm i -g @openai/codex` |
 | "Codex CLI is too old for model 'gpt-6-astra'" | `npm i -g @openai/codex@latest` — needs ≥ 0.153.1 |
-| "Codex is not signed in" | `/codex:login` (or `codex login` in a terminal; cloud: `CODEX_API_KEY` also works) |
+| "Codex is not signed in" | `/claudex:login` (or `codex login` in a terminal; cloud: `CODEX_API_KEY` also works) |
 | "A network policy blocked Codex's connection to <host>" | Allow that host in your sandbox's network settings (Claude Code cloud: environment → Network access), then start a new session |
 | "Rate limit reached" | Wait for 5-hour window reset |
 | Timeout | Narrow `focus_files` or raise `timeout_seconds` (lowering `reasoning_effort` is a last resort) |
 | Empty response | Be more specific about the task |
 | Tools not showing | Check `/mcp`, restart CC session |
 | Server failed with "Required uv version `>=0.11.4`" | `uv self update`, then reconnect the `codex` server from `/mcp`. Claude Code holds a failed start for about 15 minutes, and neither a restart nor `/reload-plugins` clears it |
+| `/codex:...` command not found | Since 3.0 the commands are `/claudex:...` |
+| Both `/codex:*` and `/claudex:*` listed | An old copy is still installed (often the claude.ai account copy or the old desktop extension): update it, then `/reload-plugins` |
 | Calls cut off after 60s (cloud session) | Update to Claudex ≥ 2.2.0 (adds the per-server MCP timeout) |
+
+## Support
+
+Questions, bugs or security reports: [hello@botique.co.il](mailto:hello@botique.co.il)
+or [GitHub issues](https://github.com/OmriT123/Claudex/issues). Privacy and data
+handling: [PRIVACY.md](PRIVACY.md).
 
 ## Credits
 
