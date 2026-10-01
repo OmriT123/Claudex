@@ -1534,8 +1534,10 @@ def _truncate_utf8(text: str, max_bytes: int) -> str:
     data = text.encode("utf-8")
     if len(data) <= max_bytes:
         return text
-    room = max(0, max_bytes - len(_TRUNCATED_SUFFIX.encode("utf-8")))
-    return data[:room].decode("utf-8", errors="ignore") + _TRUNCATED_SUFFIX
+    suffix = _TRUNCATED_SUFFIX.encode("utf-8")
+    if max_bytes < len(suffix):
+        return data[:max(0, max_bytes)].decode("utf-8", errors="ignore")
+    return data[:max_bytes - len(suffix)].decode("utf-8", errors="ignore") + _TRUNCATED_SUFFIX
 
 
 def _truncate_middle_utf8(text: str, max_bytes: int) -> str:
@@ -1544,7 +1546,9 @@ def _truncate_middle_utf8(text: str, max_bytes: int) -> str:
     if len(data) <= max_bytes:
         return text
     cut = "\n[... truncated ...]\n"
-    half = max(0, (max_bytes - len(cut.encode("utf-8"))) // 2)
+    if max_bytes < len(cut.encode("utf-8")) + 64:
+        return _truncate_utf8(text, max_bytes)
+    half = (max_bytes - len(cut.encode("utf-8"))) // 2
     head = data[:half].decode("utf-8", errors="ignore")
     tail = data[len(data) - half:].decode("utf-8", errors="ignore") if half else ""
     return head + cut + tail
@@ -1567,7 +1571,7 @@ def _init_session(
         f"<!-- claudex:rounds=0 -->\n"
     )
     if carried_from:
-        carried = _truncate_utf8(_neutralize_markers(carried), CARRY_MAX_BYTES)
+        carried = _truncate_middle_utf8(_neutralize_markers(carried), CARRY_MAX_BYTES)
         body += (
             f"{_CARRIED_FROM_MARKER.format(carried_from)}\n\n"
             f"## Carried over from '{carried_from}'\n\n{carried}\n\n"
@@ -1642,6 +1646,44 @@ def _get_truncated_session(
     return _truncate_session_content(content, max_bytes)
 
 
+def _split_session(content: str) -> tuple[str, list]:
+    parts = re.split(r'(\n---\n\n## Round \d+)', content)
+    rounds = [parts[i] + (parts[i + 1] if i + 1 < len(parts) else "")
+              for i in range(1, len(parts), 2)]
+    return parts[0], rounds
+
+
+def _carry_from_document(content: str, max_bytes: int = CARRY_MAX_BYTES) -> str:
+    """Decisions to carry from a session document into its successor.
+
+    Newest rounds first, so the latest decision always survives (an
+    oversized newest round keeps its start and end); what is left of the
+    budget goes to the document's own carried section. Used when the recap
+    failed and when a missing successor is recreated (v2.3.1).
+    """
+    header, rounds = _split_session(_without_successor_marker(content))
+    budget = max_bytes - 1024  # room for neutralization and headings
+    kept: list = []
+    used = 0
+    for rnd in reversed(rounds):
+        size = len(rnd.encode("utf-8"))
+        if used + size > budget:
+            if not kept:
+                kept.append(_truncate_middle_utf8(rnd, budget))
+                used = budget
+            break
+        kept.insert(0, rnd)
+        used += size
+    text = "".join(kept)
+    carried_idx = header.find("## Carried over from")
+    room = budget - used
+    if carried_idx != -1 and room > 512:
+        text = _truncate_middle_utf8(header[carried_idx:], room) + text
+    if len(kept) < len(rounds):
+        text = "[Earlier rounds omitted]\n" + text
+    return text
+
+
 def _truncate_session_content(content: str, max_bytes: int = SESSION_MAX_BYTES) -> str:
     """Drop oldest rounds until the session fits in max_bytes."""
     if len(content.encode("utf-8")) <= max_bytes:
@@ -1652,6 +1694,9 @@ def _truncate_session_content(content: str, max_bytes: int = SESSION_MAX_BYTES) 
     parts = re.split(r'(\n---\n\n## Round \d+)', content)
     # parts[0] is header, then alternating [delimiter+heading, content] pairs
     header = parts[0]
+    if len(header.encode("utf-8")) > max_bytes // 2:
+        # A large carried section never crowds out the rounds.
+        header = _truncate_middle_utf8(header, max_bytes // 2)
     rounds = []
     for i in range(1, len(parts), 2):
         if i + 1 < len(parts):
@@ -1710,8 +1755,8 @@ async def _lock_active_session(cwd: str, session_id: str, session_path: Path):
     whose file is missing is recreated from its predecessor's latest rounds,
     so the chain never silently loses its context.
     """
-    lock = _get_session_lock(session_id)
-    await lock.acquire()
+    held = _get_session_lock(session_id)
+    await held.acquire()
     try:
         note = ""
         visited = [session_id]
@@ -1733,27 +1778,31 @@ async def _lock_active_session(cwd: str, session_id: str, session_path: Path):
                     f"'{session_id}' continues in an invalid session id"
                 )
             predecessor_id, predecessor_text = session_id, existing
-            lock.release()
-            lock = _get_session_lock(successor)
-            await lock.acquire()
+            # Release, then wait for the successor's lock. Only a lock this
+            # call actually acquired is ever released (a cancelled wait must
+            # not release another call's lock).
+            held.release()
+            held = None
+            nxt = _get_session_lock(successor)
+            await nxt.acquire()
+            held = nxt
             visited.append(successor)
             session_id, session_path = successor, next_path
             existing = _read_session_or_none(session_path)
             if existing is None:
                 _init_session(
                     session_path, session_id, carried_from=predecessor_id,
-                    carried=_truncate_session_content(
-                        _without_successor_marker(predecessor_text), CARRY_MAX_BYTES
-                    ),
+                    carried=_carry_from_document(predecessor_text),
                 )
                 existing = _read_session_text(session_path)
                 note += (
                     f"\n\n(Session '{session_id}' was missing; it was recreated "
                     f"with '{predecessor_id}''s latest rounds as context.)"
                 )
-        return lock, session_id, session_path, existing, note
+        return held, session_id, session_path, existing, note
     except BaseException:
-        lock.release()
+        if held is not None:
+            held.release()
         raise
 
 
@@ -3429,7 +3478,7 @@ async def codex_collab(params: CollaborateInput) -> str:
                     old_session_id, old_session_path = params.session_id, session_path
                     new_session_id, new_path, successor_text = _create_successor(
                         cwd, old_session_id,
-                        recap_result if recap_ok else _truncate_session_content(existing, CARRY_MAX_BYTES),
+                        recap_result if recap_ok else _carry_from_document(existing),
                     )
                     # Re-read right before marking: nothing awaited since the
                     # recap returned, so this is the current document.

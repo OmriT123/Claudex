@@ -56,14 +56,16 @@ the `.mcpb` desktop extension.
   failed, which the reply says), bounded to the session context limit, and
   marks the old session so later calls continue in the new one instead of
   rolling over again. Calls follow the chain under each session's lock in
-  turn, so calls naming an old and a newer session roll over once; a result
+  turn (a cancelled call never releases a lock it did not get), so calls
+  naming an old and a newer session roll over once; a result
   that arrives after its session rolled over goes to the active session (the
   reply says so); a loop or a chain longer than 16 sessions is an error; an
   existing file at the successor's name is adopted only if it was created for
   that session; a missing successor is recreated from its predecessor's
   latest rounds. The carried decisions take at most a quarter of the session
-  context, so the newest rounds always fit (an oversized round keeps its
-  start and end).
+  context and are built newest round first, so the latest decision always
+  survives a failed recap or a recovery (an oversized round keeps its start
+  and end).
 - Session documents above 4 MB are refused instead of loaded into memory.
 - `install.sh` uses Claude Code's own `plugin marketplace` / `plugin install`
   commands instead of editing `known_marketplaces.json`, updates an existing

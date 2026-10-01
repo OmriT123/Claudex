@@ -3811,6 +3811,13 @@ class TestV231ChainIntegrity:
         d = tmp_path / ".claudex" / "sessions"; d.mkdir(parents=True, exist_ok=True)
         return d
 
+    @pytest.fixture(autouse=True)
+    def _fresh_session_locks(self, monkeypatch):
+        # asyncio locks bind to the loop of their first contended wait; each
+        # test runs in its own loop (one loop per process in production).
+        import server as srv
+        monkeypatch.setattr(srv, "_session_locks", {})
+
     def test_marker_in_stored_content_is_neutralized(self, tmp_path):
         import server as srv
         path = self._sessions(tmp_path) / "s.md"
@@ -3959,6 +3966,69 @@ class TestV231ChainIntegrity:
         out = srv._truncate_session_content(path.read_text())
         assert len(out.encode("utf-8")) <= srv.SESSION_MAX_BYTES
         assert "DECISION-3" in out
+
+    @pytest.mark.asyncio
+    async def test_cancelled_handoff_keeps_other_calls_lock(self, tmp_path):
+        import server as srv
+        sessions = self._sessions(tmp_path)
+        (sessions / "s.md").write_text(_session_doc("s", 4, successor="s-p2"))
+        (sessions / "s-p2.md").write_text(_session_doc("s-p2", 1, carried_from="s"))
+        owner = srv._get_session_lock("s-p2")
+        await owner.acquire()
+        try:
+            waiter = asyncio.create_task(srv._lock_active_session(
+                str(tmp_path), "s", sessions / "s.md"))
+            await asyncio.sleep(0.01)
+            assert not waiter.done()
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            assert owner.locked()
+            assert not srv._get_session_lock("s").locked()
+        finally:
+            owner.release()
+
+    @pytest.mark.asyncio
+    async def test_recovered_successor_keeps_the_latest_round(self, tmp_path):
+        import server as srv
+        sessions = self._sessions(tmp_path)
+        pred = sessions / "s-p2.md"
+        srv._init_session(pred, "s-p2", carried_from="s", carried="X" * 100_000)
+        srv._append_to_session(pred, 4, "LATEST-START", "Y" * 40_000 + "LATEST-END")
+        pred.write_text(pred.read_text() + "\n<!-- claudex:continued-in=s-p3 -->\n")
+        lock, sid, _, recovered, note = await srv._lock_active_session(str(tmp_path), "s-p2", pred)
+        lock.release()
+        assert sid == "s-p3" and "was missing" in note
+        assert "LATEST-START" in recovered and "LATEST-END" in recovered
+        assert len(recovered.encode("utf-8")) <= srv.CARRY_MAX_BYTES + 1024
+
+    @pytest.mark.asyncio
+    async def test_failed_recap_rollover_keeps_the_latest_round(self, tmp_path):
+        import server as srv
+        sessions = self._sessions(tmp_path)
+        path = sessions / "s.md"
+        srv._init_session(path, "s", carried_from="r", carried="X" * 100_000)
+        for n in range(1, srv.MAX_SESSION_ROUNDS + 1):
+            srv._append_to_session(path, n, f"START-{n}", "Y" * 9_000 + f"END-{n}")
+        prompts = []
+
+        async def capture(prompt, **k):
+            prompts.append(prompt)
+            return "answer"
+        with patch.object(srv, "_run_codex_once", new_callable=AsyncMock,
+                          return_value="Error: recap failed"), \
+             patch.object(srv, "_run_codex", side_effect=capture):
+            out = await srv.codex_collab(_collab_input(srv, tmp_path, "s"))
+        last = srv.MAX_SESSION_ROUNDS
+        successor = (sessions / "s-p2.md").read_text()
+        assert f"END-{last}" in successor and f"START-{last}" in successor
+        assert f"END-{last}" in prompts[0] and "recap failed" in out
+
+    @pytest.mark.parametrize("budget", [0, 1, 11, 40, 100])
+    def test_tiny_truncation_budgets_hold(self, budget):
+        import server as srv
+        for fn in (srv._truncate_utf8, srv._truncate_middle_utf8):
+            assert len(fn("X" * 500, budget).encode("utf-8")) <= budget
 
     def test_posix_without_dir_fd_fails_closed(self, tmp_path, monkeypatch):
         import server as srv
