@@ -1,7 +1,7 @@
 {
   "name": "codex",
   "description": "Get a second AI to review your code, stress-test your plans, and debug alongside Claude Code.",
-  "version": "2.3.1",
+  "version": "2.4.0",
   "author": {
     "name": "Omri Tal",
     "url": "https://www.botique.co.il",
@@ -21,5 +21,13 @@
     "debugging",
     "ai-collaboration",
     "async-jobs"
-  ]
+  ],
+  "userConfig": {
+    "allowed_folder": {
+      "type": "directory",
+      "title": "Project folder Codex may work in",
+      "description": "Codex runs only inside this folder (one folder; subfolders included). Leave empty to use CLAUDEX_ALLOWED_ROOTS or the per-computer folder list set with --configure-roots (see README: Workspace confinement).",
+      "default": ""
+    }
+  }
 }

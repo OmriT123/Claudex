@@ -4,6 +4,11 @@
 #     "mcp[cli]>=1.0.0,<2.0.0",
 #     "pydantic>=2.0.0",
 # ]
+#
+# [tool.uv]
+# # Older uv silently ignores --locked when the script lockfile is missing
+# # (fixed in uv 0.11.4); uv enforces this floor before resolving anything.
+# required-version = ">=0.11.4"
 # ///
 """
 Claudex MCP Server
@@ -45,6 +50,7 @@ import sys
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -58,7 +64,7 @@ from pydantic import BaseModel, Field, ConfigDict
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = "gpt-6-astra"  # GPT-6 Astra (v2.1); per-call `model` override stays
-SERVER_VERSION = "2.3.1"  # kept equal to plugin.json + desktop-extension/manifest.json (tested)
+SERVER_VERSION = "2.4.0"  # kept equal to plugin.json + desktop-extension/manifest.json (tested)
 DEFAULT_REASONING_EFFORT = "high"  # on every tool; Astra's own default is "medium"
 EXEC_TIMEOUT_SECONDS = 1200  # 20 min max per Codex call
 # Floor for the default model: older CLIs are rejected by the API (HTTP 400
@@ -92,6 +98,16 @@ _UNEXPANDED_TEMPLATE_RE = re.compile(r"\$\{user_config\.[^}]*\}")
 # var. Never applies locally; an explicit env var or --allowed-roots always wins.
 CLOUD_SESSION_ENV = "CLAUDE_CODE_REMOTE"
 PROJECT_DIR_ENV = "CLAUDE_PROJECT_DIR"
+# v2.4: two more roots sources, below argv/env in precedence.
+#  - CLAUDEX_PLUGIN_FOLDER: the plugin's single-folder userConfig option
+#    (.mcp.json maps ${user_config.allowed_folder} here; "" when unset).
+#  - A per-user config file written ONLY by the terminal command
+#    `server.py --configure-roots <dir>...` / `--revoke-roots`. It lives in a
+#    fixed OS location (never the project, never CLAUDE_PLUGIN_DATA), so every
+#    surface on the machine sees the same file and a renamed/updated plugin
+#    keeps it. `--revoke-roots` is a kill switch that beats every source.
+PLUGIN_FOLDER_ENV = "CLAUDEX_PLUGIN_FOLDER"
+ROOTS_CONFIG_VERSION = 1
 ALWAYS_DENIED_SUBPATHS = (
     ".ssh", ".aws", ".gnupg", ".codex", ".config/gh",
     "Library/Keychains", "Library/Application Support/Claude",
@@ -695,20 +711,53 @@ def _find_codex_bin() -> str:
     return "codex"  # Let it fail with a clear FileNotFoundError
 
 
-def _allowed_roots() -> list[Path]:
-    """Resolve configured workspace roots (argv --allowed-roots wins over env).
+_BUILD_ID: Optional[str] = None
 
-    Deny-by-default (v2.0): an empty result means _validate_project_dir
-    REJECTS every project directory — never "unrestricted".
-    """
-    if _ARGV_ROOTS is not None:
-        parts = list(_ARGV_ROOTS)
-    else:
-        raw = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
-        if not raw:
-            return _cloud_default_roots()
-        # os.pathsep, not a literal ':' — a ':' split corrupts C:\ paths on Windows.
-        parts = raw.split(os.pathsep)
+
+def _build_id() -> str:
+    """First 12 hex of sha256(server.py): identifies the exact running build."""
+    global _BUILD_ID
+    if _BUILD_ID is None:
+        import hashlib
+        try:
+            _BUILD_ID = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+        except OSError:
+            _BUILD_ID = "unknown"
+    return _BUILD_ID
+
+
+def _distribution() -> str:
+    """Which packaging launched this server (diagnostics only, v2.4)."""
+    if os.environ.get("CLAUDEX_DISTRIBUTION") == "mcpb":
+        return "desktop extension (.mcpb)"
+    if os.environ.get(CLOUD_SESSION_ENV) == "true":
+        return "plugin in a Claude Code cloud session"
+    if os.environ.get("CLAUDE_PLUGIN_ROOT"):
+        return "plugin"
+    return "manual launch or source checkout"
+
+
+def _config_path() -> Path:
+    """Per-user roots config file: a fixed OS location, independent of any env
+    override that a plugin host or project could influence (v2.4)."""
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA", "").strip()
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+        return base / "Botique" / "Claudex" / "config.json"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Botique" / "Claudex" / "config.json"
+    return Path.home() / ".config" / "botique-claudex" / "config.json"
+
+
+@dataclass(frozen=True)
+class _RootsResolution:
+    roots: list
+    source: str   # revoked | argv | env | plugin-setting | config-file | config-error | cloud-default | none
+    detail: str = ""
+
+
+def _parse_root_parts(parts) -> list[Path]:
+    """Shared parser for argv/env root lists (unchanged v2.0 semantics)."""
     roots = []
     for part in parts:
         part = part.strip()
@@ -727,6 +776,101 @@ def _allowed_roots() -> list[Path]:
         except OSError:
             pass
     return roots
+
+
+def _load_roots_config() -> tuple[str, list, str]:
+    """(state, roots, detail) for the per-user config file.
+
+    state: absent | ok | revoked | malformed. A file that exists but cannot be
+    read or parsed is 'malformed' and denies everything (it might have been a
+    revocation), never falls through to a weaker source.
+    """
+    path = _config_path()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "absent", [], str(path)
+    except (OSError, UnicodeDecodeError) as exc:
+        return "malformed", [], f"{path}: unreadable ({exc})"
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        return "malformed", [], f"{path}: invalid JSON ({exc})"
+    if not isinstance(data, dict) or data.get("version") != ROOTS_CONFIG_VERSION:
+        return "malformed", [], f"{path}: unsupported format (expected version {ROOTS_CONFIG_VERSION})"
+    if data.get("deny_all") is True:
+        return "revoked", [], str(path)
+    entries = data.get("allowed_roots")
+    if not isinstance(entries, list) or not all(isinstance(e, str) for e in entries):
+        return "malformed", [], f"{path}: allowed_roots must be a list of paths"
+    roots = []
+    for entry in entries:
+        if not os.path.isabs(entry):
+            return "malformed", [], f"{path}: relative path {entry!r}"
+        try:
+            roots.append(Path(entry).resolve())
+        except OSError as exc:
+            return "malformed", [], f"{path}: {entry!r} ({exc})"
+    return "ok", roots, str(path)
+
+
+def _roots_resolution() -> _RootsResolution:
+    """Resolve workspace roots and say where they came from (v2.4).
+
+    Precedence: revocation (config kill switch) > --allowed-roots argv >
+    CLAUDEX_ALLOWED_ROOTS > plugin folder setting > config file > Claude Code
+    cloud default > none. Empty values mean "not set"; an unusable value in
+    the source that was selected denies everything, without falling through.
+    """
+    state, cfg_roots, cfg_detail = _load_roots_config()
+    if state == "revoked":
+        return _RootsResolution([], "revoked", cfg_detail)
+    if state == "malformed":
+        return _RootsResolution([], "config-error", cfg_detail)
+    if _ARGV_ROOTS is not None:
+        return _RootsResolution(_parse_root_parts(_ARGV_ROOTS), "argv", "--allowed-roots")
+    raw = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
+    if raw:
+        # os.pathsep, not a literal ':' — a ':' split corrupts C:\ paths on Windows.
+        return _RootsResolution(_parse_root_parts(raw.split(os.pathsep)), "env", ALLOWED_ROOTS_ENV)
+    folder = os.environ.get(PLUGIN_FOLDER_ENV, "").strip()
+    if folder and not _UNEXPANDED_TEMPLATE_RE.fullmatch(folder):
+        expanded = os.path.expanduser(folder)
+        if not os.path.isabs(expanded) or not os.path.isdir(expanded):
+            return _RootsResolution(
+                [], "plugin-setting",
+                f"plugin folder setting {folder!r} is not an existing absolute folder",
+            )
+        return _RootsResolution([Path(expanded).resolve()], "plugin-setting", "plugin folder setting")
+    if state == "ok":
+        return _RootsResolution(cfg_roots, "config-file", cfg_detail)
+    cloud = _cloud_default_roots()
+    if cloud:
+        return _RootsResolution(cloud, "cloud-default", PROJECT_DIR_ENV)
+    return _RootsResolution([], "none", "")
+
+
+_ROOTS_SOURCE_LABELS = {
+    "revoked": "revoked by --revoke-roots",
+    "config-error": "unusable config file",
+    "argv": "--allowed-roots",
+    "env": ALLOWED_ROOTS_ENV,
+    "plugin-setting": "plugin folder setting",
+    "config-file": "config file (--configure-roots)",
+    "cloud-default": f"Claude Code cloud session default ({PROJECT_DIR_ENV})",
+    "none": "not configured",
+}
+
+
+def _allowed_roots() -> list[Path]:
+    """Resolved workspace roots. Deny-by-default (v2.0): an empty result means
+    _validate_project_dir REJECTS every project directory, never "unrestricted"."""
+    return list(_roots_resolution().roots)
+
+
+def _configure_roots_command(placeholder: str = "/path/to/your/projects") -> str:
+    """The exact terminal command that configures roots for this server file."""
+    return f'uv run --locked --script "{Path(__file__).resolve()}" --configure-roots {placeholder}'
 
 
 def _cloud_default_roots() -> list[Path]:
@@ -752,11 +896,7 @@ def _cloud_default_roots() -> list[Path]:
 
 def _roots_are_cloud_default() -> bool:
     """True when the active roots come from _cloud_default_roots()."""
-    return (
-        _ARGV_ROOTS is None
-        and not os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
-        and bool(_cloud_default_roots())
-    )
+    return _roots_resolution().source == "cloud-default"
 
 
 def _authorized_cwd(
@@ -790,6 +930,42 @@ def _roots_span_filesystem() -> bool:
     return False
 
 
+def _no_roots_message(resolution: "_RootsResolution") -> str:
+    """Actionable deny-all explanation, specific to why no roots resolved (v2.4)."""
+    configure = _configure_roots_command()
+    if resolution.source == "revoked":
+        return (
+            f"Claudex is switched off on this computer: workspace roots were revoked "
+            f"({resolution.detail}). To re-enable, run in a terminal: {configure}"
+        )
+    if resolution.source == "config-error":
+        return (
+            f"The Claudex roots config is unusable, so every project directory is "
+            f"denied: {resolution.detail}. Rewrite it in a terminal: {configure}"
+        )
+    if resolution.source == "plugin-setting":
+        return (
+            f"Every project directory is denied: the {resolution.detail}. Pick an "
+            "existing folder in the plugin's settings (/plugin configure in Claude Code)."
+        )
+    if resolution.source in ("argv", "env"):
+        return (
+            f"Every project directory is denied: {resolution.detail} is set but "
+            "yields no usable folder (unexpanded template or invalid parts were "
+            "discarded). Point it at real project folders, separated by "
+            f"'{os.pathsep}', then restart the client (it is read at spawn)."
+        )
+    return (
+        "No workspace roots configured, so every project directory is denied "
+        "(deny-by-default since v2.0). Choose the folders Codex may work in, "
+        f"one way: (1) in a terminal: {configure}  (works for every Claude app on "
+        "this computer, no restart); (2) Claude Code: the plugin's folder setting "
+        f"(/plugin configure) or export {ALLOWED_ROOTS_ENV} in your shell profile; "
+        "(3) desktop extension: pick folders in its settings. "
+        "See README: 'Workspace confinement (required)'."
+    )
+
+
 def _validate_project_dir(project_dir: Optional[str]) -> str:
     """Validate and return project directory. Returns cwd if None.
 
@@ -815,22 +991,15 @@ def _validate_project_dir(project_dir: Optional[str]) -> str:
         if resolved == denied_path or resolved.is_relative_to(denied_path):
             raise ValueError(f"Project directory is a protected location: {resolved}")
 
-    roots = _allowed_roots()
+    resolution = _roots_resolution()
+    roots = resolution.roots
     if not roots:
-        raise ValueError(
-            "No workspace roots configured — all project directories are denied "
-            f"(deny-by-default since v2.0). Fix: set {ALLOWED_ROOTS_ENV} to your "
-            f"project folder(s), separated by '{os.pathsep}', in your shell profile "
-            "or as an env block in your MCP client config, then restart the client "
-            "— roots are read at spawn. If the server was started with --allowed-roots "
-            "<paths>, those win and the env var is ignored; fix that flag instead. "
-            "Claude Desktop users: pick folders in the extension settings. "
-            "See README → 'Workspace confinement (required)'."
-        )
+        raise ValueError(_no_roots_message(resolution))
     if not any(resolved == r or resolved.is_relative_to(r) for r in roots):
         raise ValueError(
             f"Project directory {resolved} is outside the allowed workspace roots "
-            f"({ALLOWED_ROOTS_ENV}). Allowed: {', '.join(str(r) for r in roots)}"
+            f"(source: {_ROOTS_SOURCE_LABELS.get(resolution.source, resolution.source)}). "
+            f"Allowed: {', '.join(str(r) for r in roots)}"
         )
     return str(resolved)
 
@@ -4124,31 +4293,23 @@ async def codex_status(params: StatusInput) -> str:
     lines.append(f"Timeout:       {EXEC_TIMEOUT_SECONDS}s (default, per-tool overrides available)")
     lines.append(f"Tools:         13 (8 Codex-calling + codex_submit/codex_result + codex_status + codex_ping + codex_login)")
 
-    # --- Workspace confinement (v1.8.2) ---
-    raw_roots = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
-    active_roots = _allowed_roots()
+    # --- Workspace confinement (v1.8.2; sources reported since v2.4) ---
+    resolution = _roots_resolution()
+    active_roots = resolution.roots
+    source_label = _ROOTS_SOURCE_LABELS.get(resolution.source, resolution.source)
     if active_roots:
         lines.append(f"Roots:         {os.pathsep.join(str(r) for r in active_roots)}")
-        if _roots_are_cloud_default():
-            lines.append(
-                f"               (Claude Code cloud session default: {PROJECT_DIR_ENV}; "
-                f"set {ALLOWED_ROOTS_ENV} to override)"
-            )
+        lines.append(f"               (source: {source_label})")
         if _roots_span_filesystem():
-            lines.append("               (confinement NOMINAL — a root spans the whole filesystem or home; narrow it)")
-        if any(_UNEXPANDED_TEMPLATE_RE.fullmatch(p.strip()) for p in raw_roots.split(os.pathsep)):
+            lines.append("               (confinement NOMINAL: a root spans the whole filesystem or home; narrow it)")
+        raw_roots = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
+        if resolution.source == "env" and any(
+            _UNEXPANDED_TEMPLATE_RE.fullmatch(p.strip()) for p in raw_roots.split(os.pathsep)
+        ):
             lines.append("               (unexpanded template part(s) in the configured value were ignored)")
-    elif raw_roots:
-        lines.append(
-            f"Roots:         DENY-ALL — {ALLOWED_ROOTS_ENV} was set but yielded no "
-            "usable roots (unexpanded template or invalid parts discarded); every "
-            "project directory is rejected until it names a real folder"
-        )
     else:
-        lines.append(
-            f"Roots:         DENY-ALL — {ALLOWED_ROOTS_ENV} not configured; every "
-            "project directory is rejected (deny-by-default). Set it to enable Claudex."
-        )
+        lines.append(f"Roots:         DENY-ALL ({source_label}): every project directory is rejected")
+        lines.append(f"               {_no_roots_message(resolution)}")
 
     # --- Daily execution cap (durable, per-user state) ---
     lines.append(f"Run cap:       {_run_cap_status_value()}")
@@ -4166,7 +4327,10 @@ async def codex_status(params: StatusInput) -> str:
             plugin_version = json.loads(plugin_json.read_text()).get("version", "unknown")
         except (OSError, ValueError):
             pass
-    lines.append(f"Plugin:        v{plugin_version}")
+    lines.append(f"Plugin:        v{plugin_version} (build {_build_id()}, {_distribution()})")
+    lines.append(f"Server file:   {Path(__file__).resolve()}")
+    cfg_state = _load_roots_config()[0]
+    lines.append(f"Roots config:  {_config_path()} ({cfg_state})")
     lines.append(f"Author:        Omri Tal | botique.co.il | hello@botique.co.il")
 
     # --- Project-state sections require an authorized project dir ---
@@ -4297,23 +4461,23 @@ async def codex_ping(params: Optional[PingInput] = None) -> str:
 
         lines.append(f"Run cap:     {_run_cap_status_value()}")
 
-        roots = _allowed_roots()
+        resolution = _roots_resolution()
+        roots = resolution.roots
+        source_label = _ROOTS_SOURCE_LABELS.get(resolution.source, resolution.source)
         if roots and _roots_span_filesystem():
             lines.append(
-                f"Roots:       {len(roots)} configured — confinement NOMINAL "
+                f"Roots:       {len(roots)} configured ({source_label}): confinement NOMINAL "
                 "(a root spans the whole filesystem or home; narrow it)"
             )
-        elif roots and _roots_are_cloud_default():
+        elif roots and resolution.source == "cloud-default":
             lines.append(
-                f"Roots:       cloud session default ({roots[0]}) — confinement active"
+                f"Roots:       cloud session default ({roots[0]}) - confinement active"
             )
         elif roots:
-            lines.append(f"Roots:       {len(roots)} configured — confinement active")
+            lines.append(f"Roots:       {len(roots)} configured ({source_label}) - confinement active")
         else:
-            lines.append(
-                f"Roots:       NOT CONFIGURED — every project directory is "
-                f"denied until {ALLOWED_ROOTS_ENV} is set"
-            )
+            lines.append(f"Roots:       NOT CONFIGURED ({source_label}): every project directory is denied")
+            lines.append(f"             {_no_roots_message(resolution)}")
 
         lines.append(
             "Model test:  not run (pass model_test=true to spend one execution)"
@@ -5174,7 +5338,109 @@ async def codex_result(params: JobResultInput) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _write_roots_config(data: dict) -> Path:
+    """Atomically write the per-user roots config (0600 file, 0700 dir)."""
+    path = _config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    data = {**data, "version": ROOTS_CONFIG_VERSION,
+            "updated": datetime.now(timezone.utc).isoformat()}
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".config.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _validate_configured_root(raw: str) -> tuple[Optional[Path], str]:
+    """(resolved root, "") or (None, reason) for one --configure-roots folder."""
+    expanded = os.path.expanduser(raw)
+    if not os.path.isabs(expanded):
+        return None, "must be an absolute path"
+    if not os.path.isdir(expanded):
+        return None, "is not an existing folder"
+    resolved = Path(expanded).resolve()
+    home = Path.home().resolve()
+    if resolved == resolved.parent:
+        return None, "is a filesystem root; pick your project folders"
+    if resolved == home:
+        return None, "is your whole home folder; pick your project folders"
+    for denied in ALWAYS_DENIED_SUBPATHS:
+        denied_path = (home / denied).resolve()
+        if resolved == denied_path or resolved.is_relative_to(denied_path):
+            return None, "is a protected location"
+    return resolved, ""
+
+
+def _roots_cli(argv: list) -> int:
+    """Terminal-only roots management (v2.4). Not reachable from any MCP tool,
+    so a model can never widen its own workspace."""
+    if "--revoke-roots" in argv:
+        path = _write_roots_config({"deny_all": True, "allowed_roots": []})
+        print(f"Claudex roots REVOKED in {path}.")
+        print("Every Claudex server on this computer now denies all project folders,")
+        print("whatever else is configured. Takes effect on the next call.")
+        print(f"Re-enable with: {_configure_roots_command()}")
+        return 0
+    if "--configure-roots" in argv:
+        idx = argv.index("--configure-roots")
+        raw_roots = []
+        for arg in argv[idx + 1:]:
+            if arg.startswith("-"):
+                break
+            raw_roots.append(arg)
+        if not raw_roots:
+            print("Usage: --configure-roots <folder> [<folder> ...]", file=sys.stderr)
+            return 2
+        good, errors = [], []
+        for raw in raw_roots:
+            root, why = _validate_configured_root(raw)
+            if root is None:
+                errors.append(f"  {raw}: {why}")
+            elif str(root) not in good:
+                good.append(str(root))
+        if errors:
+            print("Nothing saved. Fix these folders:", file=sys.stderr)
+            print("\n".join(errors), file=sys.stderr)
+            return 2
+        path = _write_roots_config({"deny_all": False, "allowed_roots": good})
+        print(f"Saved {len(good)} folder(s) to {path}:")
+        for root in good:
+            print(f"  {root}")
+        print("Takes effect on the next Codex call; no restart needed.")
+        print(f"Note: {ALLOWED_ROOTS_ENV}, --allowed-roots and the plugin folder setting,")
+        print("when set, take precedence over this file.")
+        return 0
+    # --show-roots
+    state, _, detail = _load_roots_config()
+    resolution = _roots_resolution()
+    print(f"Config file: {_config_path()} ({state})")
+    if state == "malformed":
+        print(f"  problem: {detail}")
+    print(f"This shell resolves: {_ROOTS_SOURCE_LABELS.get(resolution.source, resolution.source)}")
+    for root in resolution.roots:
+        print(f"  {root}")
+    print("(Servers launched by Claude apps may see different environment variables;")
+    print(" codex_status shows what a running server resolved.)")
+    return 0
+
+
 if __name__ == "__main__":
+    if any(flag in sys.argv for flag in ("--configure-roots", "--revoke-roots", "--show-roots")):
+        sys.exit(_roots_cli(sys.argv[1:]))
     # Structured roots transport: `server.py --allowed-roots <path> [<path> ...]`
     # takes precedence over CLAUDEX_ALLOWED_ROOTS and needs no separator parsing.
     # NOTE: the shipping launchers still pass roots via the env var — this argv

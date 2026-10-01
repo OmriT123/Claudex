@@ -2,6 +2,50 @@
 
 All notable changes to Claudex. Versions follow the plugin manifest.
 
+## 2.4.0 (2026-10-01) - folder setup for every Claude app, locked dependencies
+
+**Before updating: run `uv self update`.** Claudex now needs uv 0.11.4 or
+newer and refuses to start on older uv ("Required uv version `>=0.11.4`").
+
+### Added
+- **One folder setup for every Claude app on a computer**: a terminal command
+  writes a per-user config file that every Claudex server reads (Claude Code
+  plugin, claude.ai account plugin, desktop extension); no restart needed.
+  `server.py --configure-roots <folder>...`, `--show-roots`, and
+  `--revoke-roots`, a kill switch that denies every folder until you
+  configure again. No MCP tool can change it, and it is never read from a
+  project.
+- **Plugin folder setting** ("Project folder Codex may work in") for Claude
+  Code: one folder, set at install or with `/plugin configure`.
+- `/codex:setup`: walks through choosing folders and checking readiness.
+- `codex_status` shows the version, build id, distribution (plugin,
+  extension, cloud), server file, roots source and config file state;
+  deny-all messages name the cause and the exact fix.
+- README section "What Claudex sends, runs and stores" and `PRIVACY.md`.
+
+### Changed
+- **Locked dependencies**: `server/server.py.lock` ships with the server and
+  every launcher runs `uv run --locked --script` (plugin, desktop extension,
+  installer, cloud setup). The desktop extension bundle carries the lockfile,
+  and its build fails without it or when manifest validation fails.
+- Roots precedence (first match): revoke, `--allowed-roots`,
+  `CLAUDEX_ALLOWED_ROOTS`, plugin folder setting, config file, cloud default.
+  An unusable value in the selected source denies everything.
+- **The skill consults Codex only when you ask for it or have given standing
+  permission** (for example in CLAUDE.md or your account instructions), and
+  says once per conversation that consulting sends context to OpenAI. Your
+  message is forwarded as `user_prompt` when it is within the permitted scope.
+  To keep Codex as an always-on peer, add a line like this to your CLAUDE.md:
+  "Codex (Claudex) is a standing independent peer: consult it on non-trivial
+  technical work without asking."
+- `install.sh` checks uv's version and prints the `--configure-roots` command.
+
+### Upgrading
+- Run `uv self update` first (all surfaces).
+- Existing `CLAUDEX_ALLOWED_ROOTS` and desktop-extension folder choices keep
+  working and take precedence over the new config file.
+- Desktop extension: install `claudex.mcpb` 2.4.0, replacing the old one.
+
 ## 2.3.1 (2026-10-01) - security fixes
 
 Update now. These fix a file-deletion bug in all earlier versions, including

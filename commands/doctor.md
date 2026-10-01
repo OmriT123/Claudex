@@ -2,7 +2,7 @@
 name: doctor
 description: "Diagnose and fix Claudex issues — checks prerequisites, auth, connectivity, and common problems"
 argument-hint: ""
-allowed-tools: Read, Glob, Grep, Bash(which:*), Bash(codex --version), Bash(du:*), mcp__plugin_codex_codex__codex_ping, mcp__plugin_codex_codex__codex_login
+allowed-tools: Read, Glob, Grep, Bash(which:*), Bash(codex --version), Bash(uv --version), Bash(du:*), mcp__plugin_codex_codex__codex_ping, mcp__plugin_codex_codex__codex_login
 ---
 
 # Claudex Doctor
@@ -31,9 +31,11 @@ Run through these diagnostic checks in order. Stop at the first failure and help
      in Claude Code cloud sessions). In a terminal, `codex login` also works. If the
      environment sets `CODEX_API_KEY`, ping shows "API key from CODEX_API_KEY" and no
      sign-in is needed. Never print an API key.
-   - If roots show NOT CONFIGURED: point to README → "Workspace confinement
-     (required)" — every call is denied until roots are set (v2.0). Cloud sessions
-     default to the project directory ("cloud session default")
+   - If roots show NOT CONFIGURED: run `/codex:setup`; every call is denied
+     until roots are set (v2.0). The ping and `codex_status` name the source in
+     use and print the exact `--configure-roots` command. Cloud sessions default
+     to the project directory ("cloud session default"). "revoked" means the
+     user switched Claudex off with `--revoke-roots`; only re-enable on request
    - Only if the user wants a full round-trip: run `codex_ping` with
      `model_test=true` (spends one execution + OpenAI-side usage)
    - If it reports "A network policy blocked Codex's connection to <host>": the
@@ -45,9 +47,11 @@ Run through these diagnostic checks in order. Stop at the first failure and help
    - Check if `codex` tools are available via `/mcp`
    - If not: suggest `/reload-plugins`, then a full Claude Code session restart if still missing
 
-5. **uv available?**
-   - Run: `which uv`
-   - If missing: provide install command
+5. **uv available and new enough?**
+   - Run: `which uv` and `uv --version`
+   - If missing: provide the install command
+   - Below 0.11.4 the server refuses to start ("Required uv version `>=0.11.4`"):
+     tell the user to run `uv self update`, then `/reload-plugins`
 
 6. **Plugin registered?**
    - Check if plugin appears in Claude Code's plugin list

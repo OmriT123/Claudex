@@ -86,6 +86,11 @@ def _default_allowed_roots(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
     monkeypatch.setenv("CLAUDEX_STATE_DIR", str(tmp_path / ".claudex-state"))
+    # v2.4: never read the developer's real roots config or plugin setting.
+    import server as _srv
+    monkeypatch.setattr(_srv, "_config_path", lambda: tmp_path / ".claudex-config" / "config.json")
+    monkeypatch.delenv("CLAUDEX_PLUGIN_FOLDER", raising=False)
+    monkeypatch.delenv("CLAUDEX_DISTRIBUTION", raising=False)
     # v2.2: the suite may itself run inside a Claude Code cloud session; the
     # cloud-default root must never leak into tests that expect deny-all.
     monkeypatch.delenv("CLAUDE_CODE_REMOTE", raising=False)
@@ -2017,7 +2022,8 @@ class TestAllowedRootsPlaceholder:
         # until real roots are configured.
         monkeypatch.setenv(ALLOWED_ROOTS_ENV, "${user_config.allowed_roots}")
         project = tmp_path / "repo"; project.mkdir()
-        with pytest.raises(ValueError, match="No workspace roots configured"):
+        # v2.4: the message names the source that yielded nothing.
+        with pytest.raises(ValueError, match="yields no usable folder"):
             _validate_project_dir(str(project))
 
     def test_non_template_dollar_part_still_fails_closed(self, tmp_path, monkeypatch):
@@ -2713,7 +2719,16 @@ class TestPluginManifest:
         assert "mcpServers" not in mcp
         server = mcp["codex"]
         assert server["command"] == "uv"
-        assert server["args"][-1].endswith("server/server.py")
+        # v2.4: the full argv is the contract (locked, script mode).
+        assert server["args"] == ["run", "--locked", "--script", "${CLAUDE_PLUGIN_ROOT}/server/server.py"]
+        assert server["env"] == {"CLAUDEX_PLUGIN_FOLDER": "${user_config.allowed_folder}"}
+
+    def test_folder_setting_has_default_so_cowork_keeps_the_server(self):
+        # Cowork skips an MCP server whose ${user_config.*} option has no
+        # default and never prompts; "" keeps the server and means "unset".
+        opt = self._manifest()["userConfig"]["allowed_folder"]
+        assert opt["type"] == "directory" and opt["default"] == ""
+        assert "multiple" not in opt  # multi-values arrive comma-joined (lossy)
 
     def test_declaration_not_moved_into_manifest(self):
         # Upstream anthropics/claude-code#16143 (open) drops plugin.json's
@@ -4272,6 +4287,255 @@ def test_server_version_matches_manifests():
     plugin = json.loads((PROJECT_ROOT / ".claude-plugin" / "plugin.json").read_text())
     ext = json.loads((PROJECT_ROOT / "desktop-extension" / "manifest.json").read_text())
     assert srv.SERVER_VERSION == plugin["version"] == ext["version"]
+
+
+# =========================================================================
+# v2.4: roots sources, config file, kill switch, CLI, lockfile
+# =========================================================================
+
+def _write_cfg(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data))
+
+
+class TestV24RootsResolution:
+    @pytest.fixture
+    def cfg(self, tmp_path):
+        import server as srv
+        return srv._config_path()
+
+    @pytest.fixture
+    def clean_env(self, monkeypatch):
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+
+    def test_none_configured_denies(self, clean_env):
+        import server as srv
+        res = srv._roots_resolution()
+        assert res.roots == [] and res.source == "none"
+
+    def test_config_file_supplies_roots(self, tmp_path, cfg, clean_env):
+        import server as srv
+        proj = tmp_path / "projects"; proj.mkdir()
+        _write_cfg(cfg, {"version": 1, "allowed_roots": [str(proj)]})
+        res = srv._roots_resolution()
+        assert res.roots == [proj.resolve()] and res.source == "config-file"
+        assert srv._validate_project_dir(str(proj)) == str(proj.resolve())
+
+    def test_env_beats_config_file(self, tmp_path, cfg, monkeypatch):
+        import server as srv
+        a = tmp_path / "a"; a.mkdir(); b = tmp_path / "b"; b.mkdir()
+        _write_cfg(cfg, {"version": 1, "allowed_roots": [str(a)]})
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(b))
+        res = srv._roots_resolution()
+        assert res.source == "env" and res.roots == [b.resolve()]
+
+    def test_plugin_folder_beats_config_file(self, tmp_path, cfg, clean_env, monkeypatch):
+        import server as srv
+        a = tmp_path / "a"; a.mkdir(); b = tmp_path / "b c"; b.mkdir()
+        _write_cfg(cfg, {"version": 1, "allowed_roots": [str(a)]})
+        monkeypatch.setenv("CLAUDEX_PLUGIN_FOLDER", str(b))
+        res = srv._roots_resolution()
+        assert res.source == "plugin-setting" and res.roots == [b.resolve()]
+
+    def test_invalid_plugin_folder_denies_without_fallthrough(self, tmp_path, cfg, clean_env, monkeypatch):
+        import server as srv
+        a = tmp_path / "a"; a.mkdir()
+        _write_cfg(cfg, {"version": 1, "allowed_roots": [str(a)]})
+        monkeypatch.setenv("CLAUDEX_PLUGIN_FOLDER", str(tmp_path / "missing"))
+        res = srv._roots_resolution()
+        assert res.roots == [] and res.source == "plugin-setting"
+        with pytest.raises(ValueError, match="plugin's settings"):
+            srv._validate_project_dir(str(a))
+
+    def test_relative_plugin_folder_denies(self, clean_env, monkeypatch):
+        import server as srv
+        monkeypatch.setenv("CLAUDEX_PLUGIN_FOLDER", "relative/dir")
+        assert srv._roots_resolution().roots == []
+
+    def test_unexpanded_plugin_folder_template_is_unset(self, tmp_path, cfg, clean_env, monkeypatch):
+        import server as srv
+        a = tmp_path / "a"; a.mkdir()
+        _write_cfg(cfg, {"version": 1, "allowed_roots": [str(a)]})
+        monkeypatch.setenv("CLAUDEX_PLUGIN_FOLDER", "${user_config.allowed_folder}")
+        assert srv._roots_resolution().source == "config-file"
+
+    def test_revocation_beats_everything(self, tmp_path, cfg, monkeypatch):
+        import server as srv
+        a = tmp_path / "a"; a.mkdir()
+        _write_cfg(cfg, {"version": 1, "deny_all": True, "allowed_roots": []})
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(a))
+        monkeypatch.setenv("CLAUDEX_PLUGIN_FOLDER", str(a))
+        monkeypatch.setattr(srv, "_ARGV_ROOTS", [str(a)])
+        res = srv._roots_resolution()
+        assert res.roots == [] and res.source == "revoked"
+        with pytest.raises(ValueError, match="switched off"):
+            srv._validate_project_dir(str(a))
+
+    @pytest.mark.parametrize("content", [
+        "{not json",
+        json.dumps({"version": 99, "allowed_roots": []}),
+        json.dumps({"version": 1, "allowed_roots": "nope"}),
+        json.dumps({"version": 1, "allowed_roots": ["relative/x"]}),
+        json.dumps(["just", "a", "list"]),
+    ])
+    def test_malformed_config_denies_everything(self, tmp_path, cfg, monkeypatch, content):
+        import server as srv
+        a = tmp_path / "a"; a.mkdir()
+        cfg.parent.mkdir(parents=True, exist_ok=True); cfg.write_text(content)
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(a))
+        res = srv._roots_resolution()
+        assert res.roots == [] and res.source == "config-error"
+
+    def test_cloud_default_still_last(self, tmp_path, clean_env, monkeypatch):
+        import server as srv
+        proj = tmp_path / "cloudproj"; proj.mkdir()
+        monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(proj))
+        assert srv._roots_resolution().source == "cloud-default"
+
+    def test_config_path_ignores_state_and_plugin_data_env(self, monkeypatch):
+        import importlib
+        import server as srv
+        real = srv.__dict__["_config_path"]
+        # The autouse fixture patched the module attribute; check the original
+        # function through a fresh import of the source.
+        spec = importlib.util.spec_from_file_location("server_fresh", srv.__file__)
+        fresh = importlib.util.module_from_spec(spec); spec.loader.exec_module(fresh)
+        monkeypatch.setenv("CLAUDEX_STATE_DIR", "/tmp/elsewhere")
+        monkeypatch.setenv("CLAUDE_PLUGIN_DATA", "/tmp/plugin-data")
+        path = str(fresh._config_path())
+        assert "elsewhere" not in path and "plugin-data" not in path
+        assert path.endswith("config.json")
+        del real
+
+
+class TestV24RootsCli:
+    def _cli(self, *args):
+        import server as srv
+        return srv._roots_cli(list(args))
+
+    def test_configure_writes_resolved_roots(self, tmp_path, capsys):
+        import server as srv
+        proj = tmp_path / "projects"; proj.mkdir()
+        assert self._cli("--configure-roots", str(proj)) == 0
+        data = json.loads(srv._config_path().read_text())
+        assert data["allowed_roots"] == [str(proj.resolve())] and data["deny_all"] is False
+        assert oct(srv._config_path().stat().st_mode & 0o777) == "0o600"
+
+    @pytest.mark.parametrize("bad", ["relative", "/definitely/missing/dir", "/"])
+    def test_configure_rejects_bad_folders_and_writes_nothing(self, bad, tmp_path, capsys):
+        import server as srv
+        assert self._cli("--configure-roots", bad) == 2
+        assert not srv._config_path().exists()
+
+    def test_configure_rejects_home_and_protected(self, tmp_path, monkeypatch):
+        import server as srv
+        home = tmp_path / "home"; (home / ".ssh").mkdir(parents=True)
+        monkeypatch.setattr(srv.Path, "home", classmethod(lambda cls: home))
+        monkeypatch.setenv("HOME", str(home))
+        assert self._cli("--configure-roots", str(home)) == 2
+        assert self._cli("--configure-roots", str(home / ".ssh")) == 2
+        assert not srv._config_path().exists()
+
+    def test_revoke_then_reconfigure(self, tmp_path, monkeypatch):
+        import server as srv
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        proj = tmp_path / "p"; proj.mkdir()
+        assert self._cli("--revoke-roots") == 0
+        assert srv._roots_resolution().source == "revoked"
+        assert self._cli("--configure-roots", str(proj)) == 0
+        assert srv._roots_resolution().source == "config-file"
+
+    def test_show_roots(self, capsys):
+        assert self._cli("--show-roots") == 0
+        out = capsys.readouterr().out
+        assert "Config file:" in out and "This shell resolves:" in out
+
+    def test_cli_not_exposed_as_tool(self):
+        import server as srv
+        names = {t.name for t in srv.mcp._tool_manager.list_tools()}
+        assert not any("root" in n for n in names)
+
+
+class TestV24Diagnostics:
+    @pytest.mark.asyncio
+    async def test_status_reports_source_build_and_config(self, tmp_path, monkeypatch):
+        import server as srv
+        monkeypatch.setenv("CLAUDEX_DISTRIBUTION", "mcpb")
+        out = await srv.codex_status(srv.StatusInput())
+        assert "(source: CLAUDEX_ALLOWED_ROOTS)" in out
+        assert "desktop extension (.mcpb)" in out
+        assert "Server file:" in out and "Roots config:" in out
+        assert f"build {srv._build_id()}" in out
+
+    @pytest.mark.asyncio
+    async def test_status_deny_all_shows_configure_command(self, monkeypatch):
+        import server as srv
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        out = await srv.codex_status(srv.StatusInput())
+        assert "DENY-ALL" in out and "--configure-roots" in out
+
+
+class TestV24Lockfile:
+    def _uv_new_enough(self):
+        uv = shutil.which("uv")
+        if not uv:
+            return None
+        out = subprocess.run([uv, "--version"], capture_output=True, text=True).stdout.split()
+        import server as srv
+        return uv if len(out) > 1 and srv._version_at_least(out[1], "0.11.4") else None
+
+    def test_metadata_declares_uv_floor(self):
+        head = (PROJECT_ROOT / "server" / "server.py").read_text().split("# ///\n")[0]
+        assert 'required-version = ">=0.11.4"' in head
+
+    def test_lockfile_shipped_and_small_enough_for_directory(self):
+        lock = PROJECT_ROOT / "server" / "server.py.lock"
+        assert lock.is_file()
+        assert lock.stat().st_size < 256 * 1024  # directory holds non-image files >= 256 KiB
+
+    def test_lockfile_is_fresh(self):
+        uv = self._uv_new_enough()
+        if not uv:
+            pytest.skip("uv >= 0.11.4 not on PATH")
+        r = subprocess.run([uv, "lock", "--script", str(PROJECT_ROOT / "server" / "server.py"), "--check"],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+
+    def test_every_launcher_is_locked(self):
+        for rel in ("install.sh", "cloud/setup.sh"):
+            text = (PROJECT_ROOT / rel).read_text()
+            assert "uv sync --locked --script" in text, rel
+        mf = json.loads((PROJECT_ROOT / "desktop-extension" / "manifest.json").read_text())
+        launcher = mf["server"]["mcp_config"]["args"][1]
+        assert 'exec uv run --locked --script "${__dirname}/server/server.py"' in launcher
+        assert "CLAUDEX_DISTRIBUTION=mcpb" in launcher
+
+    def test_mcpb_bundle_carries_the_lock(self, tmp_path):
+        if not shutil.which("zip"):
+            pytest.skip("zip not installed")
+        work = tmp_path / "repo"
+        shutil.copytree(PROJECT_ROOT / "desktop-extension", work / "desktop-extension")
+        (work / "server").mkdir()
+        for name in ("server.py", "server.py.lock"):
+            shutil.copy(PROJECT_ROOT / "server" / name, work / "server" / name)
+        env = {**os.environ, "CLAUDEX_SKIP_MCPB_VALIDATE": "1"}
+        r = subprocess.run(["bash", str(work / "desktop-extension" / "build.sh")],
+                           capture_output=True, text=True, env=env)
+        assert r.returncode == 0, r.stderr
+        import zipfile
+        names = zipfile.ZipFile(work / "desktop-extension" / "claudex.mcpb").namelist()
+        assert "server/server.py.lock" in names and "server/server.py" in names
+
+    def test_build_refuses_without_lock(self, tmp_path):
+        work = tmp_path / "repo"
+        shutil.copytree(PROJECT_ROOT / "desktop-extension", work / "desktop-extension")
+        (work / "server").mkdir()
+        shutil.copy(PROJECT_ROOT / "server" / "server.py", work / "server" / "server.py")
+        env = {**os.environ, "CLAUDEX_SKIP_MCPB_VALIDATE": "1"}
+        r = subprocess.run(["bash", str(work / "desktop-extension" / "build.sh")],
+                           capture_output=True, text=True, env=env)
+        assert r.returncode != 0 and "server.py.lock missing" in r.stderr
 
 
 # =========================================================================

@@ -22,6 +22,7 @@ Codex runs in a read-only sandbox and never modifies your files.
 | `/codex:review [files]` | Focused code review on specific files | 1 msg |
 | `/codex:review-diff [focus]` | Review your git diff before committing | 1 msg |
 | `/codex:recap [session_id]` | Generate decision record from a session | 1 msg |
+| `/codex:setup [folders]` | Choose the folders Codex may work in, then check readiness | free |
 | `/codex:login` | Sign Codex in to ChatGPT with a one-time code (no browser needed) | free |
 | `/codex:status` | Diagnostics dashboard | free |
 | `/codex:help` | This guide | free |

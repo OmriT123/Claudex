@@ -1,4 +1,4 @@
-# Claudex — Claude Code Plugin <sup>v2.3.1</sup>
+# Claudex — Claude Code Plugin <sup>v2.4.0</sup>
 
 Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, security-testing, debugging, verification, and decision support.
 
@@ -42,27 +42,41 @@ with clear CC/Codex attribution
    codex login
    ```
 
-2. **uv** — Python package runner (handles dependencies automatically):
+2. **uv 0.11.4 or newer**: Python package runner. The server's dependencies are
+   pinned in `server/server.py.lock` and launched with `uv run --locked`; older uv
+   ignored that flag when the lockfile was missing, so the server declares this floor
+   and older uv refuses to start it ("Required uv version `>=0.11.4`"):
    ```bash
-   curl -LsSf https://astral.sh/uv/install.sh | sh
+   curl -LsSf https://astral.sh/uv/install.sh | sh   # new install
+   uv self update                                    # existing install
    ```
 
 3. **Claude Code** — recent version with plugin support.
 
 ## Installation
 
-In any Claude Code session, run:
+**Claude Code:** in any session, run:
 
 ```
 /plugin marketplace add OmriT123/claude-plugins
 /plugin install claudex@omri-plugins
 ```
 
-Start a new session and you're ready to go.
+**Your claude.ai account (chat, Cowork and Claude Code):** in claude.ai or the
+Claude desktop app, open **Customize > Plugins > Add > Add marketplace**, enter
+`OmriT123/claude-plugins`, then select **Add** on Claudex. The skill and commands
+load everywhere you use that account, and the plugin syncs to Claude Code. The
+Codex tools themselves run on your computer: in the desktop app while it is
+open, in Claude Code locally. If they don't appear in the desktop app, install
+the desktop extension below.
+
+Then choose the folders Codex may work in: run `/codex:setup`, or see
+[Workspace confinement](#workspace-confinement-required).
 
 ### Verify
 
 - `/mcp` — should show `codex` with its tools
+- `codex_status` (free) — shows the version, build and where the roots come from
 - Type: `use codex_ping to check if Codex is working`
 
 <details>
@@ -92,11 +106,34 @@ This is **working-directory confinement**, not an OS-level read sandbox: it
 controls the directory Codex is launched in (`cwd`) and which directories you
 may select, and `--sandbox read-only` prevents writes. Codex still runs with
 your normal file permissions, so OS-level read isolation is not claimed here
-(it's on the roadmap). Configure the working directories Codex may run in:
+(it's on the roadmap). Configure the working directories Codex may run in, in
+whichever way fits:
 
-- **Claude Code (plugin)** — export `CLAUDEX_ALLOWED_ROOTS` in your shell profile
-  before launching `claude`; the plugin's server inherits Claude Code's process
-  environment.
+- **Every Claude app on this computer (v2.4, recommended)**: one terminal
+  command writes a per-user config file that every Claudex server on the machine
+  reads (plugin, account plugin, desktop extension). It takes effect on the next
+  call; nothing to restart. `codex_status` prints the exact path to use.
+
+  ```bash
+  uv run --locked --script /path/to/claudex/server/server.py --configure-roots ~/Projects ~/work
+  uv run --locked --script /path/to/claudex/server/server.py --show-roots
+  uv run --locked --script /path/to/claudex/server/server.py --revoke-roots   # kill switch
+  ```
+
+  `--revoke-roots` switches Claudex off on this computer: it beats every other
+  setting until you run `--configure-roots` again. The file lives in
+  `~/Library/Application Support/Botique/Claudex/config.json` (macOS),
+  `~/.config/botique-claudex/config.json` (Linux) or
+  `%APPDATA%\Botique\Claudex\config.json` (Windows). It is never read from a
+  project, and no MCP tool can change it. Your home folder itself, filesystem
+  roots and protected locations are refused.
+
+- **Claude Code, one folder**: the plugin setting "Project folder Codex may work
+  in" (`/plugin configure`, or the prompt at install).
+
+- **Claude Code, several folders**: export `CLAUDEX_ALLOWED_ROOTS` in your shell
+  profile before launching `claude`; the plugin's server inherits Claude Code's
+  process environment.
 
   ```bash
   export CLAUDEX_ALLOWED_ROOTS="/Users/you/Projects:/Users/you/work"
@@ -122,10 +159,22 @@ your normal file permissions, so OS-level read isolation is not claimed here
   Claude Code reports a cloud session (`CLAUDE_CODE_REMOTE=true`). An explicit
   `CLAUDEX_ALLOWED_ROOTS` still wins. See "Claude Code cloud sessions" below.
 
+**Which setting wins** (first match; `codex_status` names the one in use):
+
+| Order | Source | Notes |
+|---|---|---|
+| 1 | `--revoke-roots` in the config file | kill switch: denies everything |
+| 2 | `--allowed-roots` on the server command line | desktop extension launcher on Windows |
+| 3 | `CLAUDEX_ALLOWED_ROOTS` | shell profile, MCP `env` block, desktop extension folder picker |
+| 4 | Plugin folder setting | one folder; an invalid folder denies everything |
+| 5 | Config file from `--configure-roots` | an unreadable or malformed file denies everything |
+| 6 | Claude Code cloud session default | the session's project directory |
+| 7 | nothing | every project directory is denied |
+
 Protected locations (`~/.ssh`, `~/.aws`, keychains, `~/.codex`, …) cannot be
 selected as a working directory, even inside an allowed root (this bounds where
 Codex runs — it is not a read-time filter on individual files). If a call fails
-with "No workspace roots configured", this section is the fix.
+because no folders are allowed, this section (or `/codex:setup`) is the fix.
 
 **Not a sandbox against a repository you open.** Claudex runs your local `git`
 against the working directory for diff review and context. A git repository can,
@@ -141,6 +190,23 @@ the roadmap.
 **Upgrading from ≤1.8.x:** after updating, Claudex will refuse every call until
 you set roots as above — this is intentional. One line of config restores your
 workflow, now with an explicit boundary.
+
+## What Claudex sends, runs and stores
+
+- **Sends to OpenAI, under your own Codex sign-in:** the task text Claude passes
+  in (including your message as `user_prompt`, when it is in scope), earlier
+  rounds of a collab session, git context (branch, diff stat, last 5 commit
+  subjects; the full diff for `codex_review_diff`) and the contents of any
+  project files Codex chooses to read. Botique receives nothing; there is no
+  Claudex server or telemetry.
+- **Runs on your computer:** the Codex CLI (read-only sandbox), `git` in the
+  project, and `uv`, which downloads the pinned Python packages on first start.
+- **Stores:** `.claudex/` in the project (artifacts about 1 hour; sessions,
+  recaps and job results about 24 hours, cleaned on later calls) and, per user,
+  a daily execution counter and your allowed-folders file.
+
+Details: [PRIVACY.md](PRIVACY.md). Decide before use whether you may share a
+project's code with OpenAI.
 
 ## Claude Code cloud sessions (claude.ai/code, mobile)
 
@@ -190,6 +256,7 @@ with no setup.
 | `/codex:recap [session_id]` | Generate a decision record from a collaboration session |
 | `/codex:review [files]` | Get a focused code review from Codex on specific files |
 | `/codex:review-diff [focus]` | Get Codex to review your git diff before committing |
+| `/codex:setup [folders]` | Choose the folders Codex may work in (workspace roots), then check readiness |
 | `/codex:login` | Sign Codex in to ChatGPT with a one-time code — no browser needed (cloud sessions, SSH) |
 | `/codex:status` | Show Claudex diagnostics (zero Codex cost) |
 | `/codex:help` | Quick start guide |
@@ -222,7 +289,9 @@ available in the Claude desktop app and get proxied into Cowork cloud sessions:
 
 Double-click `claudex.mcpb` to install (Settings → Extensions if prompted),
 then fully restart the Claude desktop app. Prerequisites on the target Mac:
-[uv](https://astral.sh/uv) and the Codex CLI (`npm i -g @openai/codex && codex login`).
+[uv](https://astral.sh/uv) 0.11.4 or newer and the Codex CLI
+(`npm i -g @openai/codex@latest && codex login`). The bundle carries the server
+and its lockfile; replace an older `.mcpb` rather than keeping both.
 
 Note for capped transports (e.g. Cowork's device bridge, which limits tool calls
 to 60s): use `codex_submit` / `codex_result` — see Async jobs below.
@@ -395,7 +464,8 @@ Claudex/
 │   └── plugin.json          # Plugin manifest
 ├── .mcp.json                # MCP server registration
 ├── server/
-│   └── server.py            # Python MCP server (runs via uv)
+│   ├── server.py            # Python MCP server (runs via uv)
+│   └── server.py.lock       # Pinned dependencies (uv run --locked)
 ├── commands/
 │   ├── plan.md              # /codex:plan
 │   ├── brainstorm.md        # /codex:brainstorm
@@ -407,10 +477,11 @@ Claudex/
 │   ├── status.md            # /codex:status
 │   ├── help.md              # /codex:help
 │   ├── doctor.md            # /codex:doctor
-│   └── login.md             # /codex:login
+│   ├── login.md             # /codex:login
+│   └── setup.md             # /codex:setup
 ├── skills/
 │   └── claudex/
-│       └── SKILL.md         # Auto-triggers during plan mode
+│       └── SKILL.md         # When and how Claude consults Codex
 ├── tests/
 │   └── test_helpers.py      # Test suite (uv run --script)
 ├── .claudex/                # Scratchpad (gitignored)
@@ -422,6 +493,8 @@ Claudex/
 │   └── setup.sh             # Claude Code cloud environment setup script
 ├── docs/
 │   └── initial-plan.md      # Original design document
+├── CHANGELOG.md
+├── PRIVACY.md
 ├── CLAUDE.md
 ├── README.md
 └── LICENSE

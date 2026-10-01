@@ -75,10 +75,10 @@ main() {
   server=$(installed_server)
   if [ -z "$server" ]; then
     log "FAIL: could not locate the installed $PLUGIN (claude plugin list --json)"; failed=1
-  elif (cd /tmp && timeout 300 uv sync --script "$server" </dev/null >/dev/null 2>&1); then
+  elif (cd /tmp && timeout 300 uv sync --locked --script "$server" </dev/null >/dev/null 2>&1); then
     log "server dependencies prepared for $server"
   else
-    log "FAIL: server dependency preparation (uv sync --script $server)"; failed=1
+    log "FAIL: server dependency preparation (uv sync --locked --script $server)"; failed=1
   fi
 
   if [ "$failed" -eq 0 ]; then log "setup finished: OK"; else log "setup finished WITH FAILURES (session still starts; see $LOG)"; fi
