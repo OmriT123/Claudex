@@ -7,9 +7,6 @@
       "--script",
       "${CLAUDE_PLUGIN_ROOT}/server/server.py"
     ],
-    "env": {
-      "CLAUDEX_PLUGIN_FOLDER": "${user_config.allowed_folder}"
-    },
     "timeout": 1800000
   }
 }

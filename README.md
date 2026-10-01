@@ -128,10 +128,7 @@ whichever way fits:
   project, and no MCP tool can change it. Your home folder itself, filesystem
   roots and protected locations are refused.
 
-- **Claude Code, one folder**: the plugin setting "Project folder Codex may work
-  in" (`/plugin configure`, or the prompt at install).
-
-- **Claude Code, several folders**: export `CLAUDEX_ALLOWED_ROOTS` in your shell
+- **Claude Code only**: export `CLAUDEX_ALLOWED_ROOTS` in your shell
   profile before launching `claude`; the plugin's server inherits Claude Code's
   process environment.
 
@@ -166,10 +163,9 @@ whichever way fits:
 | 1 | `--revoke-roots` in the config file | kill switch: denies everything |
 | 2 | `--allowed-roots` on the server command line | desktop extension launcher on Windows |
 | 3 | `CLAUDEX_ALLOWED_ROOTS` | shell profile, MCP `env` block, desktop extension folder picker |
-| 4 | Plugin folder setting | one folder; an invalid folder denies everything |
-| 5 | Config file from `--configure-roots` | an unreadable or malformed file denies everything |
-| 6 | Claude Code cloud session default | the session's project directory |
-| 7 | nothing | every project directory is denied |
+| 4 | Config file from `--configure-roots` | an unreadable or malformed file denies everything |
+| 5 | Claude Code cloud session default | the session's project directory |
+| 6 | nothing | every project directory is denied |
 
 Protected locations (`~/.ssh`, `~/.aws`, keychains, `~/.codex`, …) cannot be
 selected as a working directory, even inside an allowed root (this bounds where
@@ -512,6 +508,7 @@ Claudex/
 | Timeout | Narrow `focus_files` or raise `timeout_seconds` (lowering `reasoning_effort` is a last resort) |
 | Empty response | Be more specific about the task |
 | Tools not showing | Check `/mcp`, restart CC session |
+| Server failed with "Required uv version `>=0.11.4`" | `uv self update`, then reconnect the `codex` server from `/mcp`. Claude Code holds a failed start for about 15 minutes, and neither a restart nor `/reload-plugins` clears it |
 | Calls cut off after 60s (cloud session) | Update to Claudex ≥ 2.2.0 (adds the per-server MCP timeout) |
 
 ## Credits

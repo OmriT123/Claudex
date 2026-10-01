@@ -86,7 +86,7 @@ def _default_allowed_roots(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
     monkeypatch.setenv("CLAUDEX_STATE_DIR", str(tmp_path / ".claudex-state"))
-    # v2.4: never read the developer's real roots config or plugin setting.
+    # v2.4: never read the developer's real roots config.
     import server as _srv
     monkeypatch.setattr(_srv, "_config_path", lambda: tmp_path / ".claudex-config" / "config.json")
     monkeypatch.delenv("CLAUDEX_PLUGIN_FOLDER", raising=False)
@@ -2721,14 +2721,15 @@ class TestPluginManifest:
         assert server["command"] == "uv"
         # v2.4: the full argv is the contract (locked, script mode).
         assert server["args"] == ["run", "--locked", "--script", "${CLAUDE_PLUGIN_ROOT}/server/server.py"]
-        assert server["env"] == {"CLAUDEX_PLUGIN_FOLDER": "${user_config.allowed_folder}"}
+        assert "env" not in server
 
-    def test_folder_setting_has_default_so_cowork_keeps_the_server(self):
-        # Cowork skips an MCP server whose ${user_config.*} option has no
-        # default and never prompts; "" keeps the server and means "unset".
-        opt = self._manifest()["userConfig"]["allowed_folder"]
-        assert opt["type"] == "directory" and opt["default"] == ""
-        assert "multiple" not in opt  # multi-values arrive comma-joined (lossy)
+    def test_no_user_config_anywhere(self):
+        # The desktop app can leave a plugin MCP server that needs plugin
+        # settings unstarted (user_config_unsupported); one server config must
+        # start on every surface. Roots come from --configure-roots, the env
+        # var or the cloud default instead.
+        assert "userConfig" not in self._manifest()
+        assert "user_config" not in (PROJECT_ROOT / ".mcp.json").read_text()
 
     def test_declaration_not_moved_into_manifest(self):
         # Upstream anthropics/claude-code#16143 (open) drops plugin.json's
@@ -4329,42 +4330,22 @@ class TestV24RootsResolution:
         res = srv._roots_resolution()
         assert res.source == "env" and res.roots == [b.resolve()]
 
-    def test_plugin_folder_beats_config_file(self, tmp_path, cfg, clean_env, monkeypatch):
+    def test_no_plugin_folder_source(self, tmp_path, cfg, clean_env, monkeypatch):
+        # The plugin folder setting was removed before release; a stray env
+        # var from a pre-release build must not grant a root.
         import server as srv
-        a = tmp_path / "a"; a.mkdir(); b = tmp_path / "b c"; b.mkdir()
+        a = tmp_path / "a"; a.mkdir(); b = tmp_path / "b"; b.mkdir()
         _write_cfg(cfg, {"version": 1, "allowed_roots": [str(a)]})
         monkeypatch.setenv("CLAUDEX_PLUGIN_FOLDER", str(b))
         res = srv._roots_resolution()
-        assert res.source == "plugin-setting" and res.roots == [b.resolve()]
-
-    def test_invalid_plugin_folder_denies_without_fallthrough(self, tmp_path, cfg, clean_env, monkeypatch):
-        import server as srv
-        a = tmp_path / "a"; a.mkdir()
-        _write_cfg(cfg, {"version": 1, "allowed_roots": [str(a)]})
-        monkeypatch.setenv("CLAUDEX_PLUGIN_FOLDER", str(tmp_path / "missing"))
-        res = srv._roots_resolution()
-        assert res.roots == [] and res.source == "plugin-setting"
-        with pytest.raises(ValueError, match="plugin's settings"):
-            srv._validate_project_dir(str(a))
-
-    def test_relative_plugin_folder_denies(self, clean_env, monkeypatch):
-        import server as srv
-        monkeypatch.setenv("CLAUDEX_PLUGIN_FOLDER", "relative/dir")
-        assert srv._roots_resolution().roots == []
-
-    def test_unexpanded_plugin_folder_template_is_unset(self, tmp_path, cfg, clean_env, monkeypatch):
-        import server as srv
-        a = tmp_path / "a"; a.mkdir()
-        _write_cfg(cfg, {"version": 1, "allowed_roots": [str(a)]})
-        monkeypatch.setenv("CLAUDEX_PLUGIN_FOLDER", "${user_config.allowed_folder}")
-        assert srv._roots_resolution().source == "config-file"
+        assert res.source == "config-file" and res.roots == [a.resolve()]
+        assert not hasattr(srv, "PLUGIN_FOLDER_ENV")
 
     def test_revocation_beats_everything(self, tmp_path, cfg, monkeypatch):
         import server as srv
         a = tmp_path / "a"; a.mkdir()
         _write_cfg(cfg, {"version": 1, "deny_all": True, "allowed_roots": []})
         monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(a))
-        monkeypatch.setenv("CLAUDEX_PLUGIN_FOLDER", str(a))
         monkeypatch.setattr(srv, "_ARGV_ROOTS", [str(a)])
         res = srv._roots_resolution()
         assert res.roots == [] and res.source == "revoked"

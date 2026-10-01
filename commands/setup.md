@@ -18,7 +18,7 @@ Help the user choose them once. Folders: $ARGUMENTS
 2. **See what is configured.** Run
    `uv run --locked --script ${CLAUDE_PLUGIN_ROOT}/server/server.py --show-roots`
    and call `codex_status` (free). The status `Roots:` line names the source in
-   use (env var, plugin folder setting, config file, cloud default) or says
+   use (env var, config file, cloud default) or says
    DENY-ALL.
 
 3. **If no folders are set, ask which folders** Codex may work in, unless the
@@ -29,9 +29,7 @@ Help the user choose them once. Folders: $ARGUMENTS
      `uv run --locked --script ${CLAUDE_PLUGIN_ROOT}/server/server.py --configure-roots <folder> [<folder> ...]`
      Takes effect on the next call, no restart. This changes a per-user settings
      file, so show the exact command and get the user's OK before running it.
-   - **Claude Code only, one folder:** `/plugin configure`, then the
-     "Project folder Codex may work in" setting.
-   - **Claude Code only, several folders:** `export CLAUDEX_ALLOWED_ROOTS="<a>:<b>"`
+   - **Claude Code only:** `export CLAUDEX_ALLOWED_ROOTS="<a>:<b>"`
      in the shell profile, then restart Claude Code.
 
 4. **Verify.** Call `codex_status` again and confirm the `Roots:` line lists the

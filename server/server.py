@@ -98,15 +98,16 @@ _UNEXPANDED_TEMPLATE_RE = re.compile(r"\$\{user_config\.[^}]*\}")
 # var. Never applies locally; an explicit env var or --allowed-roots always wins.
 CLOUD_SESSION_ENV = "CLAUDE_CODE_REMOTE"
 PROJECT_DIR_ENV = "CLAUDE_PROJECT_DIR"
-# v2.4: two more roots sources, below argv/env in precedence.
-#  - CLAUDEX_PLUGIN_FOLDER: the plugin's single-folder userConfig option
-#    (.mcp.json maps ${user_config.allowed_folder} here; "" when unset).
-#  - A per-user config file written ONLY by the terminal command
-#    `server.py --configure-roots <dir>...` / `--revoke-roots`. It lives in a
-#    fixed OS location (never the project, never CLAUDE_PLUGIN_DATA), so every
-#    surface on the machine sees the same file and a renamed/updated plugin
-#    keeps it. `--revoke-roots` is a kill switch that beats every source.
-PLUGIN_FOLDER_ENV = "CLAUDEX_PLUGIN_FOLDER"
+# v2.4: one more roots source, below argv/env in precedence: a per-user
+# config file written ONLY by the terminal command
+# `server.py --configure-roots <dir>...` / `--revoke-roots`. It lives in a
+# fixed OS location (never the project, never CLAUDE_PLUGIN_DATA), so every
+# surface on the machine sees the same file and a renamed/updated plugin keeps
+# it. `--revoke-roots` is a kill switch that beats every source.
+# There is deliberately no plugin `userConfig` folder option: the desktop app
+# can leave a plugin MCP server that needs plugin settings unstarted
+# (user_config_unsupported), which would take Claudex down in chat/Cowork, and
+# the option only duplicated --configure-roots for one Claude Code folder.
 ROOTS_CONFIG_VERSION = 1
 ALWAYS_DENIED_SUBPATHS = (
     ".ssh", ".aws", ".gnupg", ".codex", ".config/gh",
@@ -752,7 +753,7 @@ def _config_path() -> Path:
 @dataclass(frozen=True)
 class _RootsResolution:
     roots: list
-    source: str   # revoked | argv | env | plugin-setting | config-file | config-error | cloud-default | none
+    source: str   # revoked | argv | env | config-file | config-error | cloud-default | none
     detail: str = ""
 
 
@@ -818,9 +819,9 @@ def _roots_resolution() -> _RootsResolution:
     """Resolve workspace roots and say where they came from (v2.4).
 
     Precedence: revocation (config kill switch) > --allowed-roots argv >
-    CLAUDEX_ALLOWED_ROOTS > plugin folder setting > config file > Claude Code
-    cloud default > none. Empty values mean "not set"; an unusable value in
-    the source that was selected denies everything, without falling through.
+    CLAUDEX_ALLOWED_ROOTS > config file > Claude Code cloud default > none.
+    Empty values mean "not set"; an unusable value in the source that was
+    selected denies everything, without falling through.
     """
     state, cfg_roots, cfg_detail = _load_roots_config()
     if state == "revoked":
@@ -833,15 +834,6 @@ def _roots_resolution() -> _RootsResolution:
     if raw:
         # os.pathsep, not a literal ':' — a ':' split corrupts C:\ paths on Windows.
         return _RootsResolution(_parse_root_parts(raw.split(os.pathsep)), "env", ALLOWED_ROOTS_ENV)
-    folder = os.environ.get(PLUGIN_FOLDER_ENV, "").strip()
-    if folder and not _UNEXPANDED_TEMPLATE_RE.fullmatch(folder):
-        expanded = os.path.expanduser(folder)
-        if not os.path.isabs(expanded) or not os.path.isdir(expanded):
-            return _RootsResolution(
-                [], "plugin-setting",
-                f"plugin folder setting {folder!r} is not an existing absolute folder",
-            )
-        return _RootsResolution([Path(expanded).resolve()], "plugin-setting", "plugin folder setting")
     if state == "ok":
         return _RootsResolution(cfg_roots, "config-file", cfg_detail)
     cloud = _cloud_default_roots()
@@ -855,7 +847,6 @@ _ROOTS_SOURCE_LABELS = {
     "config-error": "unusable config file",
     "argv": "--allowed-roots",
     "env": ALLOWED_ROOTS_ENV,
-    "plugin-setting": "plugin folder setting",
     "config-file": "config file (--configure-roots)",
     "cloud-default": f"Claude Code cloud session default ({PROJECT_DIR_ENV})",
     "none": "not configured",
@@ -943,11 +934,6 @@ def _no_roots_message(resolution: "_RootsResolution") -> str:
             f"The Claudex roots config is unusable, so every project directory is "
             f"denied: {resolution.detail}. Rewrite it in a terminal: {configure}"
         )
-    if resolution.source == "plugin-setting":
-        return (
-            f"Every project directory is denied: the {resolution.detail}. Pick an "
-            "existing folder in the plugin's settings (/plugin configure in Claude Code)."
-        )
     if resolution.source in ("argv", "env"):
         return (
             f"Every project directory is denied: {resolution.detail} is set but "
@@ -959,8 +945,8 @@ def _no_roots_message(resolution: "_RootsResolution") -> str:
         "No workspace roots configured, so every project directory is denied "
         "(deny-by-default since v2.0). Choose the folders Codex may work in, "
         f"one way: (1) in a terminal: {configure}  (works for every Claude app on "
-        "this computer, no restart); (2) Claude Code: the plugin's folder setting "
-        f"(/plugin configure) or export {ALLOWED_ROOTS_ENV} in your shell profile; "
+        f"this computer, no restart); (2) Claude Code: export {ALLOWED_ROOTS_ENV} "
+        "in your shell profile, then restart; "
         "(3) desktop extension: pick folders in its settings. "
         "See README: 'Workspace confinement (required)'."
     )
@@ -5421,8 +5407,8 @@ def _roots_cli(argv: list) -> int:
         for root in good:
             print(f"  {root}")
         print("Takes effect on the next Codex call; no restart needed.")
-        print(f"Note: {ALLOWED_ROOTS_ENV}, --allowed-roots and the plugin folder setting,")
-        print("when set, take precedence over this file.")
+        print(f"Note: {ALLOWED_ROOTS_ENV} and --allowed-roots, when set, take precedence")
+        print("over this file.")
         return 0
     # --show-roots
     state, _, detail = _load_roots_config()

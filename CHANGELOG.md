@@ -6,6 +6,9 @@ All notable changes to Claudex. Versions follow the plugin manifest.
 
 **Before updating: run `uv self update`.** Claudex now needs uv 0.11.4 or
 newer and refuses to start on older uv ("Required uv version `>=0.11.4`").
+If you updated first: run `uv self update`, then reconnect the `codex` server
+from `/mcp` (Claude Code holds a failed start for about 15 minutes, and
+neither a restart nor `/reload-plugins` clears it).
 
 ### Added
 - **One folder setup for every Claude app on a computer**: a terminal command
@@ -15,8 +18,6 @@ newer and refuses to start on older uv ("Required uv version `>=0.11.4`").
   `--revoke-roots`, a kill switch that denies every folder until you
   configure again. No MCP tool can change it, and it is never read from a
   project.
-- **Plugin folder setting** ("Project folder Codex may work in") for Claude
-  Code: one folder, set at install or with `/plugin configure`.
 - `/codex:setup`: walks through choosing folders and checking readiness.
 - `codex_status` shows the version, build id, distribution (plugin,
   extension, cloud), server file, roots source and config file state;
@@ -29,7 +30,7 @@ newer and refuses to start on older uv ("Required uv version `>=0.11.4`").
   installer, cloud setup). The desktop extension bundle carries the lockfile,
   and its build fails without it or when manifest validation fails.
 - Roots precedence (first match): revoke, `--allowed-roots`,
-  `CLAUDEX_ALLOWED_ROOTS`, plugin folder setting, config file, cloud default.
+  `CLAUDEX_ALLOWED_ROOTS`, config file, cloud default.
   An unusable value in the selected source denies everything.
 - **The skill consults Codex only when you ask for it or have given standing
   permission** (for example in CLAUDE.md or your account instructions), and

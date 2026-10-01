@@ -51,7 +51,9 @@ Run through these diagnostic checks in order. Stop at the first failure and help
    - Run: `which uv` and `uv --version`
    - If missing: provide the install command
    - Below 0.11.4 the server refuses to start ("Required uv version `>=0.11.4`"):
-     tell the user to run `uv self update`, then `/reload-plugins`
+     tell the user to run `uv self update`, then reconnect the `codex` server
+     from `/mcp` (Claude Code holds a failed start for about 15 minutes; a
+     restart or `/reload-plugins` does not clear it)
 
 6. **Plugin registered?**
    - Check if plugin appears in Claude Code's plugin list
