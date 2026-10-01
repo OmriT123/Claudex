@@ -4445,13 +4445,68 @@ class TestV24ConfigIntegrity:
         assert denied.startswith("Error:") and "SECRET-RESULT" not in denied
         assert str(proj) not in listing and "no longer allowed" in listing
 
-    def test_status_flags_an_ineffective_gitignore(self, tmp_path):
+    @pytest.mark.parametrize("body,state", [
+        ("", "unverified"),
+        ("*\n!*\n", "unverified"),
+        ("*\n!sessions/\n", "unverified"),
+        ("# Created by Claudex\n*\n", "ok"),
+    ])
+    def test_gitignore_state_is_ok_only_for_exactly_star(self, tmp_path, body, state):
         import server as srv
         claudex = tmp_path / ".claudex"; claudex.mkdir()
-        (claudex / ".gitignore").write_text("")
-        assert srv._claudex_ignore_state(claudex) == "ineffective"
-        (claudex / ".gitignore").write_text("# x\n*\n")
-        assert srv._claudex_ignore_state(claudex) == "ok"
+        (claudex / ".gitignore").write_text(body)
+        assert srv._claudex_ignore_state(claudex) == state
+
+    def test_gitignore_missing_is_reported(self, tmp_path):
+        import server as srv
+        claudex = tmp_path / ".claudex"; claudex.mkdir()
+        assert srv._claudex_ignore_state(claudex) == "missing"
+
+    @pytest.mark.asyncio
+    async def test_revocation_during_a_result_wait_withholds_it(self, tmp_path, monkeypatch):
+        import server as srv
+        proj = tmp_path / "p"; proj.mkdir()
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        job_id = "job-0123456789ac"
+        srv._jobs[job_id] = {"project_dir": str(proj), "tool": "plan", "status": "running",
+                             "submitted": 0.0, "finished": None, "started_running": 0.0,
+                             "result": None}
+
+        async def finish_after_revoke():
+            await asyncio.sleep(0.05)
+            srv._write_roots_config({"deny_all": True, "allowed_roots": []})
+            srv._jobs[job_id].update(status="completed", result="SECRET-LATE", finished=1.0)
+        srv._job_tasks[job_id] = asyncio.create_task(finish_after_revoke())
+        try:
+            out = await srv.codex_result(srv.JobResultInput(job_id=job_id, wait_seconds=5))
+        finally:
+            srv._jobs.pop(job_id, None)
+            srv._job_tasks.pop(job_id, None)
+        assert out.startswith("Error:") and "SECRET-LATE" not in out
+
+    def test_writable_ancestor_denies_even_without_a_file(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        shared = tmp_path / "shared"; shared.mkdir()
+        os.chmod(shared, 0o777)
+        monkeypatch.setattr(srv, "_config_path", lambda: shared / "botique-claudex" / "config.json")
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        res = srv._roots_resolution()
+        assert res.source == "config-error" and "writable by other accounts" in res.detail
+        with pytest.raises(OSError):
+            srv._write_roots_config({"deny_all": False, "allowed_roots": [str(tmp_path)]})
+
+    def test_symlink_inside_a_writable_folder_denies(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        safe = tmp_path / "safe" / "botique-claudex"; safe.mkdir(parents=True, mode=0o700)
+        shared = tmp_path / "shared"; shared.mkdir(); os.chmod(shared, 0o777)
+        (shared / "cfg").symlink_to(tmp_path / "safe")
+        monkeypatch.setattr(srv, "_config_path", lambda: shared / "cfg" / "botique-claudex" / "config.json")
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        assert srv._roots_resolution().source == "config-error"
 
     def test_prompts_do_not_claim_verbatim(self):
         import server as srv

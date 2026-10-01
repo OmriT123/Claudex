@@ -899,14 +899,46 @@ def _check_private(st, what: str) -> None:
         raise OSError(errno.EPERM, f"{what} is writable by other accounts")
 
 
+def _check_config_ancestors(path: Path) -> None:
+    """POSIX: every directory leading to the config folder, by name and after
+    resolving symlinks, must belong to this account or root and must not be
+    writable by other accounts (sticky directories such as /tmp excepted),
+    as ssh's StrictModes requires. Otherwise another account could move the
+    folder away (a revocation would read as "absent") or swap it (v2.4).
+    Checked even when the file does not exist yet.
+    """
+    if os.name == "nt":
+        return
+    uid = os.getuid()
+    start = path.parent
+    while not os.path.lexists(start) and start != start.parent:
+        start = start.parent
+    chain = [start, *start.parents]
+    real = Path(os.path.realpath(start))
+    chain += [real, *real.parents]
+    seen = set()
+    for d in chain:
+        if d in seen:
+            continue
+        seen.add(d)
+        st = os.stat(d)
+        if st.st_uid not in (uid, 0):
+            raise OSError(errno.EPERM, f"{d} belongs to another account")
+        if st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX:
+            raise OSError(errno.EPERM, f"{d} is writable by other accounts")
+
+
 def _read_roots_config_bytes(path: Path) -> bytes:
     """Bounded, no-follow read of the roots config (v2.4).
 
     The file and its own folder must be real (no symlink at either), owned by
     this account and not writable by others; anything else raises, and the
     caller treats it as unusable (deny-all), never as absent. Non-blocking, so
-    a FIFO cannot hang the server. FileNotFoundError only when it is missing.
+    a FIFO cannot hang the server. FileNotFoundError only when it is missing
+    and every folder leading to it is safe (_check_config_ancestors).
+    Windows: leaf checks only, until the Windows port (README says so).
     """
+    _check_config_ancestors(path)
     if os.name == "nt" or not (_O_NOFOLLOW and _O_DIRECTORY):
         st = os.lstat(path)
         if not stat.S_ISREG(st.st_mode):
@@ -1494,10 +1526,13 @@ def _ensure_claudex_ignored(claudex_dir: Path) -> None:
 
 
 def _claudex_ignore_state(claudex_dir: Path) -> str:
-    """'ok', 'missing' or 'ineffective' for .claudex/.gitignore (diagnostics).
+    """'ok', 'missing' or 'unverified' for .claudex/.gitignore (diagnostics).
 
     Claudex creates the file but never overwrites one a repository brought
-    along, so status reports when it does not ignore everything.
+    along. Only a file whose rules are exactly `*` (what Claudex writes) is
+    reported ok; any other rule (a negation like `!*`, say) is 'unverified',
+    since git applies the last matching rule. Files git already tracks stay
+    tracked either way.
     """
     if not _HAVE_DIR_FD:
         return "unknown"
@@ -1511,12 +1546,13 @@ def _claudex_ignore_state(claudex_dir: Path) -> str:
         except FileNotFoundError:
             return "missing"
         except OSError:
-            return "ineffective"
+            return "unverified"
         with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
-            lines = [ln.strip() for ln in f.read(65_536).splitlines()]
+            rules = [ln.strip() for ln in f.read(65_536).splitlines()
+                     if ln.strip() and not ln.strip().startswith("#")]
     finally:
         os.close(claudex_fd)
-    return "ok" if "*" in lines else "ineffective"
+    return "ok" if rules == ["*"] else "unverified"
 
 
 def _tree_bytes_fd(dir_fd: int, depth: int = 0) -> int:
@@ -4528,11 +4564,17 @@ async def codex_status(params: StatusInput) -> str:
 
     if "total" in usage:
         lines.append(f"\n.claudex/ total: {usage['total'] / 1024:.1f} KB")
-        if _claudex_ignore_state(claudex_dir) == "ineffective":
+        ignore_state = _claudex_ignore_state(claudex_dir)
+        if ignore_state == "unverified":
             lines.append(
-                "WARNING: .claudex/.gitignore exists but does not ignore everything "
-                "(Claudex never overwrites it). Session documents and artifacts can "
-                "be committed: make it contain a line with just `*`."
+                "WARNING: .claudex/.gitignore has rules other than `*` (Claudex never "
+                "overwrites it), so Claudex cannot confirm session documents and "
+                "artifacts stay out of git. Make its only rule `*`."
+            )
+        elif ignore_state == "missing":
+            lines.append(
+                "WARNING: .claudex/.gitignore is missing, so .claudex/ files can show "
+                "up in git. Claudex recreates it on its next write."
             )
 
     # --- Metrics ---
@@ -5479,6 +5521,11 @@ async def codex_result(params: JobResultInput) -> str:
         if task is not None:
             await asyncio.wait([task], timeout=params.wait_seconds)
 
+    # Again after the wait: roots may have been revoked meanwhile.
+    _, _auth_err = _authorized_cwd(job["project_dir"])
+    if _auth_err:
+        return _auth_err
+
     if job["status"] in ("queued", "running"):
         elapsed = time.time() - job["submitted"]
         return (
@@ -5509,6 +5556,7 @@ def _write_roots_config(data: dict) -> Path:
         os.mkdir(path.parent, 0o700)
     except FileExistsError:
         pass
+    _check_config_ancestors(path)
     body = json.dumps({**data, "version": ROOTS_CONFIG_VERSION,
                        "updated": datetime.now(timezone.utc).isoformat()}, indent=2) + "\n"
     tmp_name = f".config.{uuid.uuid4().hex}.tmp"

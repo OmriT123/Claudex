@@ -38,7 +38,8 @@ or other people's confidential material you may not share.
 
 In each project, under `.claudex/` (git-ignored: Claudex creates
 `.claudex/.gitignore` with `*`, never overwrites one a repository already has,
-and `codex_status` warns when that file does not ignore everything):
+and `codex_status` warns unless that file's only rule is `*`; files git
+already tracks stay tracked):
 
 | Folder | Content | Kept |
 |---|---|---|
