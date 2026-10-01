@@ -1076,13 +1076,16 @@ def _cleanup_old_run_dirs(claudex_dir: Path) -> None:
     except OSError:
         return  # missing, not a directory, or a symlink: nothing to clean
     try:
+        stale = []
         with os.scandir(claudex_fd) as entries:
-            stale = [
-                e.name for e in entries
-                if e.name.startswith("run-")
-                and e.is_dir(follow_symlinks=False)
-                and e.stat(follow_symlinks=False).st_mtime < cutoff
-            ]
+            for e in entries:
+                try:
+                    if (e.name.startswith("run-")
+                            and e.is_dir(follow_symlinks=False)
+                            and e.stat(follow_symlinks=False).st_mtime < cutoff):
+                        stale.append(e.name)
+                except OSError:
+                    pass  # vanished meanwhile: best-effort
         for name in stale:
             try:
                 _rmtree_fd(claudex_fd, name)
@@ -1186,6 +1189,103 @@ def _ensure_claudex_ignored(claudex_dir: Path) -> None:
             f.write(body)
     except OSError:
         pass  # exists already, or .claudex is unusable
+
+
+def _tree_bytes_fd(dir_fd: int, depth: int = 0) -> int:
+    """Bytes of regular files under a directory fd, never following symlinks."""
+    total = 0
+    if depth > 32:
+        return total
+    with os.scandir(dir_fd) as entries:
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    sub_fd = _open_dir_nofollow(entry.name, dir_fd=dir_fd)
+                    try:
+                        total += _tree_bytes_fd(sub_fd, depth + 1)
+                    finally:
+                        os.close(sub_fd)
+                elif entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _claudex_usage(claudex_dir: Path) -> dict:
+    """fd-anchored inventory of .claudex/ for codex_status (no symlink follows)."""
+    usage: dict = {}
+    if not _HAVE_DIR_FD:
+        return usage
+    if claudex_dir.is_symlink():
+        usage["refused"] = True
+        return usage
+    try:
+        claudex_fd = _claudex_fd(claudex_dir, create=False)
+    except OSError:
+        return usage
+    try:
+        sessions = []
+        try:
+            sub_fd = _open_dir_nofollow("sessions", dir_fd=claudex_fd)
+        except OSError:
+            sub_fd = None
+        if sub_fd is not None:
+            try:
+                with os.scandir(sub_fd) as entries:
+                    names = sorted(
+                        e.name for e in entries
+                        if e.name.endswith(".md") and e.is_file(follow_symlinks=False)
+                    )
+                for name in names:
+                    try:
+                        fd = _open_leaf(sub_fd, name, os.O_RDONLY, 0)
+                        st = os.fstat(fd)
+                        with os.fdopen(fd, "r", encoding="utf-8") as f:
+                            text = f.read(SESSION_FILE_MAX_CHARS)
+                        sessions.append((name[:-3], _parse_session_rounds(text), st.st_mtime, st.st_size))
+                    except (OSError, UnicodeDecodeError):
+                        pass
+            finally:
+                os.close(sub_fd)
+        usage["sessions"] = sessions
+        try:
+            sub_fd = _open_dir_nofollow("recaps", dir_fd=claudex_fd)
+        except OSError:
+            sub_fd = None
+        count = size = 0
+        if sub_fd is not None:
+            try:
+                with os.scandir(sub_fd) as entries:
+                    for e in entries:
+                        try:
+                            if e.is_file(follow_symlinks=False):
+                                count += 1
+                                size += e.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            pass
+            finally:
+                os.close(sub_fd)
+        usage["recaps"] = (count, size)
+        runs = run_bytes = 0
+        with os.scandir(claudex_fd) as entries:
+            run_names = [e.name for e in entries
+                         if e.name.startswith("run-") and e.is_dir(follow_symlinks=False)]
+        for name in run_names:
+            try:
+                sub_fd = _open_dir_nofollow(name, dir_fd=claudex_fd)
+            except OSError:
+                continue
+            try:
+                runs += 1
+                run_bytes += _tree_bytes_fd(sub_fd)
+            finally:
+                os.close(sub_fd)
+        usage["runs"] = (runs, run_bytes)
+        usage["total"] = _tree_bytes_fd(claudex_fd)
+    finally:
+        os.close(claudex_fd)
+    return usage
 
 
 _PROXY_403_RE = re.compile(
@@ -1376,16 +1476,41 @@ def _auto_session_id(problem: str) -> str:
     return f"{slug}-{suffix}" if slug else f"session-{suffix}"
 
 
-def _init_session(session_path: Path, session_id: str) -> None:
-    """Create a new session document with structured header."""
+_SUCCESSOR_MARKER = "<!-- claudex:continued-in={} -->"
+_SUCCESSOR_RE = re.compile(r"<!-- claudex:continued-in=([A-Za-z0-9_.-]+) -->")
+
+
+def _session_successor(content: str) -> Optional[str]:
+    match = _SUCCESSOR_RE.search(content)
+    return match.group(1) if match else None
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text
+    return data[:max_bytes].decode("utf-8", errors="ignore") + "\n[truncated]"
+
+
+def _init_session(
+    session_path: Path, session_id: str, *,
+    carried_from: Optional[str] = None, carried: str = "",
+) -> None:
+    """Create a new session document with structured header.
+
+    A chained session (rollover) starts with the decisions carried over from
+    its predecessor, so they stay in context for every later round.
+    """
     _ensure_parent_dir(session_path)
     timestamp = datetime.now(timezone.utc).isoformat()
-    _write_text_nofollow(
-        session_path,
+    body = (
         f"# Session: {session_id}\n"
         f"Started: {timestamp}\n"
-        f"<!-- claudex:rounds=0 -->\n\n",
+        f"<!-- claudex:rounds=0 -->\n\n"
     )
+    if carried_from:
+        body += f"## Carried over from '{carried_from}'\n\n{carried}\n\n"
+    _write_text_nofollow(session_path, body)
     _ensure_claudex_ignored(session_path.parent.parent)
 
 
@@ -1531,21 +1656,69 @@ _GIT_SAFE_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/nul
 _GIT_DIFF_SAFE_FLAGS = ("--no-ext-diff", "--no-textconv")
 
 
+def _kill_own_group(proc) -> None:
+    """SIGKILL the process group of a child started with start_new_session=True
+    (its pgid equals its pid), children included; else just the process."""
+    try:
+        pid = int(proc.pid)
+        pgid = os.getpgid(pid)
+        if pid <= 1 or pgid != pid:
+            raise OSError("not a dedicated process group")
+        os.killpg(pgid, 9)
+    except (AttributeError, ProcessLookupError, PermissionError, OSError, TypeError, ValueError):
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
 async def _communicate_or_kill(proc, timeout: float):
-    """communicate() with a deadline; on timeout kill and reap the process so
-    a hung git (or a repo's filter program) never outlives the request."""
+    """communicate() with a deadline; on timeout kill and reap the process tree
+    so a hung git (or a repo's filter program and its children) never outlives
+    the request. Spawn with start_new_session=True."""
     try:
         return await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+        _kill_own_group(proc)
         try:
             await asyncio.wait_for(proc.wait(), timeout=5)
         except (asyncio.TimeoutError, ProcessLookupError):
             pass
         raise
+
+
+async def _git_run(project_dir: str, *args: str, timeout: int = 2) -> tuple[Optional[int], str]:
+    """(returncode, stdout) for a git command; returncode None when git could
+    not be run or timed out (distinguishes "no such ref" from "git failed")."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", *_GIT_SAFE_CONFIG, *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=project_dir,
+            env=_sanitized_codex_env(),
+            start_new_session=True,
+        )
+        stdout, _ = await _communicate_or_kill(proc, timeout)
+        return proc.returncode, stdout.decode(errors="replace").strip()
+    except (asyncio.TimeoutError, OSError):
+        return None, ""
+
+
+async def _head_attestation(project_dir: str) -> Optional[str]:
+    """HEAD sha, "none (no commits yet)" for an unborn branch, or None on failure."""
+    rc, sha = await _git_run(project_dir, "rev-parse", "--verify", "-q", "HEAD")
+    if rc == 0 and sha:
+        return sha
+    if rc != 1:
+        return None  # git failed or timed out
+    rc_ref, ref = await _git_run(project_dir, "symbolic-ref", "-q", "HEAD")
+    if rc_ref != 0 or not ref:
+        return None  # detached and unresolvable, or git failed
+    rc_show, _ = await _git_run(project_dir, "show-ref", "--verify", "-q", ref)
+    if rc_show == 1:
+        return "none (no commits yet)"  # HEAD names a branch that has no commit
+    return None
 
 
 async def _git_cmd(project_dir: str, *args: str, timeout: int = 2) -> Optional[str]:
@@ -1562,6 +1735,7 @@ async def _git_cmd(project_dir: str, *args: str, timeout: int = 2) -> Optional[s
             stderr=asyncio.subprocess.PIPE,
             cwd=project_dir,
             env=_sanitized_codex_env(),
+            start_new_session=True,  # own group: a timeout kills filters too
         )
         stdout, _ = await _communicate_or_kill(proc, timeout)
         if proc.returncode != 0:
@@ -3058,6 +3232,27 @@ async def codex_collab(params: CollaborateInput) -> str:
                 existing = ""  # Treat corrupted session as empty
             except OSError as exc:
                 return _session_unusable_error(exc)
+            # A session that already rolled over points at its successor
+            # (persisted marker), so later calls continue there instead of
+            # re-running the recap (v2.3.1).
+            hops = 0
+            while existing and hops < 10:
+                successor = _session_successor(existing)
+                if not successor:
+                    break
+                next_path = _safe_claudex_path(cwd, "sessions", f"{successor}.md")
+                if next_path is None:
+                    break
+                params.session_id, session_path = successor, next_path
+                try:
+                    existing = _read_session_text(session_path)
+                except FileNotFoundError:
+                    existing = None
+                except UnicodeDecodeError:
+                    existing = ""
+                except OSError as exc:
+                    return _session_unusable_error(exc)
+                hops += 1
             if existing is not None and _parse_session_rounds(existing) >= MAX_SESSION_ROUNDS:
                 # Auto-rollover: generate recap, then start chained session
                 logger.info(
@@ -3087,27 +3282,38 @@ async def codex_collab(params: CollaborateInput) -> str:
                     except OSError as exc:
                         logger.warning("Auto-recap save failed: %s", exc)
 
-                # Chain session, carrying the decisions forward (v2.3.1): the
-                # recap when it succeeded, else the earlier rounds themselves.
-                old_session_id = params.session_id
+                # Chain session, carrying the decisions forward and persisting
+                # them in the successor (v2.3.1): the recap when it succeeded,
+                # else the earlier rounds themselves, bounded either way.
+                old_session_id, old_session_path = params.session_id, session_path
                 new_session_id = _chain_session_id(old_session_id)
-                params.session_id = new_session_id
-                session_path = _safe_claudex_path(cwd, "sessions", f"{new_session_id}.md")
-                if session_path is None:
+                new_path = _safe_claudex_path(cwd, "sessions", f"{new_session_id}.md")
+                if new_path is None:
                     return f"{ERROR_PREFIX}Invalid chained session_id — contains unsafe characters."
-                if recap_ok:
-                    session_context = (
-                        f"Decision record of the previous session '{old_session_id}':\n"
-                        f"{recap_result}"
-                    )
-                else:
-                    session_context = old_session_content
+                carried = _truncate_utf8(recap_result if recap_ok else old_session_content, SESSION_MAX_BYTES)
+                if not recap_ok:
                     rollover_note = (
                         f"\n\n(Session '{old_session_id}' reached {MAX_SESSION_ROUNDS} "
                         f"rounds and its recap failed: {recap_result[:300]}. "
                         f"'{new_session_id}' was started with the earlier rounds as "
                         "context instead.)"
                     )
+                try:
+                    try:
+                        successor_text = _read_session_text(new_path)
+                    except FileNotFoundError:
+                        _init_session(new_path, new_session_id, carried_from=old_session_id, carried=carried)
+                        successor_text = _read_session_text(new_path)
+                    _write_text_nofollow(
+                        old_session_path,
+                        existing.rstrip("\n") + f"\n{_SUCCESSOR_MARKER.format(new_session_id)}\n",
+                    )
+                except UnicodeDecodeError as exc:
+                    return f"{ERROR_PREFIX}Session rollover failed: {exc}"
+                except OSError as exc:
+                    return _session_unusable_error(exc)
+                params.session_id, session_path = new_session_id, new_path
+                session_context = _truncate_session_content(successor_text)
                 logger.info("Session rolled over to '%s'.", new_session_id)
             elif existing:
                 session_context = _truncate_session_content(existing)
@@ -3474,6 +3680,7 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
             stderr=asyncio.subprocess.PIPE,
             cwd=project_dir,
             env=_sanitized_codex_env(),  # drop GIT_DIR/GIT_EXTERNAL_DIFF/etc. (see _git_cmd)
+            start_new_session=True,
         )
         stdout, stderr = await _communicate_or_kill(proc, 5)
         if proc.returncode != 0:
@@ -3497,6 +3704,7 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
             stderr=asyncio.subprocess.PIPE,
             cwd=project_dir,
             env=_sanitized_codex_env(),  # drop GIT_DIR/GIT_EXTERNAL_DIFF/etc. (see _git_cmd)
+            start_new_session=True,
         )
         stdout, stderr = await _communicate_or_kill(proc, 5)
         if proc.returncode != 0:
@@ -3509,13 +3717,11 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
 
         # --- Attestation: bind the review to an exact repository state ---
         import hashlib
-        head_sha = await _git_cmd(project_dir, "rev-parse", "--verify", "-q", "HEAD")
+        # An unborn branch (no commits yet) is legitimate: the diff is vs the
+        # index. Anything else is a git failure, never an attestation.
+        head_sha = await _head_attestation(project_dir)
         if head_sha is None:
-            # An unborn branch (no commits yet) is legitimate: diff is vs the
-            # index. Anything else is a git failure, never an attestation.
-            if await _git_cmd(project_dir, "symbolic-ref", "-q", "HEAD") is None:
-                return _git_failure("git rev-parse HEAD", "could not resolve HEAD")
-            head_sha = "none (no commits yet)"
+            return _git_failure("git rev-parse HEAD", "could not resolve HEAD")
         diff_hash = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()[:16]
         untracked = await _git_cmd(
             project_dir, "ls-files", "--others", "--exclude-standard"
@@ -3748,88 +3954,41 @@ async def codex_status(params: StatusInput) -> str:
         lines.append(f"\nMetrics (this session):\n{metrics_summary}")
         return "\n".join(lines)
 
-    # --- Sessions ---
-    # Diagnostics never follow symlinks inside .claudex/ either (v2.3.1).
+    # --- Sessions / recaps / artifacts / disk usage ---
+    # Diagnostics never follow symlinks inside .claudex/ either: the walk is
+    # fd-anchored like every other .claudex operation (v2.3.1).
     claudex_dir = Path(cwd) / ".claudex"
-    claudex_usable = claudex_dir.is_dir() and not claudex_dir.is_symlink()
-    if claudex_dir.is_symlink():
+    usage = _claudex_usage(claudex_dir)
+    if usage.get("refused"):
         lines.append("\n.claudex/ is a symlink: ignored (Claudex refuses to use it)")
-
-    def _real_subdir(name: str) -> Optional[Path]:
-        d = claudex_dir / name
-        return d if claudex_usable and d.is_dir() and not d.is_symlink() else None
-
-    sessions_dir = _real_subdir("sessions")
     session_entries = []
-    if sessions_dir is not None:
-        for f in sorted(sessions_dir.iterdir()):
-            if f.suffix == ".md" and f.is_file() and not f.is_symlink():
-                try:
-                    rounds = _read_session_rounds(f)
-                    st = f.lstat()
-                    age_secs = time.time() - st.st_mtime
-                    if age_secs < 3600:
-                        age_str = f"{int(age_secs / 60)}m ago"
-                    else:
-                        age_str = f"{age_secs / 3600:.1f}h ago"
-                    size_kb = st.st_size / 1024
-                    name = f.stem
-                    session_entries.append(
-                        f"  {name:<20s} Round {rounds}/{MAX_SESSION_ROUNDS}  "
-                        f"({age_str}, {size_kb:.1f} KB)"
-                    )
-                except (OSError, UnicodeDecodeError):
-                    pass
-
+    for name, rounds, mtime, size in usage.get("sessions", []):
+        age_secs = time.time() - mtime
+        age_str = f"{int(age_secs / 60)}m ago" if age_secs < 3600 else f"{age_secs / 3600:.1f}h ago"
+        session_entries.append(
+            f"  {name:<20s} Round {rounds}/{MAX_SESSION_ROUNDS}  "
+            f"({age_str}, {size / 1024:.1f} KB)"
+        )
     if session_entries:
         lines.append(f"\nSessions ({len(session_entries)} active):")
         lines.extend(session_entries)
     else:
         lines.append("\nSessions: none")
 
-    # --- Recaps ---
-    recaps_dir = _real_subdir("recaps")
-    recap_count = 0
-    recap_bytes = 0
-    if recaps_dir is not None:
-        for f in recaps_dir.iterdir():
-            if f.is_file() and not f.is_symlink():
-                try:
-                    recap_count += 1
-                    recap_bytes += f.lstat().st_size
-                except OSError:
-                    pass
+    recap_count, recap_bytes = usage.get("recaps", (0, 0))
     if recap_count:
         lines.append(f"Recaps: {recap_count} file(s) ({recap_bytes / 1024:.1f} KB)")
     else:
         lines.append("Recaps: none")
 
-    def _tree_bytes(top: Path) -> int:
-        total = 0
-        for root_path, _dirs, files in os.walk(top):  # followlinks=False
-            for fname in files:
-                try:
-                    total += os.lstat(os.path.join(root_path, fname)).st_size
-                except OSError:
-                    pass
-        return total
-
-    # --- Artifact run dirs ---
-    run_dir_count = 0
-    run_dir_bytes = 0
-    if claudex_usable:
-        for entry in claudex_dir.iterdir():
-            if entry.name.startswith("run-") and entry.is_dir() and not entry.is_symlink():
-                run_dir_count += 1
-                run_dir_bytes += _tree_bytes(entry)
+    run_dir_count, run_dir_bytes = usage.get("runs", (0, 0))
     if run_dir_count:
         lines.append(f"Artifacts: {run_dir_count} run dir(s) ({run_dir_bytes / 1024:.1f} KB)")
     else:
         lines.append("Artifacts: none")
 
-    # --- Total .claudex/ disk usage ---
-    if claudex_usable:
-        lines.append(f"\n.claudex/ total: {_tree_bytes(claudex_dir) / 1024:.1f} KB")
+    if "total" in usage:
+        lines.append(f"\n.claudex/ total: {usage['total'] / 1024:.1f} KB")
 
     # --- Metrics ---
     metrics_summary = _get_metrics_summary()

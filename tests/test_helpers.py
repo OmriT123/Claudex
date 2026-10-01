@@ -3706,6 +3706,67 @@ class TestV231CollabContinuity:
         assert (tmp_path / ".claudex" / "recaps" / "s1_recap.md").exists()
 
 
+class TestV231RolloverState:
+    def _at_cap(self, tmp_path, sid="s1"):
+        import server as srv
+        sessions = tmp_path / ".claudex" / "sessions"; sessions.mkdir(parents=True, exist_ok=True)
+        (sessions / f"{sid}.md").write_text(
+            f"# Session: {sid}\n<!-- claudex:rounds={srv.MAX_SESSION_ROUNDS} -->\n"
+            "\n---\n\n## Round 1\n\nOLD-DECISION\n")
+        return sessions
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_roll_over_once(self, tmp_path):
+        import server as srv
+        sessions = self._at_cap(tmp_path)
+        recap = AsyncMock(return_value="RECAP-ONCE")
+        with patch.object(srv, "_run_codex_once", recap), \
+             patch.object(srv, "_run_codex", new_callable=AsyncMock, return_value="answer"):
+            outs = await asyncio.gather(*[
+                srv.codex_collab(srv.CollaborateInput(
+                    problem="a problem long enough", cc_analysis="analysis long enough",
+                    project_dir=str(tmp_path), session_id="s1"))
+                for _ in range(2)])
+        assert recap.await_count == 1
+        assert all("Session: s1-p2" in o for o in outs)
+        assert "continued-in=s1-p2" in (sessions / "s1.md").read_text()
+        assert not (sessions / "s1-p3.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_carried_decisions_survive_later_rounds(self, tmp_path):
+        import server as srv
+        self._at_cap(tmp_path)
+        prompts = []
+
+        async def capture(prompt, **k):
+            prompts.append(prompt)
+            return "answer"
+        with patch.object(srv, "_run_codex_once", new_callable=AsyncMock, return_value="RECAP-KEEP"), \
+             patch.object(srv, "_run_codex", side_effect=capture):
+            for _ in range(2):
+                await srv.codex_collab(srv.CollaborateInput(
+                    problem="a problem long enough", cc_analysis="analysis long enough",
+                    project_dir=str(tmp_path), session_id="s1"))
+        assert len(prompts) == 2 and all("RECAP-KEEP" in p for p in prompts)
+
+    @pytest.mark.asyncio
+    async def test_carried_recap_is_bounded(self, tmp_path):
+        import server as srv
+        self._at_cap(tmp_path)
+        prompts = []
+
+        async def capture(prompt, **k):
+            prompts.append(prompt)
+            return "answer"
+        huge = "R" * (srv.SESSION_MAX_BYTES * 2)
+        with patch.object(srv, "_run_codex_once", new_callable=AsyncMock, return_value=huge), \
+             patch.object(srv, "_run_codex", side_effect=capture):
+            await srv.codex_collab(srv.CollaborateInput(
+                problem="a problem long enough", cc_analysis="analysis long enough",
+                project_dir=str(tmp_path), session_id="s1"))
+        assert prompts[0].count("R" * 1000) < (srv.SESSION_MAX_BYTES * 2) // 1000
+
+
 class TestV231GitLifecycle:
     @pytest.mark.asyncio
     async def test_unborn_head_is_attested_not_failed(self, tmp_path):
@@ -3717,6 +3778,103 @@ class TestV231GitLifecycle:
         sp.run(["git", "add", "a.py"], cwd=repo, check=True)
         out = await srv._get_git_diff(str(repo), staged=True)
         assert out is not None and "HEAD none (no commits yet)" in out
+
+    @pytest.mark.asyncio
+    async def test_head_failure_on_committed_repo_is_an_error(self, tmp_path, monkeypatch):
+        import subprocess as sp
+        import server as srv
+        repo = tmp_path / "r"; repo.mkdir()
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "a.py").write_text("x = 1\n")
+        sp.run(["git", "add", "-A"], cwd=repo, check=True)
+        sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "i"],
+               cwd=repo, check=True)
+        (repo / "a.py").write_text("x = 2\n")
+        real = srv._git_run
+
+        async def flaky(project_dir, *args, **k):
+            if args[:1] == ("rev-parse",):
+                return None, ""  # timed out / could not run
+            return await real(project_dir, *args, **k)
+        monkeypatch.setattr(srv, "_git_run", flaky)
+        out = await srv._get_git_diff(str(repo))
+        assert out.startswith("Error:") and "no commits yet" not in out
+
+    @pytest.mark.asyncio
+    async def test_head_of_committed_repo_is_a_sha(self, tmp_path):
+        import subprocess as sp
+        import server as srv
+        repo = tmp_path / "r"; repo.mkdir()
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                "--allow-empty", "-m", "i"], cwd=repo, check=True)
+        att = await srv._head_attestation(str(repo))
+        assert att and len(att) == 40
+
+    @pytest.mark.asyncio
+    async def test_git_timeout_kills_the_whole_process_group(self, tmp_path):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX only")
+        pidfile = tmp_path / "child.pid"
+        proc = await asyncio.create_subprocess_exec(
+            "sh", "-c", f"sleep 30 & echo $! > {pidfile}; wait",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True)
+        for _ in range(50):
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+            await asyncio.sleep(0.05)
+        child = int(pidfile.read_text())
+        with pytest.raises(asyncio.TimeoutError):
+            await srv._communicate_or_kill(proc, 0.2)
+        await asyncio.sleep(0.2)
+        try:
+            os.kill(child, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True
+        if alive:
+            # A zombie still answers kill(0); reaped or zombie both mean killed.
+            status = Path(f"/proc/{child}/status")
+            alive = not (status.exists() and "zombie" in status.read_text().lower())
+        assert not alive
+
+    def test_run_cleanup_survives_vanishing_entries(self, tmp_path, monkeypatch):
+        import server as srv
+        claudex = tmp_path / ".claudex"; claudex.mkdir()
+        real_scandir = srv.os.scandir
+
+        class Vanishing:
+            name = "run-gone"
+            def is_dir(self, follow_symlinks=True):
+                return True
+            def stat(self, follow_symlinks=True):
+                raise FileNotFoundError("gone")
+
+        class Ctx:
+            def __init__(self, it): self.it = it
+            def __enter__(self): return iter(self.it)
+            def __exit__(self, *a): return False
+
+        def fake_scandir(fd):
+            with real_scandir(fd) as it:
+                items = list(it)
+            return Ctx([Vanishing(), *items])
+        monkeypatch.setattr(srv.os, "scandir", fake_scandir)
+        srv._cleanup_old_run_dirs(claudex)  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_status_reports_symlinked_claudex(self, tmp_path):
+        import server as srv
+        outside = tmp_path / "outside"; (outside / "recaps").mkdir(parents=True)
+        (outside / "recaps" / "r.md").write_text("x")
+        proj = tmp_path / "proj"; proj.mkdir()
+        (proj / ".claudex").symlink_to(outside)
+        out = await srv.codex_status(srv.StatusInput(project_dir=str(proj)))
+        assert "is a symlink: ignored" in out and "Recaps: none" in out
 
     @pytest.mark.asyncio
     async def test_git_timeout_kills_the_process(self, monkeypatch):

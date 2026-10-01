@@ -33,18 +33,22 @@ the `.mcpb` desktop extension.
   `os.replace` is never listed in `os.supports_dir_fd`.
 - `_safe_claudex_path` checks the final path component before anything else
   (the old post-resolve symlink check could never fire).
-- `codex_status` no longer follows symlinks when it sizes `.claudex/`.
+- `codex_status` inventories `.claudex/` through the same anchored walk and
+  never follows symlinks.
 
 ### Fixed
 - `codex_review_diff` reports git failures (not a repository, git missing,
   timeout, untracked-file listing failed, HEAD unresolvable) as errors.
   Previously they read as "No changes found. Nothing to review." A repository
   with no commits yet is still reviewed (attested as "no commits yet").
-- Timed-out git commands are killed and reaped instead of left running.
+- Timed-out git commands are killed with their whole process group (a
+  repository's filter programs included) and reaped.
 - `codex_collab` keeps an existing session's content as context even when its
-  round counter is missing, and a rollover now carries the decisions forward
-  (the recap, or the earlier rounds if the recap failed, which the reply now
-  says). Rollovers of the same session are serialized.
+  round counter is missing. A rollover now carries the decisions forward into
+  the new session document (the recap, or the earlier rounds if the recap
+  failed, which the reply says), bounded to the session context limit, and
+  marks the old session so later calls continue in the new one instead of
+  rolling over again. Rollovers of the same session are serialized.
 - Session documents above 4 MB are refused instead of loaded into memory.
 - `install.sh` uses Claude Code's own `plugin marketplace` / `plugin install`
   commands instead of editing `known_marketplaces.json`, updates an existing
