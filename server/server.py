@@ -935,6 +935,17 @@ _HAVE_DIR_FD = bool(
 # os.replace never appears in os.supports_dir_fd (only os.rename does, and on
 # POSIX rename atomically replaces the destination too).
 _HAVE_RENAME_DIR_FD = _HAVE_DIR_FD and os.rename in os.supports_dir_fd
+# Path-based fallbacks are allowed only on Windows. A POSIX system without the
+# *at() calls fails closed: O_NOFOLLOW guards only the last path component,
+# so a path walk could follow a swapped .claudex or subdir.
+_PATHWISE_FALLBACK = (not _HAVE_DIR_FD) and os.name == "nt"
+
+
+def _no_fd_support() -> OSError:
+    return OSError(
+        errno.ENOTSUP,
+        "this platform lacks the fd-relative file calls Claudex needs for .claudex/",
+    )
 
 
 def _open_dir_nofollow(path, dir_fd: Optional[int] = None) -> int:
@@ -993,7 +1004,11 @@ def _open_nofollow(path: Path, flags: int, mode: int = 0o644) -> int:
     checks without the directory walk.
     """
     path = Path(path)
-    if _HAVE_DIR_FD and _is_claudex_path(path):
+    if _is_claudex_path(path):
+        if not _HAVE_DIR_FD:
+            if not _PATHWISE_FALLBACK:
+                raise _no_fd_support()
+            return _open_leaf(None, path, flags, mode)
         sub_fd = _open_claudex_subdir(
             path.parent.parent, path.parent.name, create=bool(flags & os.O_CREAT)
         )
@@ -1040,7 +1055,8 @@ def _remove_run_dir(run_dir: Path) -> None:
                 _rmtree_fd(claudex_fd, run_dir.name)
             finally:
                 os.close(claudex_fd)
-        elif not run_dir.is_symlink() and not run_dir.parent.is_symlink():
+        elif (_PATHWISE_FALLBACK and not run_dir.is_symlink()
+              and not run_dir.parent.is_symlink()):
             shutil.rmtree(run_dir)
     except OSError:
         pass
@@ -1050,6 +1066,8 @@ def _ensure_parent_dir(path: Path) -> None:
     """Make sure <project>/.claudex exists (subdirs are created fd-relative)."""
     if _HAVE_DIR_FD and _is_claudex_path(path):
         os.close(_claudex_fd(path.parent.parent, create=True))
+    elif _is_claudex_path(path) and not _PATHWISE_FALLBACK:
+        raise _no_fd_support()
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1058,7 +1076,7 @@ def _cleanup_old_run_dirs(claudex_dir: Path) -> None:
     """Best-effort removal of run directories older than RUN_DIR_MAX_AGE_SECONDS."""
     cutoff = time.time() - RUN_DIR_MAX_AGE_SECONDS
     if not _HAVE_DIR_FD:
-        if claudex_dir.is_symlink() or not claudex_dir.is_dir():
+        if not _PATHWISE_FALLBACK or claudex_dir.is_symlink() or not claudex_dir.is_dir():
             return
         for entry in claudex_dir.iterdir():
             if entry.is_symlink():
@@ -1110,7 +1128,8 @@ def _cleanup_old_sessions(claudex_dir: Path) -> None:
     """
     cutoff = time.time() - SESSION_MAX_AGE_SECONDS
     if not _HAVE_DIR_FD:
-        _cleanup_old_sessions_pathwise(claudex_dir, cutoff)
+        if _PATHWISE_FALLBACK:
+            _cleanup_old_sessions_pathwise(claudex_dir, cutoff)
         return
     try:
         claudex_fd = _claudex_fd(claudex_dir, create=False)
@@ -1182,7 +1201,8 @@ def _ensure_claudex_ignored(claudex_dir: Path) -> None:
             finally:
                 os.close(claudex_fd)
         else:
-            if claudex_dir.is_symlink() or not claudex_dir.is_dir():
+            if (not _PATHWISE_FALLBACK or claudex_dir.is_symlink()
+                    or not claudex_dir.is_dir()):
                 return
             fd = _open_leaf(None, claudex_dir / ".gitignore", flags, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -1216,6 +1236,7 @@ def _claudex_usage(claudex_dir: Path) -> dict:
     """fd-anchored inventory of .claudex/ for codex_status (no symlink follows)."""
     usage: dict = {}
     if not _HAVE_DIR_FD:
+        usage["unavailable"] = True  # never report "none" for files we did not look at
         return usage
     if claudex_dir.is_symlink():
         usage["refused"] = True
@@ -1346,8 +1367,10 @@ def _prepare_run_dir(project_dir: str) -> Path:
             os.mkdir(run_dir.name, 0o777, dir_fd=claudex_fd)
         finally:
             os.close(claudex_fd)
-    else:
+    elif _PATHWISE_FALLBACK:
         run_dir.mkdir(parents=True, exist_ok=False)
+    else:
+        raise _no_fd_support()
     _ensure_claudex_ignored(claudex_dir)
     return run_dir
 
@@ -1476,8 +1499,22 @@ def _auto_session_id(problem: str) -> str:
     return f"{slug}-{suffix}" if slug else f"session-{suffix}"
 
 
+# Server-written session markers. Text that comes from Claude, Codex or a
+# recap is neutralized before it is stored (_neutralize_markers), and the
+# successor marker counts only as the document's last line, so session content
+# cannot forge a redirect to another session (v2.3.1).
 _SUCCESSOR_MARKER = "<!-- claudex:continued-in={} -->"
-_SUCCESSOR_RE = re.compile(r"<!-- claudex:continued-in=([A-Za-z0-9_.-]+) -->")
+_SUCCESSOR_RE = re.compile(r"\n<!-- claudex:continued-in=([A-Za-z0-9_.-]+) -->\s*\Z")
+_CARRIED_FROM_MARKER = "<!-- claudex:carried-from={} -->"
+_SESSION_CHAIN_MAX_HOPS = 16
+# A rollover carries at most this much into the successor's header, so the
+# newest rounds always keep most of the SESSION_MAX_BYTES context budget.
+CARRY_MAX_BYTES = SESSION_MAX_BYTES // 4
+_TRUNCATED_SUFFIX = "\n[truncated]"
+
+
+def _neutralize_markers(text: str) -> str:
+    return text.replace("<!-- claudex:", "<!-- claudex (quoted):")
 
 
 def _session_successor(content: str) -> Optional[str]:
@@ -1485,11 +1522,32 @@ def _session_successor(content: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def _session_carried_from(content: str) -> Optional[str]:
+    """The predecessor a session was created for (header only)."""
+    head = content[:2048]
+    match = re.search(r"<!-- claudex:carried-from=([A-Za-z0-9_.-]+) -->", head)
+    return match.group(1) if match else None
+
+
 def _truncate_utf8(text: str, max_bytes: int) -> str:
+    """At most max_bytes of UTF-8, suffix included."""
     data = text.encode("utf-8")
     if len(data) <= max_bytes:
         return text
-    return data[:max_bytes].decode("utf-8", errors="ignore") + "\n[truncated]"
+    room = max(0, max_bytes - len(_TRUNCATED_SUFFIX.encode("utf-8")))
+    return data[:room].decode("utf-8", errors="ignore") + _TRUNCATED_SUFFIX
+
+
+def _truncate_middle_utf8(text: str, max_bytes: int) -> str:
+    """At most max_bytes of UTF-8: the start and the end, the middle cut."""
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text
+    cut = "\n[... truncated ...]\n"
+    half = max(0, (max_bytes - len(cut.encode("utf-8"))) // 2)
+    head = data[:half].decode("utf-8", errors="ignore")
+    tail = data[len(data) - half:].decode("utf-8", errors="ignore") if half else ""
+    return head + cut + tail
 
 
 def _init_session(
@@ -1506,10 +1564,16 @@ def _init_session(
     body = (
         f"# Session: {session_id}\n"
         f"Started: {timestamp}\n"
-        f"<!-- claudex:rounds=0 -->\n\n"
+        f"<!-- claudex:rounds=0 -->\n"
     )
     if carried_from:
-        body += f"## Carried over from '{carried_from}'\n\n{carried}\n\n"
+        carried = _truncate_utf8(_neutralize_markers(carried), CARRY_MAX_BYTES)
+        body += (
+            f"{_CARRIED_FROM_MARKER.format(carried_from)}\n\n"
+            f"## Carried over from '{carried_from}'\n\n{carried}\n\n"
+        )
+    else:
+        body += "\n"
     _write_text_nofollow(session_path, body)
     _ensure_claudex_ignored(session_path.parent.parent)
 
@@ -1520,12 +1584,12 @@ def _append_to_session(
     """Append a round to an existing session document and update round count."""
     content = _read_session_text(session_path)
     # Update round count in structured header
-    content = re.sub(r'<!-- claudex:rounds=\d+ -->', f'<!-- claudex:rounds={round_num} -->', content)
+    content = re.sub(r'<!-- claudex:rounds=\d+ -->', f'<!-- claudex:rounds={round_num} -->', content, count=1)
     content += (
         f"\n---\n\n"
         f"## Round {round_num}\n\n"
-        f"### CC Analysis\n{cc_analysis}\n\n"
-        f"### Codex Response\n{codex_response}\n"
+        f"### CC Analysis\n{_neutralize_markers(cc_analysis)}\n\n"
+        f"### Codex Response\n{_neutralize_markers(codex_response)}\n"
     )
     _write_text_nofollow(session_path, content)
 
@@ -1594,12 +1658,19 @@ def _truncate_session_content(content: str, max_bytes: int = SESSION_MAX_BYTES) 
             rounds.append(parts[i] + parts[i + 1])
         else:
             rounds.append(parts[i])
-    # Drop oldest rounds until within limit
-    while rounds and len((header + "".join(rounds)).encode("utf-8")) > max_bytes:
+    note = "[Earlier rounds truncated]\n"
+    newest = rounds[-1] if rounds else ""
+    # Drop oldest rounds until within limit (byte-accurate, note included)
+    while rounds and len((header + note + "".join(rounds)).encode("utf-8")) > max_bytes:
         rounds.pop(0)
-    if not rounds:
-        return header[:max_bytes]
-    return header + "[Earlier rounds truncated]\n" + "".join(rounds)
+    if rounds:
+        return header + note + "".join(rounds)
+    # Even the newest round alone does not fit: keep its start and its end
+    # (the conclusion) rather than dropping the latest decision.
+    room = max_bytes - len((header + note).encode("utf-8"))
+    if newest and room > 256:
+        return header + note + _truncate_middle_utf8(newest, room)
+    return _truncate_utf8(header, max_bytes)
 
 
 def _chain_session_id(session_id: str) -> str:
@@ -1609,6 +1680,103 @@ def _chain_session_id(session_id: str) -> str:
         base, num = match.group(1), int(match.group(2))
         return f"{base}-p{num + 1}"
     return f"{session_id}-p2"
+
+
+class _SessionChainError(Exception):
+    """A session chain that cannot be followed safely (message is user-facing)."""
+
+
+def _read_session_or_none(session_path: Path) -> Optional[str]:
+    try:
+        return _read_session_text(session_path)
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError:
+        return ""  # Treat corrupted session as empty
+
+
+def _without_successor_marker(content: str) -> str:
+    match = _SUCCESSOR_RE.search(content)
+    return content[:match.start()] if match else content
+
+
+async def _lock_active_session(cwd: str, session_id: str, session_path: Path):
+    """Follow continued-in markers to the active session, hand over hand (v2.3.1).
+
+    Returns (lock, session_id, session_path, existing, note) with the active
+    session's lock held; the caller releases it. existing is None for a new
+    session. Raises _SessionChainError for a loop, an over-long chain or an
+    invalid successor name, OSError for an unusable document. A successor
+    whose file is missing is recreated from its predecessor's latest rounds,
+    so the chain never silently loses its context.
+    """
+    lock = _get_session_lock(session_id)
+    await lock.acquire()
+    try:
+        note = ""
+        visited = [session_id]
+        existing = _read_session_or_none(session_path)
+        while existing:
+            successor = _session_successor(existing)
+            if not successor:
+                break
+            if successor in visited:
+                raise _SessionChainError(f"session chain loops back to '{successor}'")
+            if len(visited) > _SESSION_CHAIN_MAX_HOPS:
+                raise _SessionChainError(
+                    f"the chain from '{visited[0]}' is longer than "
+                    f"{_SESSION_CHAIN_MAX_HOPS} sessions"
+                )
+            next_path = _safe_claudex_path(cwd, "sessions", f"{successor}.md")
+            if next_path is None:
+                raise _SessionChainError(
+                    f"'{session_id}' continues in an invalid session id"
+                )
+            predecessor_id, predecessor_text = session_id, existing
+            lock.release()
+            lock = _get_session_lock(successor)
+            await lock.acquire()
+            visited.append(successor)
+            session_id, session_path = successor, next_path
+            existing = _read_session_or_none(session_path)
+            if existing is None:
+                _init_session(
+                    session_path, session_id, carried_from=predecessor_id,
+                    carried=_truncate_session_content(
+                        _without_successor_marker(predecessor_text), CARRY_MAX_BYTES
+                    ),
+                )
+                existing = _read_session_text(session_path)
+                note += (
+                    f"\n\n(Session '{session_id}' was missing; it was recreated "
+                    f"with '{predecessor_id}''s latest rounds as context.)"
+                )
+        return lock, session_id, session_path, existing, note
+    except BaseException:
+        lock.release()
+        raise
+
+
+def _create_successor(cwd: str, old_session_id: str, carried: str):
+    """Create (or adopt) the successor of a session that hit the round cap.
+
+    A file already at the chained name is adopted only if it was created for
+    this predecessor (carried-from marker); anything else is skipped, so an
+    unrelated session is never taken over. Returns (id, path, text).
+    """
+    candidate = old_session_id
+    for _ in range(50):
+        candidate = _chain_session_id(candidate)
+        path = _safe_claudex_path(cwd, "sessions", f"{candidate}.md")
+        if path is None:
+            raise _SessionChainError("the chained session id is invalid")
+        text = _read_session_or_none(path)
+        if text is None:
+            _init_session(path, candidate, carried_from=old_session_id, carried=carried)
+            return candidate, path, _read_session_text(path)
+        if _session_carried_from(text) == old_session_id:
+            return candidate, path, text
+    raise _SessionChainError("no free successor session id")
 
 
 # --- File list normalization ---
@@ -1657,14 +1825,19 @@ _GIT_DIFF_SAFE_FLAGS = ("--no-ext-diff", "--no-textconv")
 
 
 def _kill_own_group(proc) -> None:
-    """SIGKILL the process group of a child started with start_new_session=True
-    (its pgid equals its pid), children included; else just the process."""
+    """SIGKILL the process group of a child started with start_new_session=True.
+
+    Such a child leads a new group whose id equals its pid for as long as any
+    member lives, so the group is signalled by that id even after the leader
+    exited (a git filter's background child can keep the pipes open while git
+    is gone). A pid is not reused while a group with that id exists. The
+    server's own group is never signalled. No killpg (Windows): the process.
+    """
     try:
         pid = int(proc.pid)
-        pgid = os.getpgid(pid)
-        if pid <= 1 or pgid != pid:
-            raise OSError("not a dedicated process group")
-        os.killpg(pgid, 9)
+        if pid <= 1 or pid == os.getpgrp():
+            raise OSError("refusing to signal this process group")
+        os.killpg(pid, 9)
     except (AttributeError, ProcessLookupError, PermissionError, OSError, TypeError, ValueError):
         try:
             proc.kill()
@@ -2457,21 +2630,11 @@ async def _run_codex_once(
     def _kill_tree(p) -> None:
         """Kill the process group (children included), falling back to the process.
 
-        Refuses pgid <= 1 defensively — killing init's group would take down
-        the host session (start_new_session=True guarantees pgid == child pid
-        in practice, so a real child always passes).
+        start_new_session=True makes the group id equal the child's pid, so
+        commands Codex started are killed even after codex itself exited
+        (v2.3.1); pid <= 1 and the server's own group are refused.
         """
-        try:
-            pid = int(p.pid)
-            pgid = os.getpgid(pid)
-            if pid <= 1 or pgid <= 1:
-                raise OSError(f"refusing to kill pgid {pgid}")
-            os.killpg(pgid, 9)
-        except (ProcessLookupError, PermissionError, OSError, TypeError, ValueError):
-            try:
-                p.kill()
-            except (ProcessLookupError, OSError):
-                pass
+        _kill_own_group(p)
 
     proc = None
     try:
@@ -3221,38 +3384,19 @@ async def codex_collab(params: CollaborateInput) -> str:
         session_path = _safe_claudex_path(cwd, "sessions", f"{params.session_id}.md")
         if session_path is None:
             return f"{ERROR_PREFIX}Invalid session_id — contains unsafe characters."
-        # Serialized per session (in this process), including a rollover's
-        # recap call, so two calls cannot both roll the same session over.
-        async with _get_session_lock(params.session_id):
-            try:
-                existing = _read_session_text(session_path)
-            except FileNotFoundError:
-                existing = None
-            except UnicodeDecodeError:
-                existing = ""  # Treat corrupted session as empty
-            except OSError as exc:
-                return _session_unusable_error(exc)
-            # A session that already rolled over points at its successor
-            # (persisted marker), so later calls continue there instead of
-            # re-running the recap (v2.3.1).
-            hops = 0
-            while existing and hops < 10:
-                successor = _session_successor(existing)
-                if not successor:
-                    break
-                next_path = _safe_claudex_path(cwd, "sessions", f"{successor}.md")
-                if next_path is None:
-                    break
-                params.session_id, session_path = successor, next_path
-                try:
-                    existing = _read_session_text(session_path)
-                except FileNotFoundError:
-                    existing = None
-                except UnicodeDecodeError:
-                    existing = ""
-                except OSError as exc:
-                    return _session_unusable_error(exc)
-                hops += 1
+        # A session that already rolled over points at its successor, so the
+        # call continues in the active session; its lock is held from here on
+        # (handed over along the chain), including a rollover's recap call, so
+        # two calls cannot both roll the same session over (v2.3.1).
+        try:
+            lock, params.session_id, session_path, existing, rollover_note = (
+                await _lock_active_session(cwd, params.session_id, session_path)
+            )
+        except _SessionChainError as exc:
+            return f"{ERROR_PREFIX}Session chain unusable: {exc}. Start a new session_id."
+        except OSError as exc:
+            return _session_unusable_error(exc)
+        try:
             if existing is not None and _parse_session_rounds(existing) >= MAX_SESSION_ROUNDS:
                 # Auto-rollover: generate recap, then start chained session
                 logger.info(
@@ -3281,42 +3425,42 @@ async def codex_collab(params: CollaborateInput) -> str:
                         logger.info("Auto-recap saved: %s", recap_path.name)
                     except OSError as exc:
                         logger.warning("Auto-recap save failed: %s", exc)
-
-                # Chain session, carrying the decisions forward and persisting
-                # them in the successor (v2.3.1): the recap when it succeeded,
-                # else the earlier rounds themselves, bounded either way.
-                old_session_id, old_session_path = params.session_id, session_path
-                new_session_id = _chain_session_id(old_session_id)
-                new_path = _safe_claudex_path(cwd, "sessions", f"{new_session_id}.md")
-                if new_path is None:
-                    return f"{ERROR_PREFIX}Invalid chained session_id — contains unsafe characters."
-                carried = _truncate_utf8(recap_result if recap_ok else old_session_content, SESSION_MAX_BYTES)
-                if not recap_ok:
-                    rollover_note = (
-                        f"\n\n(Session '{old_session_id}' reached {MAX_SESSION_ROUNDS} "
-                        f"rounds and its recap failed: {recap_result[:300]}. "
-                        f"'{new_session_id}' was started with the earlier rounds as "
-                        "context instead.)"
-                    )
                 try:
-                    try:
-                        successor_text = _read_session_text(new_path)
-                    except FileNotFoundError:
-                        _init_session(new_path, new_session_id, carried_from=old_session_id, carried=carried)
-                        successor_text = _read_session_text(new_path)
+                    old_session_id, old_session_path = params.session_id, session_path
+                    new_session_id, new_path, successor_text = _create_successor(
+                        cwd, old_session_id,
+                        recap_result if recap_ok else _truncate_session_content(existing, CARRY_MAX_BYTES),
+                    )
+                    # Re-read right before marking: nothing awaited since the
+                    # recap returned, so this is the current document.
+                    current = _read_session_text(old_session_path)
                     _write_text_nofollow(
                         old_session_path,
-                        existing.rstrip("\n") + f"\n{_SUCCESSOR_MARKER.format(new_session_id)}\n",
+                        current.rstrip("\n") + f"\n{_SUCCESSOR_MARKER.format(new_session_id)}\n",
                     )
+                except _SessionChainError as exc:
+                    return f"{ERROR_PREFIX}Session rollover failed: {exc}. Start a new session_id."
                 except UnicodeDecodeError as exc:
                     return f"{ERROR_PREFIX}Session rollover failed: {exc}"
                 except OSError as exc:
                     return _session_unusable_error(exc)
+                if not recap_ok:
+                    rollover_note += (
+                        f"\n\n(Session '{old_session_id}' reached {MAX_SESSION_ROUNDS} "
+                        f"rounds and its recap failed: {recap_result[:300]}. "
+                        f"'{new_session_id}' was started with the latest earlier rounds "
+                        "as context instead.)"
+                    )
+                # The successor's lock is not taken: in this event loop nothing
+                # can interleave before the prompt is built, and later calls
+                # reach it through the marker (and its own lock).
                 params.session_id, session_path = new_session_id, new_path
                 session_context = _truncate_session_content(successor_text)
                 logger.info("Session rolled over to '%s'.", new_session_id)
             elif existing:
                 session_context = _truncate_session_content(existing)
+        finally:
+            lock.release()
 
     # --- Build prompt ---
     system_prompt = _build_collaborate_system(params.request_type)
@@ -3371,53 +3515,74 @@ async def codex_collab(params: CollaborateInput) -> str:
 
     # --- Update session document (locked to prevent concurrent corruption) ---
     if params.session_id and session_path is not None and not result.startswith(ERROR_PREFIX):
-        async with _get_session_lock(params.session_id):
-            try:
-                # Re-validate after the (minutes-long) model call: the tree may
-                # have changed meanwhile. The writes below are no-follow too.
-                fresh_path = _safe_claudex_path(cwd, "sessions", f"{params.session_id}.md")
-                if fresh_path is None or fresh_path != session_path:
-                    raise OSError("session path changed during the Codex call")
+        try:
+            # Re-validate after the (minutes-long) model call: the tree may
+            # have changed meanwhile. The writes below are no-follow too.
+            fresh_path = _safe_claudex_path(cwd, "sessions", f"{params.session_id}.md")
+            if fresh_path is None or fresh_path != session_path:
+                raise OSError("session path changed during the Codex call")
+            # The session may have rolled over while Codex was working: the
+            # round then goes to the active successor, never to a document
+            # that is already continued elsewhere.
+            lock, active_id, active_path, active_text, late_note = (
+                await _lock_active_session(cwd, params.session_id, session_path)
+            )
+        except (OSError, UnicodeDecodeError, _SessionChainError) as exc:
+            logger.warning("Session update failed: %s", exc)
+            result += (
+                f"\n\n(Session document NOT updated: {exc}. "
+                ".claudex/sessions must be a real directory of regular files.)"
+            )
+            return result + rollover_note
+        try:
+            if active_id != params.session_id:
+                late_note += (
+                    f"\n\n('{params.session_id}' rolled over while Codex was "
+                    f"working; this round was added to '{active_id}'.)"
+                )
+            if active_text is None:
+                _init_session(active_path, active_id)
+            # Strip metadata footer before writing to session (avoid polluting context)
+            session_result = result
+            if "\n\n---\n_Codex:" in session_result:
+                session_result = session_result.rsplit("\n\n---\n_Codex:", 1)[0]
+            rounds = _read_session_rounds(active_path) + 1
+            _append_to_session(active_path, rounds, params.cc_analysis, session_result)
+
+            # --- Artifact-session linking ---
+            if "## Artifacts Created" in result:
                 try:
-                    _read_text_nofollow(session_path, max_chars=1)
-                except FileNotFoundError:
-                    _init_session(session_path, params.session_id)
-                # Strip metadata footer before writing to session (avoid polluting context)
-                session_result = result
-                if "\n\n---\n_Codex:" in session_result:
-                    session_result = session_result.rsplit("\n\n---\n_Codex:", 1)[0]
-                rounds = _read_session_rounds(session_path) + 1
-                _append_to_session(session_path, rounds, params.cc_analysis, session_result)
+                    artifact_idx = result.index("## Artifacts Created")
+                    artifact_end = result.find("\n\n---\n_Codex:", artifact_idx)
+                    if artifact_end == -1:
+                        artifact_section = result[artifact_idx:]
+                    else:
+                        artifact_section = result[artifact_idx:artifact_end]
+                    session_content = _read_session_text(active_path)
+                    session_content += (
+                        f"\n\n### Artifacts (Round {rounds})\n"
+                        f"{_neutralize_markers(artifact_section)}\n"
+                    )
+                    _write_text_nofollow(active_path, session_content)
+                except (ValueError, OSError) as exc:
+                    logger.warning("Artifact-session linking failed: %s", exc)
 
-                # --- Artifact-session linking ---
-                if "## Artifacts Created" in result:
-                    try:
-                        artifact_idx = result.index("## Artifacts Created")
-                        artifact_end = result.find("\n\n---\n_Codex:", artifact_idx)
-                        if artifact_end == -1:
-                            artifact_section = result[artifact_idx:]
-                        else:
-                            artifact_section = result[artifact_idx:artifact_end]
-                        session_content = _read_session_text(session_path)
-                        session_content += f"\n\n### Artifacts (Round {rounds})\n{artifact_section}\n"
-                        _write_text_nofollow(session_path, session_content)
-                    except (ValueError, OSError) as exc:
-                        logger.warning("Artifact-session linking failed: %s", exc)
-
-                session_line = (
-                    f"\n\nSession: {params.session_id} "
-                    f"(Round {rounds}/{MAX_SESSION_ROUNDS})"
-                )
-                if session_was_auto:
-                    session_line += " [auto-generated]"
-                session_line += f"\nDocument: .claudex/sessions/{session_path.name}"
-                result += session_line
-            except (OSError, UnicodeDecodeError) as exc:
-                logger.warning("Session update failed: %s", exc)
-                result += (
-                    f"\n\n(Session document NOT updated: {exc}. "
-                    ".claudex/sessions must be a real directory of regular files.)"
-                )
+            session_line = (
+                f"\n\nSession: {active_id} "
+                f"(Round {rounds}/{MAX_SESSION_ROUNDS})"
+            )
+            if session_was_auto:
+                session_line += " [auto-generated]"
+            session_line += f"\nDocument: .claudex/sessions/{active_path.name}"
+            result += session_line + late_note
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning("Session update failed: %s", exc)
+            result += (
+                f"\n\n(Session document NOT updated: {exc}. "
+                ".claudex/sessions must be a real directory of regular files.)"
+            )
+        finally:
+            lock.release()
 
     return result + rollover_note
 
@@ -3961,6 +4126,14 @@ async def codex_status(params: StatusInput) -> str:
     usage = _claudex_usage(claudex_dir)
     if usage.get("refused"):
         lines.append("\n.claudex/ is a symlink: ignored (Claudex refuses to use it)")
+    if usage.get("unavailable"):
+        lines.append(
+            "\nSessions/recaps/artifacts: not inventoried (this platform lacks the "
+            "fd-relative file calls the no-symlink walk needs)"
+        )
+        metrics_summary = _get_metrics_summary()
+        lines.append(f"\nMetrics (this session):\n{metrics_summary}")
+        return "\n".join(lines)
     session_entries = []
     for name, rounds, mtime, size in usage.get("sessions", []):
         age_secs = time.time() - mtime
@@ -4602,8 +4775,10 @@ def _write_job_file(job_id: str, *, status_only: bool = False) -> None:
     try:
         if _HAVE_DIR_FD:
             _write_job_content_fd(path, content)
-        else:
+        elif _PATHWISE_FALLBACK:
             _write_job_content_pathwise(path, content)
+        else:
+            raise _no_fd_support()
         _ensure_claudex_ignored(path.parent.parent)
     except OSError as exc:
         logger.warning("Job file write failed for %s: %s", job_id, exc)
