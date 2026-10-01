@@ -65,7 +65,9 @@ the `.mcpb` desktop extension.
   latest rounds. The carried decisions take at most a quarter of the session
   context and are built newest round first, so the latest decision always
   survives a failed recap or a recovery (an oversized round keeps its start
-  and end).
+  and end). A session id is used in its stored form everywhere (`foo bar`
+  and `foo_bar` are one session), so ids with spaces or punctuation continue
+  in their successor instead of starting a new one.
 - Session documents above 4 MB are refused instead of loaded into memory.
 - `install.sh` uses Claude Code's own `plugin marketplace` / `plugin install`
   commands instead of editing `known_marketplaces.json`, updates an existing

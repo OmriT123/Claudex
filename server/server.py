@@ -610,6 +610,11 @@ _metrics: dict[str, dict] = {}
 _session_locks: dict[str, asyncio.Lock] = {}
 
 
+def _canonical_session_id(session_id: str) -> str:
+    """The session id as stored: the sanitized file-name form."""
+    return re.sub(r'[^a-zA-Z0-9_\-.]', '_', session_id)
+
+
 def _get_session_lock(session_id: str) -> asyncio.Lock:
     """Get or create an async lock for a session.
 
@@ -617,7 +622,7 @@ def _get_session_lock(session_id: str) -> asyncio.Lock:
     'foo bar' and 'foo@bar' map to the same session file, so they must share
     one lock — keying by raw ID allowed alias writes to bypass locking.
     """
-    key = re.sub(r'[^a-zA-Z0-9_\-.]', '_', session_id)
+    key = _canonical_session_id(session_id)
     if key not in _session_locks:
         _session_locks[key] = asyncio.Lock()
     return _session_locks[key]
@@ -3430,6 +3435,12 @@ async def codex_collab(params: CollaborateInput) -> str:
     session_context = ""
     rollover_note = ""
     if params.session_id:
+        if "\x00" in params.session_id:
+            return f"{ERROR_PREFIX}Invalid session_id — contains unsafe characters."
+        # One canonical id (the file name's form) for the file, the lock, the
+        # chain markers and successor names, so 'foo bar' and 'foo_bar' are
+        # the same session and its markers stay parseable (v2.3.1).
+        params.session_id = _canonical_session_id(params.session_id)
         session_path = _safe_claudex_path(cwd, "sessions", f"{params.session_id}.md")
         if session_path is None:
             return f"{ERROR_PREFIX}Invalid session_id — contains unsafe characters."

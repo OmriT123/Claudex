@@ -4030,6 +4030,32 @@ class TestV231ChainIntegrity:
         for fn in (srv._truncate_utf8, srv._truncate_middle_utf8):
             assert len(fn("X" * 500, budget).encode("utf-8")) <= budget
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sid", ["foo bar", "foo@bar", "foo_bar"])
+    async def test_any_alias_of_an_id_reaches_its_successor(self, tmp_path, sid):
+        # Codex review 5: the raw id ('foo bar') was written into markers the
+        # parser could not read, so the next call started a third session.
+        import server as srv
+        recap = AsyncMock(return_value="RECAP-OF-PREDECESSOR")
+        prompts = []
+
+        async def answer(prompt, **kwargs):
+            prompts.append(prompt)
+            return "FIRST-SUCCESSOR-DECISION"
+        path = srv._safe_claudex_path(str(tmp_path), "sessions", sid + ".md")
+        srv._init_session(path, srv._canonical_session_id(sid))
+        for n in range(1, srv.MAX_SESSION_ROUNDS + 1):
+            srv._append_to_session(path, n, "old analysis", "old answer")
+        with patch.object(srv, "_run_codex_once", recap), \
+             patch.object(srv, "_run_codex", side_effect=answer), \
+             patch.object(srv, "_get_git_context", AsyncMock(return_value=None)):
+            await srv.codex_collab(_collab_input(srv, tmp_path, sid))
+            out = await srv.codex_collab(_collab_input(srv, tmp_path, sid))
+        assert "FIRST-SUCCESSOR-DECISION" in prompts[1]
+        assert recap.await_count == 1
+        assert len(list(path.parent.glob("*.md"))) == 2
+        assert "Session: foo_bar-p2 (Round 2/" in out
+
     def test_posix_without_dir_fd_fails_closed(self, tmp_path, monkeypatch):
         import server as srv
         monkeypatch.setattr(srv, "_HAVE_DIR_FD", False)
