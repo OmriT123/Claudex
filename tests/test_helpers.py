@@ -4844,6 +4844,13 @@ class TestV3Rename:
         assert skill.is_file() and not (PROJECT_ROOT / "skills" / "claudex").exists()
         assert "\nname: codex\n" in skill.read_text().split("---")[1] + "\n"
 
+    def test_upgrade_notice_links_to_the_changelog_heading(self):
+        import re as _re
+        heading = next(l for l in (PROJECT_ROOT / "CHANGELOG.md").read_text().splitlines()
+                       if l.startswith("## 3.0.0"))
+        slug = _re.sub(r"[^a-z0-9 _-]", "", heading[3:].strip().lower()).replace(" ", "-")
+        assert f"CHANGELOG.md#{slug})" in (PROJECT_ROOT / "README.md").read_text()
+
 
 # =========================================================================
 # Entry point for uv run --script

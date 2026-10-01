@@ -20,21 +20,36 @@ All notable changes to Claudex. Versions follow the plugin manifest.
 ### Migration
 1. Update every copy you use, then reload:
    - Claude Code: `/plugin marketplace update omri-plugins`, then
-     `/plugin update claudex@omri-plugins`, then `/reload-plugins`.
+     `/plugin update claudex@omri-plugins`, then `/reload-plugins` (restart
+     Claude Code if the `/claudex:*` commands or tools don't show).
    - claude.ai account plugin: syncs from GitHub; check Customize > Plugins
      shows 3.0.0.
    - Desktop extension: install `claudex.mcpb` 3.0.0, replacing the old one.
-2. If both `/codex:*` and `/claudex:*` appear, an old copy is still loaded:
-   update or remove it.
-3. Rename references in your own files: `/codex:` to `/claudex:` in notes and
-   CLAUDE.md, and `mcp__plugin_codex_codex__` to `mcp__plugin_claudex_codex__`
-   in permission rules (`permissions.allow`/`deny` in `~/.claude/settings.json`
-   and project settings), hook matchers and saved instructions. Bare tool names
+2. Expect both namespaces if you also use OpenAI's own Codex plugin: its
+   commands (`/codex:review`, `/codex:status`, `/codex:setup`,
+   `/codex:rescue`, ...) are not Claudex's. An old Claudex copy is still
+   loaded only if Claudex-only names still appear under `/codex:`
+   (`/codex:plan`, `/codex:collab`, `/codex:review-diff`, `/codex:brainstorm`,
+   `/codex:evaluate`, `/codex:recap`, `/codex:doctor`): update that copy.
+3. Rename Claudex references in your own files: `/codex:plan` and the other
+   Claudex commands to `/claudex:...` in notes and CLAUDE.md (leave references
+   to OpenAI's plugin alone), and `mcp__plugin_codex_codex__` to
+   `mcp__plugin_claudex_codex__` in permission rules
+   (`permissions.allow`/`ask`/`deny` in `~/.claude/settings.json` and project
+   settings), hook matchers and saved instructions. Bare tool names
    (`codex_plan`) need no change.
-4. Claude Code keeps a daily execution counter per installed plugin: the copy
-   synced from your claude.ai account changes data folder with the rename
-   (`codex-synced` to `claudex-synced`), so its counter starts fresh. A local
-   `claudex@omri-plugins` install keeps its counter.
+4. What follows the plugin's identity in Claude Code depends on how it is
+   installed:
+   - Marketplace install `claudex@omri-plugins`: the id is unchanged, so its
+     enabled/disabled setting, data folder and daily execution counter carry
+     over.
+   - The copy synced from your claude.ai account (`codex@synced` becomes
+     `claudex@synced`) and a `--plugin-dir` development copy are keyed by the
+     plugin name: if you had disabled the old copy in `enabledPlugins`, set
+     the same for the new id, and its daily counter starts fresh (unless
+     `CLAUDEX_STATE_DIR` is set).
+   - Your roots config (`--configure-roots`) is per computer and does not
+     depend on the plugin's identity.
 
 ### Added
 - README: three reproducible examples, Support section, troubleshooting for

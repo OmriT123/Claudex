@@ -9,7 +9,7 @@ sign-in; see [What Claudex sends, runs and stores](#what-claudex-sends-runs-and-
 
 > **Upgrading from 2.x?** Commands are now `/claudex:*` (were `/codex:*`) and
 > plugin tools are `mcp__plugin_claudex_codex__*`. Natural requests like "use
-> Codex" work as before. See [CHANGELOG.md](CHANGELOG.md#300).
+> Codex" work as before. See [CHANGELOG.md](CHANGELOG.md#300-2026-10-01---plugin-renamed-to-claudex).
 
 ## How It Works
 
@@ -545,7 +545,7 @@ Claudex/
 | Tools not showing | Check `/mcp`, restart CC session |
 | Server failed with "Required uv version `>=0.11.4`" | `uv self update`, then reconnect the `codex` server from `/mcp`. Claude Code holds a failed start for about 15 minutes, and neither a restart nor `/reload-plugins` clears it |
 | `/codex:...` command not found | Since 3.0 the commands are `/claudex:...` |
-| Both `/codex:*` and `/claudex:*` listed | An old copy is still installed (often the claude.ai account copy or the old desktop extension): update it, then `/reload-plugins` |
+| Claudex commands listed under both `/codex:` and `/claudex:` | `/codex:review`, `/codex:status`, `/codex:setup` and `/codex:rescue` alone belong to OpenAI's Codex plugin and are expected. If `/codex:plan`, `/codex:collab` or `/codex:review-diff` appear, an old Claudex copy is still installed (often the claude.ai account copy): update it, then `/reload-plugins` |
 | Calls cut off after 60s (cloud session) | Update to Claudex ≥ 2.2.0 (adds the per-server MCP timeout) |
 
 ## Support
