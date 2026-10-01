@@ -4521,6 +4521,37 @@ class TestV24ConfigIntegrity:
         res = srv._roots_resolution()
         assert res.source == "config-error" and "writable by other accounts" in res.detail
 
+    def test_foreign_hop_in_a_sticky_shared_folder_denies(self, tmp_path, monkeypatch):
+        # Codex red team 4: a hop owned by another account inside a sticky
+        # shared folder (like /tmp) can be removed by its owner.
+        import server as srv
+        if os.name == "nt" or os.getuid() != 0:
+            pytest.skip("needs root to create a foreign-owned entry")
+        safe = tmp_path / "safe" / "botique-claudex"; safe.mkdir(parents=True)
+        os.chmod(safe, 0o700)
+        shared = tmp_path / "sticky"; shared.mkdir(); os.chmod(shared, 0o1777)
+        hop = shared / "hop"; hop.symlink_to(tmp_path / "safe")
+        os.lchown(hop, 4242, 4242)
+        home = tmp_path / "home"; home.mkdir()
+        (home / ".config").symlink_to(hop)
+        monkeypatch.setattr(srv, "_config_path", lambda: home / ".config" / "botique-claudex" / "config.json")
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        res = srv._roots_resolution()
+        assert res.source == "config-error" and "another account in a shared folder" in res.detail
+        hop.unlink()  # its owner removes it
+        res = srv._roots_resolution()
+        assert res.source == "config-error" and "missing from a shared folder" in res.detail
+
+    def test_own_entries_in_a_sticky_shared_folder_are_fine(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        shared = tmp_path / "sticky"; shared.mkdir(); os.chmod(shared, 0o1777)
+        mine = shared / "mine"; mine.mkdir(mode=0o700)
+        monkeypatch.setattr(srv, "_config_path", lambda: mine / "botique-claudex" / "config.json")
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        assert srv._load_roots_config()[0] == "absent"
+
     def test_safe_symlinked_dotfiles_still_work(self, tmp_path, monkeypatch):
         import server as srv
         if os.name == "nt":

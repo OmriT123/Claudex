@@ -899,12 +899,16 @@ def _check_private(st, what: str) -> None:
         raise OSError(errno.EPERM, f"{what} is writable by other accounts")
 
 
-def _check_safe_dir(d: Path, uid: int) -> None:
+def _check_safe_dir(d: Path, uid: int) -> bool:
+    """Raise unless d is safe; True when it is a sticky shared folder (/tmp)."""
     st = os.stat(d)
     if st.st_uid not in (uid, 0):
         raise OSError(errno.EPERM, f"{d} belongs to another account")
-    if st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX:
-        raise OSError(errno.EPERM, f"{d} is writable by other accounts")
+    if st.st_mode & 0o022:
+        if not st.st_mode & stat.S_ISVTX:
+            raise OSError(errno.EPERM, f"{d} is writable by other accounts")
+        return True
+    return False
 
 
 def _check_config_ancestors(path: Path) -> None:
@@ -913,15 +917,17 @@ def _check_config_ancestors(path: Path) -> None:
     belong to this account or root and not be writable by other accounts
     (sticky directories such as /tmp excepted), as ssh's StrictModes does.
     Otherwise another account could move the folder or a symlink hop away
-    (a revocation would read as "absent") or swap it (v2.4). A missing
-    component ends the walk: its parent was checked, so the absence is real.
+    (a revocation would read as "absent") or swap it (v2.4). Inside a sticky
+    shared folder every entry traversed must belong to this account or root,
+    and a missing entry there fails closed. Elsewhere a missing component
+    ends the walk: its parent was checked, so the absence is real.
     """
     if os.name == "nt":
         return
     uid = os.getuid()
     pending = list(Path(os.path.abspath(path.parent)).parts[1:])
     cur = Path("/")
-    _check_safe_dir(cur, uid)
+    shared = _check_safe_dir(cur, uid)
     hops = 0
     while pending:
         name = pending.pop(0)
@@ -929,12 +935,20 @@ def _check_config_ancestors(path: Path) -> None:
             continue
         if name == "..":
             cur = cur.parent
+            shared = _check_safe_dir(cur, uid)
             continue
         nxt = cur / name
         try:
             st = os.lstat(nxt)
         except FileNotFoundError:
+            if shared:
+                # In a sticky shared folder (like /tmp) another account may
+                # have removed its own entry: absence proves nothing there.
+                raise OSError(errno.EPERM, f"{nxt} is missing from a shared folder")
             return
+        if shared and st.st_uid not in (uid, 0):
+            # Its owner can remove or replace it despite the sticky bit.
+            raise OSError(errno.EPERM, f"{nxt} belongs to another account in a shared folder")
         if stat.S_ISLNK(st.st_mode):
             hops += 1
             if hops > 40:
@@ -942,6 +956,7 @@ def _check_config_ancestors(path: Path) -> None:
             target = Path(os.readlink(nxt))
             if target.is_absolute():
                 cur = Path("/")
+                shared = _check_safe_dir(cur, uid)
                 pending = list(target.parts[1:]) + pending
             else:
                 pending = list(target.parts) + pending
@@ -949,7 +964,7 @@ def _check_config_ancestors(path: Path) -> None:
         if not stat.S_ISDIR(st.st_mode):
             raise OSError(errno.ENOTDIR, "not a directory", str(nxt))
         cur = nxt
-        _check_safe_dir(cur, uid)
+        shared = _check_safe_dir(cur, uid)
 
 
 def _read_roots_config_bytes(path: Path) -> bytes:

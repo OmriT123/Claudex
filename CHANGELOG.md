@@ -31,8 +31,9 @@ neither a restart nor `/reload-plugins` clears it).
   server. Protected-folder checks cover both the account's home and `HOME`.
 - The config file and its folder must not be symlinks and must belong to
   you, and no folder traversed on the way to it (through every symlink hop)
-  may be writable by other accounts, so nobody else can move a revocation
-  away;
+  may be writable by other accounts (in a sticky shared folder like /tmp,
+  every entry traversed must be yours or root's, and a missing one denies),
+  so nobody else can move a revocation away;
   reads are bounded and non-blocking. A symlinked, dangling, oversized or
   otherwise unusable file, or an unsafe folder chain, denies every folder
   instead of counting as absent. The terminal command writes it relative to
