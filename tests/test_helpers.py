@@ -3508,6 +3508,237 @@ class TestV231NoFollowIO:
         assert out.startswith("Error:")
 
 
+class TestV231AnchoredIO:
+    """Codex R1 review (2026-10-01): operations must stay anchored even when
+    .claudex or a subdir is swapped for a symlink AFTER path validation."""
+
+    def _swap_claudex(self, proj, outside):
+        shutil.rmtree(proj / ".claudex")
+        (proj / ".claudex").symlink_to(outside)
+
+    def test_swap_after_validation_write_refused(self, tmp_path):
+        import server as srv
+        proj = tmp_path / "proj"; (proj / ".claudex" / "sessions").mkdir(parents=True)
+        outside = tmp_path / "outside"; (outside / "sessions").mkdir(parents=True)
+        path = srv._safe_claudex_path(str(proj), "sessions", "s.md")
+        assert path == proj / ".claudex" / "sessions" / "s.md"  # lexical, not resolved
+        self._swap_claudex(proj, outside)
+        with pytest.raises(OSError):
+            srv._write_text_nofollow(path, "x")
+        assert list((outside / "sessions").iterdir()) == []
+
+    def test_swap_after_validation_read_refused(self, tmp_path):
+        import server as srv
+        proj = tmp_path / "proj"; (proj / ".claudex" / "sessions").mkdir(parents=True)
+        outside = tmp_path / "outside"; (outside / "sessions").mkdir(parents=True)
+        (outside / "sessions" / "s.md").write_text("<!-- claudex:rounds=1 --> secret")
+        path = srv._safe_claudex_path(str(proj), "sessions", "s.md")
+        self._swap_claudex(proj, outside)
+        with pytest.raises(OSError):
+            srv._read_text_nofollow(path)
+
+    @pytest.mark.parametrize("atomic", [True, False], ids=["renameat", "in_place"])
+    def test_job_writer_both_modes(self, tmp_path, monkeypatch, atomic):
+        import server as srv
+        if not srv._HAVE_DIR_FD:
+            pytest.skip("platform lacks dir_fd support")
+        monkeypatch.setattr(srv, "_HAVE_RENAME_DIR_FD", atomic and srv._HAVE_RENAME_DIR_FD)
+        proj = tmp_path / "proj"; proj.mkdir()
+        job_id = "job-abcdef123456"
+        srv._jobs[job_id] = {"project_dir": str(proj), "tool": "plan",
+                             "status": "completed", "result": "the result"}
+        try:
+            srv._write_job_file(job_id)
+            srv._write_job_file(job_id)  # overwrite works in both modes
+        finally:
+            srv._jobs.pop(job_id, None)
+        f = proj / ".claudex" / "jobs" / f"{job_id}.md"
+        assert "Status: completed" in f.read_text() and "the result" in f.read_text()
+        assert oct(f.stat().st_mode & 0o777) == "0o600"
+        assert [p.name for p in f.parent.iterdir() if p.name.endswith(".tmp")] == []
+
+    def test_job_writer_selection_is_fd_based_on_posix(self):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX only")
+        assert srv._HAVE_DIR_FD and srv._HAVE_RENAME_DIR_FD
+
+    @pytest.mark.asyncio
+    async def test_fifo_job_file_is_refused_without_hanging(self, tmp_path):
+        import server as srv
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("no FIFOs")
+        proj = tmp_path / "proj"; jobs = proj / ".claudex" / "jobs"; jobs.mkdir(parents=True)
+        os.mkfifo(jobs / "job-abcdef123456.md")
+        out = await asyncio.wait_for(srv.codex_result(srv.JobResultInput(
+            job_id="job-abcdef123456", project_dir=str(proj))), timeout=5)
+        assert out.startswith("Error:")
+
+    def test_fifo_session_is_refused(self, tmp_path):
+        import server as srv
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("no FIFOs")
+        sessions = tmp_path / "proj" / ".claudex" / "sessions"; sessions.mkdir(parents=True)
+        os.mkfifo(sessions / "s.md")
+        with pytest.raises(OSError):
+            srv._read_session_text(sessions / "s.md")
+
+    def test_oversized_session_is_refused(self, tmp_path, monkeypatch):
+        import server as srv
+        monkeypatch.setattr(srv, "SESSION_FILE_MAX_CHARS", 100)
+        sessions = tmp_path / "proj" / ".claudex" / "sessions"; sessions.mkdir(parents=True)
+        (sessions / "big.md").write_text("x" * 500)
+        with pytest.raises(OSError):
+            srv._read_session_text(sessions / "big.md")
+
+    def test_run_dir_creation_and_artifacts_refuse_swapped_claudex(self, tmp_path):
+        import server as srv
+        proj = tmp_path / "proj"; proj.mkdir()
+        run_dir = srv._prepare_run_dir(str(proj))
+        outside = tmp_path / "outside"; (outside / run_dir.name).mkdir(parents=True)
+        self._swap_claudex(proj, outside)
+        out = (
+            "---FINAL-ANSWER---\n"
+            '<claudex-artifact filename="proof.txt" language="text">pwned</claudex-artifact>'
+        )
+        _, artifacts = srv._extract_and_save_artifacts(out, run_dir)
+        assert artifacts == []
+        assert not (outside / run_dir.name / "proof.txt").exists()
+        with pytest.raises(OSError):
+            srv._prepare_run_dir(str(proj))
+
+    def test_remove_run_dir_refuses_swapped_claudex(self, tmp_path):
+        import server as srv
+        proj = tmp_path / "proj"; proj.mkdir()
+        run_dir = srv._prepare_run_dir(str(proj))
+        outside = tmp_path / "outside"; (outside / run_dir.name).mkdir(parents=True)
+        keep = outside / run_dir.name / "keep.txt"; keep.write_text("k")
+        self._swap_claudex(proj, outside)
+        srv._remove_run_dir(run_dir)
+        assert keep.exists()
+
+    def test_stale_run_dir_cleanup_skips_symlinks(self, tmp_path):
+        import server as srv
+        claudex = tmp_path / "proj" / ".claudex"; claudex.mkdir(parents=True)
+        stale = claudex / "run-old"; stale.mkdir(); (stale / "a.txt").write_text("a")
+        _make_old(stale)
+        outside = tmp_path / "outside"; outside.mkdir()
+        keep = outside / "keep.txt"; keep.write_text("k"); _make_old(outside)
+        (claudex / "run-link").symlink_to(outside)
+        srv._cleanup_old_run_dirs(claudex)
+        assert not stale.exists() and keep.exists() and (claudex / "run-link").is_symlink()
+
+    def test_gitignore_not_created_through_symlink(self, tmp_path):
+        import server as srv
+        outside = tmp_path / "outside"; outside.mkdir()
+        proj = tmp_path / "proj"; proj.mkdir()
+        (proj / ".claudex").symlink_to(outside)
+        srv._ensure_claudex_ignored(proj / ".claudex")
+        assert not (outside / ".gitignore").exists()
+
+    @pytest.mark.asyncio
+    async def test_status_ignores_symlinked_subdirs(self, tmp_path):
+        import server as srv
+        outside = tmp_path / "outside"; outside.mkdir()
+        (outside / "secret_recap.md").write_text("x" * 5000)
+        (tmp_path / ".claudex").mkdir()
+        (tmp_path / ".claudex" / "recaps").symlink_to(outside)
+        out = await srv.codex_status(srv.StatusInput(project_dir=str(tmp_path)))
+        assert "Recaps: none" in out
+
+
+class TestV231CollabContinuity:
+    @pytest.mark.asyncio
+    async def test_existing_session_without_rounds_still_gives_context(self, tmp_path):
+        import server as srv
+        sessions = tmp_path / ".claudex" / "sessions"; sessions.mkdir(parents=True)
+        (sessions / "s1.md").write_text("# Session: s1\nEARLIER-NOTES-MARKER\n")
+        seen = {}
+
+        async def capture(prompt, **k):
+            seen["prompt"] = prompt
+            return "ok"
+        with patch.object(srv, "_run_codex", side_effect=capture):
+            await srv.codex_collab(srv.CollaborateInput(
+                problem="a problem long enough", cc_analysis="analysis long enough",
+                project_dir=str(tmp_path), session_id="s1"))
+        assert "EARLIER-NOTES-MARKER" in seen["prompt"]
+
+    @pytest.mark.asyncio
+    async def test_rollover_recap_failure_is_reported_and_context_kept(self, tmp_path):
+        import server as srv
+        sessions = tmp_path / ".claudex" / "sessions"; sessions.mkdir(parents=True)
+        (sessions / "s1.md").write_text(
+            f"# Session: s1\n<!-- claudex:rounds={srv.MAX_SESSION_ROUNDS} -->\n"
+            "\n---\n\n## Round 1\n\nDECISION-MARKER\n")
+        seen = {}
+
+        async def capture(prompt, **k):
+            seen["prompt"] = prompt
+            return "fine"
+        with patch.object(srv, "_run_codex_once", new_callable=AsyncMock,
+                          return_value="Error: recap timed out"), \
+             patch.object(srv, "_run_codex", side_effect=capture):
+            out = await srv.codex_collab(srv.CollaborateInput(
+                problem="a problem long enough", cc_analysis="analysis long enough",
+                project_dir=str(tmp_path), session_id="s1"))
+        assert "recap failed" in out and "s1-p2" in out
+        assert "DECISION-MARKER" in seen["prompt"]
+
+    @pytest.mark.asyncio
+    async def test_rollover_success_carries_recap(self, tmp_path):
+        import server as srv
+        sessions = tmp_path / ".claudex" / "sessions"; sessions.mkdir(parents=True)
+        (sessions / "s1.md").write_text(
+            f"# Session: s1\n<!-- claudex:rounds={srv.MAX_SESSION_ROUNDS} -->\n")
+        seen = {}
+
+        async def capture(prompt, **k):
+            seen["prompt"] = prompt
+            return "fine"
+        with patch.object(srv, "_run_codex_once", new_callable=AsyncMock,
+                          return_value="RECAP-MARKER decisions"), \
+             patch.object(srv, "_run_codex", side_effect=capture):
+            await srv.codex_collab(srv.CollaborateInput(
+                problem="a problem long enough", cc_analysis="analysis long enough",
+                project_dir=str(tmp_path), session_id="s1"))
+        assert "RECAP-MARKER" in seen["prompt"]
+        assert (tmp_path / ".claudex" / "recaps" / "s1_recap.md").exists()
+
+
+class TestV231GitLifecycle:
+    @pytest.mark.asyncio
+    async def test_unborn_head_is_attested_not_failed(self, tmp_path):
+        import subprocess as sp
+        import server as srv
+        repo = tmp_path / "r"; repo.mkdir()
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "a.py").write_text("x = 1\n")
+        sp.run(["git", "add", "a.py"], cwd=repo, check=True)
+        out = await srv._get_git_diff(str(repo), staged=True)
+        assert out is not None and "HEAD none (no commits yet)" in out
+
+    @pytest.mark.asyncio
+    async def test_git_timeout_kills_the_process(self, monkeypatch):
+        import server as srv
+
+        class Hung:
+            returncode = None
+            killed = False
+            async def communicate(self):
+                await asyncio.sleep(60)
+            def kill(self):
+                Hung.killed = True
+            async def wait(self):
+                return -9
+
+        async def spawn(*a, **k):
+            return Hung()
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", spawn)
+        out = await srv._git_cmd(str(Path.cwd()), "status", timeout=0.05)
+        assert out is None and Hung.killed
+
+
 class TestV231DiffFailures:
     @pytest.mark.asyncio
     async def test_not_a_repo_is_an_error_not_nothing_to_review(self, tmp_path):

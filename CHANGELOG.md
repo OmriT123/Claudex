@@ -16,18 +16,36 @@ the `.mcpb` desktop extension.
   directory. Cleanup now opens `.claudex` and each subdirectory with
   `O_NOFOLLOW` and deletes relative to the directory's file descriptor, so a
   symlinked (or mid-cleanup swapped) directory is skipped.
-- **Session, recap and job files** are read and written the same way, so a
-  symlink at `.claudex`, its subdirectory or the file itself can no longer
-  redirect a read or write. `codex_collab` re-validates its session path after
-  the model call (which can take minutes) and reports when it could not update
-  the session document.
-- `_safe_claudex_path` now checks the final path component before resolving it
+- **Every operation inside `.claudex/` is anchored the same way**: session,
+  recap and job reads and writes, artifact files, run-directory creation and
+  removal, and the `.gitignore` Claudex writes. The project directory is opened
+  once and `.claudex`, its subdirectory and the file are each opened relative
+  to their parent with `O_NOFOLLOW`, so a symlink there, committed in the repo
+  or swapped in while a call runs, can no longer redirect a read, write or
+  delete. Paths are no longer `resolve()`d (resolving followed a swapped
+  `.claudex`). `codex_collab` also re-validates its session path after the
+  model call and reports when it could not update the session document.
+- **Only regular files**: FIFOs and device files inside `.claudex/` are
+  refused, and files are opened non-blocking, so a planted FIFO can no longer
+  freeze the server (for example when `codex_result` reads a job file).
+- Job records are written atomically with `renameat` on the jobs directory
+  (Linux and macOS). The earlier fd-based writer never ran, because
+  `os.replace` is never listed in `os.supports_dir_fd`.
+- `_safe_claudex_path` checks the final path component before anything else
   (the old post-resolve symlink check could never fire).
+- `codex_status` no longer follows symlinks when it sizes `.claudex/`.
 
 ### Fixed
 - `codex_review_diff` reports git failures (not a repository, git missing,
-  timeout, untracked-file listing failed) as errors. Previously they read as
-  "No changes found. Nothing to review."
+  timeout, untracked-file listing failed, HEAD unresolvable) as errors.
+  Previously they read as "No changes found. Nothing to review." A repository
+  with no commits yet is still reviewed (attested as "no commits yet").
+- Timed-out git commands are killed and reaped instead of left running.
+- `codex_collab` keeps an existing session's content as context even when its
+  round counter is missing, and a rollover now carries the decisions forward
+  (the recap, or the earlier rounds if the recap failed, which the reply now
+  says). Rollovers of the same session are serialized.
+- Session documents above 4 MB are refused instead of loaded into memory.
 - `install.sh` uses Claude Code's own `plugin marketplace` / `plugin install`
   commands instead of editing `known_marketplaces.json`, updates an existing
   install, and prepares dependencies for the version that was actually

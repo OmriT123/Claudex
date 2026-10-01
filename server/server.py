@@ -32,6 +32,7 @@ Requires:
 
 import asyncio
 import atexit
+import errno
 import json
 import math
 import os
@@ -39,6 +40,7 @@ import re
 import shutil
 import logging
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -879,6 +881,14 @@ def _safe_claudex_path(
     if not safe_name or safe_name.startswith('.'):
         logger.warning("Invalid filename rejected: %r", filename)
         return None
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", subdir):
+        logger.warning("Invalid .claudex subdir rejected: %r", subdir)
+        return None
+    # Lexical path, never resolve()d (v2.3.1): resolving follows a .claudex or
+    # subdir swapped for a symlink between these checks and the I/O, and the
+    # result would no longer carry the .claudex anchor that _open_nofollow
+    # walks with directory fds. These checks give early, friendly errors; the
+    # fd walk at I/O time is what enforces containment.
     claudex_dir = Path(project_dir) / ".claudex"
     if claudex_dir.is_symlink():
         logger.warning("Symlink rejected at .claudex/ directory: %s", claudex_dir)
@@ -887,86 +897,111 @@ def _safe_claudex_path(
     if subdir_path.is_symlink():
         logger.warning("Symlink rejected at .claudex/%s directory: %s", subdir, subdir_path)
         return None
-    base_dir = subdir_path.resolve()
-    # Ensure resolved base_dir is still under .claudex
-    claudex_resolved = claudex_dir.resolve()
-    if not base_dir.is_relative_to(claudex_resolved):
-        logger.warning("Subdir escape rejected: %s not under %s", base_dir, claudex_resolved)
-        return None
-    candidate = base_dir / safe_name
-    # Check the leaf BEFORE resolving: resolve() follows a symlink to its
-    # target, so a post-resolve is_symlink() can never fire (v2.3.1 fix: a
-    # symlink to a sibling file used to be accepted as that sibling).
-    if candidate.is_symlink():
-        logger.warning("Symlink rejected at target: %s", candidate)
-        return None
-    target = candidate.resolve()
-    if not target.is_relative_to(base_dir):
-        logger.warning("Path traversal attempt rejected: %r -> %s", filename, target)
+    target = subdir_path / safe_name
+    if target.is_symlink():
+        logger.warning("Symlink rejected at target: %s", target)
         return None
     return target
 
 
 # --- No-follow file I/O inside .claudex/ (v2.3.1) ---
 #
-# Paths validated by _safe_claudex_path can go stale: codex_collab validates
-# its session path, then awaits a model call for minutes before writing. To
-# close that window (and the cleanup escape below), every read/write/delete
-# under .claudex/<subdir>/ walks the tree with directory file descriptors and
-# O_NOFOLLOW: .claudex, <subdir> and the leaf are each opened relative to
-# their parent's fd, so a symlink swapped in at any of them fails with
+# Every read, write, create and delete under <project>/.claudex/ is anchored
+# to directory file descriptors. The project directory (already validated and
+# resolved by _authorized_cwd) is opened by path; .claudex, its subdirectory
+# and the file are then each opened RELATIVE to their parent's fd with
+# O_NOFOLLOW. A symlink at any of them, committed in the repo or swapped in
+# while a call runs (collab waits minutes for the model), fails with
 # ELOOP/ENOTDIR instead of redirecting the operation outside the workspace.
+# Files must also be regular files: FIFOs/devices are refused, and opens are
+# non-blocking so a FIFO can never stall the server's event loop.
+#
+# Paths stay lexical (<project>/.claudex/<subdir>/<name>, never resolve()d):
+# resolving would follow a swapped .claudex and lose the anchor.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+# True on Linux and macOS. The path-based fallbacks below exist only for
+# platforms without *at() support (Windows), where they are best-effort.
 _HAVE_DIR_FD = bool(
     _O_NOFOLLOW
     and _O_DIRECTORY
     and os.open in os.supports_dir_fd
     and os.unlink in os.supports_dir_fd
     and os.mkdir in os.supports_dir_fd
+    and os.rmdir in os.supports_dir_fd
     and os.scandir in os.supports_fd
 )
+# os.replace never appears in os.supports_dir_fd (only os.rename does, and on
+# POSIX rename atomically replaces the destination too).
+_HAVE_RENAME_DIR_FD = _HAVE_DIR_FD and os.rename in os.supports_dir_fd
 
 
-def _open_dir_nofollow(path: Path, dir_fd: Optional[int] = None) -> int:
+def _open_dir_nofollow(path, dir_fd: Optional[int] = None) -> int:
     """Open a directory without following a symlink at its last component."""
     return os.open(path, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=dir_fd)
 
 
-def _open_claudex_subdir(claudex_dir: Path, subdir: str, *, create: bool) -> int:
-    """Return an fd for .claudex/<subdir>, refusing symlinks at both levels.
+def _claudex_fd(claudex_dir: Path, *, create: bool) -> int:
+    """fd for <project>/.claudex, opened relative to the project dir's fd."""
+    parent_fd = os.open(claudex_dir.parent, os.O_RDONLY | _O_DIRECTORY)
+    try:
+        if create:
+            try:
+                os.mkdir(claudex_dir.name, 0o777, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+        return _open_dir_nofollow(claudex_dir.name, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
 
-    Requires _HAVE_DIR_FD. Raises OSError (ELOOP/ENOTDIR/ENOENT) on refusal.
-    """
-    claudex_fd = _open_dir_nofollow(claudex_dir)
+
+def _open_claudex_subdir(claudex_dir: Path, subdir: str, *, create: bool) -> int:
+    """fd for .claudex/<subdir>, refusing symlinks at both levels."""
+    claudex_fd = _claudex_fd(claudex_dir, create=create)
     try:
         if create:
             try:
                 os.mkdir(subdir, 0o777, dir_fd=claudex_fd)
             except FileExistsError:
                 pass
-        return _open_dir_nofollow(Path(subdir), dir_fd=claudex_fd)
+        return _open_dir_nofollow(subdir, dir_fd=claudex_fd)
     finally:
         os.close(claudex_fd)
 
 
-def _open_nofollow(path: Path, flags: int, mode: int = 0o644) -> int:
-    """os.open() that never follows a symlink inside .claudex/.
+def _is_claudex_path(path: Path) -> bool:
+    return path.parent.parent.name == ".claudex"
 
-    For <root>/.claudex/<subdir>/<name> the walk is fd-based (see above);
-    for any other path (and on platforms without dir_fd support) only the
-    leaf is opened with O_NOFOLLOW.
+
+def _open_leaf(dir_fd: Optional[int], name, flags: int, mode: int) -> int:
+    """Open a regular file with O_NOFOLLOW|O_NONBLOCK; refuse anything else."""
+    fd = os.open(name, flags | _O_NOFOLLOW | _O_NONBLOCK, mode, dir_fd=dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(name))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _open_nofollow(path: Path, flags: int, mode: int = 0o644) -> int:
+    """os.open() that never follows a symlink inside .claudex/ (see above).
+
+    Paths outside a .claudex/<subdir>/ shape (only used by tests) get the leaf
+    checks without the directory walk.
     """
     path = Path(path)
-    if _HAVE_DIR_FD and path.parent.parent.name == ".claudex":
+    if _HAVE_DIR_FD and _is_claudex_path(path):
         sub_fd = _open_claudex_subdir(
             path.parent.parent, path.parent.name, create=bool(flags & os.O_CREAT)
         )
         try:
-            return os.open(path.name, flags | _O_NOFOLLOW, mode, dir_fd=sub_fd)
+            return _open_leaf(sub_fd, path.name, flags, mode)
         finally:
             os.close(sub_fd)
-    return os.open(path, flags | _O_NOFOLLOW, mode)
+    return _open_leaf(None, path, flags, mode)
 
 
 def _read_text_nofollow(path: Path, max_chars: Optional[int] = None) -> str:
@@ -981,21 +1016,81 @@ def _write_text_nofollow(path: Path, content: str, mode: int = 0o644) -> None:
         f.write(content)
 
 
+def _rmtree_fd(parent_fd: int, name: str) -> None:
+    """Remove the directory <parent_fd>/<name> without following any symlink."""
+    dir_fd = _open_dir_nofollow(name, dir_fd=parent_fd)
+    try:
+        with os.scandir(dir_fd) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    _rmtree_fd(dir_fd, entry.name)
+                else:
+                    os.unlink(entry.name, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _remove_run_dir(run_dir: Path) -> None:
+    """Best-effort removal of one .claudex/run-<id> directory."""
+    try:
+        if _HAVE_DIR_FD:
+            claudex_fd = _claudex_fd(run_dir.parent, create=False)
+            try:
+                _rmtree_fd(claudex_fd, run_dir.name)
+            finally:
+                os.close(claudex_fd)
+        elif not run_dir.is_symlink() and not run_dir.parent.is_symlink():
+            shutil.rmtree(run_dir)
+    except OSError:
+        pass
+
+
+def _ensure_parent_dir(path: Path) -> None:
+    """Make sure <project>/.claudex exists (subdirs are created fd-relative)."""
+    if _HAVE_DIR_FD and _is_claudex_path(path):
+        os.close(_claudex_fd(path.parent.parent, create=True))
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+
 def _cleanup_old_run_dirs(claudex_dir: Path) -> None:
     """Best-effort removal of run directories older than RUN_DIR_MAX_AGE_SECONDS."""
-    if claudex_dir.is_symlink() or not claudex_dir.is_dir():
-        return
     cutoff = time.time() - RUN_DIR_MAX_AGE_SECONDS
-    for entry in claudex_dir.iterdir():
-        if entry.is_symlink():
-            continue  # Never follow symlinks during cleanup
-        if entry.is_dir() and entry.name.startswith("run-"):
+    if not _HAVE_DIR_FD:
+        if claudex_dir.is_symlink() or not claudex_dir.is_dir():
+            return
+        for entry in claudex_dir.iterdir():
+            if entry.is_symlink():
+                continue  # Never follow symlinks during cleanup
+            if entry.is_dir() and entry.name.startswith("run-"):
+                try:
+                    if entry.stat().st_mtime < cutoff:
+                        shutil.rmtree(entry)
+                        logger.info("Cleaned up stale run dir: %s", entry.name)
+                except OSError:
+                    pass  # best-effort
+        return
+    try:
+        claudex_fd = _claudex_fd(claudex_dir, create=False)
+    except OSError:
+        return  # missing, not a directory, or a symlink: nothing to clean
+    try:
+        with os.scandir(claudex_fd) as entries:
+            stale = [
+                e.name for e in entries
+                if e.name.startswith("run-")
+                and e.is_dir(follow_symlinks=False)
+                and e.stat(follow_symlinks=False).st_mtime < cutoff
+            ]
+        for name in stale:
             try:
-                if entry.stat().st_mtime < cutoff:
-                    shutil.rmtree(entry)
-                    logger.info("Cleaned up stale run dir: %s", entry.name)
+                _rmtree_fd(claudex_fd, name)
+                logger.info("Cleaned up stale run dir: %s", name)
             except OSError:
                 pass  # best-effort
+    finally:
+        os.close(claudex_fd)
 
 
 _CLEANUP_SUBDIRS = ("sessions", "recaps", "jobs")
@@ -1015,13 +1110,13 @@ def _cleanup_old_sessions(claudex_dir: Path) -> None:
         _cleanup_old_sessions_pathwise(claudex_dir, cutoff)
         return
     try:
-        claudex_fd = _open_dir_nofollow(claudex_dir)
+        claudex_fd = _claudex_fd(claudex_dir, create=False)
     except OSError:
         return  # missing, not a directory, or a symlink: nothing to clean
     try:
         for subdir_name in _CLEANUP_SUBDIRS:
             try:
-                sub_fd = _open_dir_nofollow(Path(subdir_name), dir_fd=claudex_fd)
+                sub_fd = _open_dir_nofollow(subdir_name, dir_fd=claudex_fd)
             except FileNotFoundError:
                 continue
             except OSError:
@@ -1056,8 +1151,6 @@ def _cleanup_old_sessions_pathwise(claudex_dir: Path, cutoff: float) -> None:
         subdir = claudex_dir / subdir_name
         if subdir.is_symlink() or not subdir.is_dir():
             continue
-        if not subdir.resolve().is_relative_to(claudex_dir.resolve()):
-            continue
         for entry in subdir.iterdir():
             if entry.is_symlink():
                 continue
@@ -1076,21 +1169,23 @@ def _ensure_claudex_ignored(claudex_dir: Path) -> None:
     touching the user's own .gitignore (the same trick virtualenvs and tool
     caches use). Best-effort: never follows symlinks, never overwrites.
     """
-    if claudex_dir.is_symlink() or not claudex_dir.is_dir():
-        return
-    path = claudex_dir / ".gitignore"
-    if path.is_symlink() or path.exists():
-        return
+    body = "# Created by Claudex: keeps its scratch files out of git.\n*\n"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     try:
-        fd = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o644,
-        )
+        if _HAVE_DIR_FD:
+            claudex_fd = _claudex_fd(claudex_dir, create=False)
+            try:
+                fd = _open_leaf(claudex_fd, ".gitignore", flags, 0o644)
+            finally:
+                os.close(claudex_fd)
+        else:
+            if claudex_dir.is_symlink() or not claudex_dir.is_dir():
+                return
+            fd = _open_leaf(None, claudex_dir / ".gitignore", flags, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write("# Created by Claudex: keeps its scratch files out of git.\n*\n")
+            f.write(body)
     except OSError:
-        pass
+        pass  # exists already, or .claudex is unusable
 
 
 _PROXY_403_RE = re.compile(
@@ -1143,7 +1238,16 @@ def _prepare_run_dir(project_dir: str) -> Path:
     _cleanup_old_sessions(claudex_dir)
 
     run_dir = claudex_dir / f"run-{uuid.uuid4()}"
-    run_dir.mkdir(parents=True, exist_ok=False)
+    if _HAVE_DIR_FD:
+        # Created relative to the .claudex fd (v2.3.1): a .claudex swapped for
+        # a symlink after the check above fails here instead of redirecting.
+        claudex_fd = _claudex_fd(claudex_dir, create=True)
+        try:
+            os.mkdir(run_dir.name, 0o777, dir_fd=claudex_fd)
+        finally:
+            os.close(claudex_fd)
+    else:
+        run_dir.mkdir(parents=True, exist_ok=False)
     _ensure_claudex_ignored(claudex_dir)
     return run_dir
 
@@ -1205,8 +1309,10 @@ def _extract_and_save_artifacts(
             )
             continue
 
-        target = (run_dir / filename).resolve()
-        if not target.is_relative_to(run_dir.resolve()):
+        # Lexical target (v2.3.1): the write below walks .claudex/run-<id>
+        # with directory fds, so containment does not depend on resolve().
+        target = run_dir / filename
+        if target.parent != run_dir:
             logger.warning(
                 "Artifact rejected — path traversal attempt: %r", filename
             )
@@ -1231,9 +1337,10 @@ def _extract_and_save_artifacts(
             )
             continue
 
-        # Write with exclusive create to avoid overwriting via symlink race
+        # Exclusive, no-follow, fd-anchored create (v2.3.1)
         try:
-            with open(target, "x", encoding="utf-8") as f:
+            fd = _open_nofollow(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(content)
             artifacts.append((filename, language))
             logger.info("Artifact saved: %s (%s)", filename, language)
@@ -1269,19 +1376,6 @@ def _auto_session_id(problem: str) -> str:
     return f"{slug}-{suffix}" if slug else f"session-{suffix}"
 
 
-def _ensure_parent_dir(path: Path) -> None:
-    """Create the directory for a .claudex/<subdir>/<file> path.
-
-    Only .claudex itself is created by path; <subdir> is created by
-    _open_nofollow relative to .claudex's fd, so a symlinked .claudex can
-    never make us create directories somewhere else.
-    """
-    if _HAVE_DIR_FD and path.parent.parent.name == ".claudex":
-        path.parent.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-
 def _init_session(session_path: Path, session_id: str) -> None:
     """Create a new session document with structured header."""
     _ensure_parent_dir(session_path)
@@ -1299,7 +1393,7 @@ def _append_to_session(
     session_path: Path, round_num: int, cc_analysis: str, codex_response: str
 ) -> None:
     """Append a round to an existing session document and update round count."""
-    content = _read_text_nofollow(session_path)
+    content = _read_session_text(session_path)
     # Update round count in structured header
     content = re.sub(r'<!-- claudex:rounds=\d+ -->', f'<!-- claudex:rounds={round_num} -->', content)
     content += (
@@ -1311,14 +1405,29 @@ def _append_to_session(
     _write_text_nofollow(session_path, content)
 
 
+SESSION_FILE_MAX_CHARS = 4_000_000  # far above SESSION_MAX_BYTES; bounds memory
+
+
+def _read_session_text(session_path: Path) -> str:
+    """Bounded, no-follow read of a session document (v2.3.1)."""
+    content = _read_text_nofollow(session_path, max_chars=SESSION_FILE_MAX_CHARS + 1)
+    if len(content) > SESSION_FILE_MAX_CHARS:
+        raise OSError(errno.EFBIG, "session document too large", str(session_path))
+    return content
+
+
+def _parse_session_rounds(content: str) -> int:
+    match = re.search(r'<!-- claudex:rounds=(\d+) -->', content)
+    return int(match.group(1)) if match else 0
+
+
 def _read_session_rounds(session_path: Path) -> int:
     """Parse round count from structured header line."""
     try:
-        content = _read_text_nofollow(session_path)
+        content = _read_session_text(session_path)
     except FileNotFoundError:
         return 0
-    match = re.search(r'<!-- claudex:rounds=(\d+) -->', content)
-    return int(match.group(1)) if match else 0
+    return _parse_session_rounds(content)
 
 
 def _session_unusable_error(exc: OSError) -> str:
@@ -1338,7 +1447,7 @@ def _get_truncated_session(
     propagate: callers must not treat an unusable session as an empty one.
     """
     try:
-        content = _read_text_nofollow(session_path)
+        content = _read_session_text(session_path)
     except FileNotFoundError:
         return ""
     return _truncate_session_content(content, max_bytes)
@@ -1422,6 +1531,23 @@ _GIT_SAFE_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/nul
 _GIT_DIFF_SAFE_FLAGS = ("--no-ext-diff", "--no-textconv")
 
 
+async def _communicate_or_kill(proc, timeout: float):
+    """communicate() with a deadline; on timeout kill and reap the process so
+    a hung git (or a repo's filter program) never outlives the request."""
+    try:
+        return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
+        raise
+
+
 async def _git_cmd(project_dir: str, *args: str, timeout: int = 2) -> Optional[str]:
     """Run a git command and return stdout, or None on failure.
 
@@ -1437,7 +1563,7 @@ async def _git_cmd(project_dir: str, *args: str, timeout: int = 2) -> Optional[s
             cwd=project_dir,
             env=_sanitized_codex_env(),
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        stdout, _ = await _communicate_or_kill(proc, timeout)
         if proc.returncode != 0:
             return None
         return stdout.decode(errors="replace").strip()
@@ -2342,8 +2468,8 @@ async def _run_codex_once(
             )
             cleaned_output += "\n".join(lines)
         else:
-            # No artifacts — clean up the empty run dir
-            shutil.rmtree(run_dir, ignore_errors=True)
+            # No artifacts: clean up the empty run dir (fd-anchored, v2.3.1)
+            _remove_run_dir(run_dir)
     except OSError as exc:
         logger.warning("Artifact directory setup failed: %s", exc)
         cleaned_output = output  # Fall back to raw output
@@ -2916,29 +3042,29 @@ async def codex_collab(params: CollaborateInput) -> str:
     # --- Session management: check round cap ---
     session_path = None
     session_context = ""
+    rollover_note = ""
     if params.session_id:
         session_path = _safe_claudex_path(cwd, "sessions", f"{params.session_id}.md")
         if session_path is None:
             return f"{ERROR_PREFIX}Invalid session_id — contains unsafe characters."
-        try:
-            rounds = _read_session_rounds(session_path)  # 0 when the file is missing
-        except UnicodeDecodeError:
-            rounds = 0  # Treat corrupted session as empty
-        except OSError as exc:
-            return _session_unusable_error(exc)
-        if rounds > 0:
-            if rounds >= MAX_SESSION_ROUNDS:
+        # Serialized per session (in this process), including a rollover's
+        # recap call, so two calls cannot both roll the same session over.
+        async with _get_session_lock(params.session_id):
+            try:
+                existing = _read_session_text(session_path)
+            except FileNotFoundError:
+                existing = None
+            except UnicodeDecodeError:
+                existing = ""  # Treat corrupted session as empty
+            except OSError as exc:
+                return _session_unusable_error(exc)
+            if existing is not None and _parse_session_rounds(existing) >= MAX_SESSION_ROUNDS:
                 # Auto-rollover: generate recap, then start chained session
                 logger.info(
                     "Session '%s' hit round cap (%d). Auto-rolling over.",
                     params.session_id, MAX_SESSION_ROUNDS,
                 )
-                try:
-                    old_session_content = _get_truncated_session(session_path)
-                except UnicodeDecodeError:
-                    old_session_content = ""
-                except OSError as exc:
-                    return _session_unusable_error(exc)
+                old_session_content = _truncate_session_content(existing)
                 recap_result = await _run_codex_once(
                     RECAP_SYSTEM + "\n---\n"
                     f"## Session Log\n{old_session_content}\n\n"
@@ -2949,9 +3075,10 @@ async def codex_collab(params: CollaborateInput) -> str:
                     timeout=1200,
                     tool_name="codex_collab_recap",
                 )
+                recap_ok = not recap_result.startswith(ERROR_PREFIX)
                 # Save recap
                 recap_path = _safe_claudex_path(cwd, "recaps", f"{params.session_id}_recap.md")
-                if recap_path and not recap_result.startswith(ERROR_PREFIX):
+                if recap_path and recap_ok:
                     try:
                         _ensure_parent_dir(recap_path)
                         _write_text_nofollow(recap_path, recap_result)
@@ -2960,21 +3087,30 @@ async def codex_collab(params: CollaborateInput) -> str:
                     except OSError as exc:
                         logger.warning("Auto-recap save failed: %s", exc)
 
-                # Chain session
-                new_session_id = _chain_session_id(params.session_id)
+                # Chain session, carrying the decisions forward (v2.3.1): the
+                # recap when it succeeded, else the earlier rounds themselves.
+                old_session_id = params.session_id
+                new_session_id = _chain_session_id(old_session_id)
                 params.session_id = new_session_id
                 session_path = _safe_claudex_path(cwd, "sessions", f"{new_session_id}.md")
                 if session_path is None:
                     return f"{ERROR_PREFIX}Invalid chained session_id — contains unsafe characters."
-                session_context = ""
+                if recap_ok:
+                    session_context = (
+                        f"Decision record of the previous session '{old_session_id}':\n"
+                        f"{recap_result}"
+                    )
+                else:
+                    session_context = old_session_content
+                    rollover_note = (
+                        f"\n\n(Session '{old_session_id}' reached {MAX_SESSION_ROUNDS} "
+                        f"rounds and its recap failed: {recap_result[:300]}. "
+                        f"'{new_session_id}' was started with the earlier rounds as "
+                        "context instead.)"
+                    )
                 logger.info("Session rolled over to '%s'.", new_session_id)
-            else:
-                try:
-                    session_context = _get_truncated_session(session_path)
-                except UnicodeDecodeError:
-                    session_context = ""
-                except OSError as exc:
-                    return _session_unusable_error(exc)
+            elif existing:
+                session_context = _truncate_session_content(existing)
 
     # --- Build prompt ---
     system_prompt = _build_collaborate_system(params.request_type)
@@ -3056,7 +3192,7 @@ async def codex_collab(params: CollaborateInput) -> str:
                             artifact_section = result[artifact_idx:]
                         else:
                             artifact_section = result[artifact_idx:artifact_end]
-                        session_content = _read_text_nofollow(session_path)
+                        session_content = _read_session_text(session_path)
                         session_content += f"\n\n### Artifacts (Round {rounds})\n{artifact_section}\n"
                         _write_text_nofollow(session_path, session_content)
                     except (ValueError, OSError) as exc:
@@ -3077,7 +3213,7 @@ async def codex_collab(params: CollaborateInput) -> str:
                     ".claudex/sessions must be a real directory of regular files.)"
                 )
 
-    return result
+    return result + rollover_note
 
 
 @mcp.tool(
@@ -3251,7 +3387,7 @@ async def codex_recap(params: RecapInput) -> str:
     if session_path is None:
         return f"{ERROR_PREFIX}Invalid session_id — contains unsafe characters."
     try:
-        raw_session = _read_text_nofollow(session_path)
+        raw_session = _read_session_text(session_path)
     except FileNotFoundError:
         return f"{ERROR_PREFIX}Session '{params.session_id}' not found in .claudex/sessions/."
     except UnicodeDecodeError:
@@ -3339,7 +3475,7 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
             cwd=project_dir,
             env=_sanitized_codex_env(),  # drop GIT_DIR/GIT_EXTERNAL_DIFF/etc. (see _git_cmd)
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        stdout, stderr = await _communicate_or_kill(proc, 5)
         if proc.returncode != 0:
             tail = stderr.decode(errors="replace").strip()[-300:] or f"exit {proc.returncode}"
             return _git_failure("git diff --name-only", tail)
@@ -3362,7 +3498,7 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
             cwd=project_dir,
             env=_sanitized_codex_env(),  # drop GIT_DIR/GIT_EXTERNAL_DIFF/etc. (see _git_cmd)
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        stdout, stderr = await _communicate_or_kill(proc, 5)
         if proc.returncode != 0:
             tail = stderr.decode(errors="replace").strip()[-300:] or f"exit {proc.returncode}"
             return _git_failure("git diff", tail)
@@ -3373,7 +3509,13 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
 
         # --- Attestation: bind the review to an exact repository state ---
         import hashlib
-        head_sha = await _git_cmd(project_dir, "rev-parse", "HEAD") or "UNAVAILABLE (no commits yet, or rev-parse failed)"
+        head_sha = await _git_cmd(project_dir, "rev-parse", "--verify", "-q", "HEAD")
+        if head_sha is None:
+            # An unborn branch (no commits yet) is legitimate: diff is vs the
+            # index. Anything else is a git failure, never an attestation.
+            if await _git_cmd(project_dir, "symbolic-ref", "-q", "HEAD") is None:
+                return _git_failure("git rev-parse HEAD", "could not resolve HEAD")
+            head_sha = "none (no commits yet)"
         diff_hash = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()[:16]
         untracked = await _git_cmd(
             project_dir, "ls-files", "--others", "--exclude-standard"
@@ -3607,27 +3749,36 @@ async def codex_status(params: StatusInput) -> str:
         return "\n".join(lines)
 
     # --- Sessions ---
+    # Diagnostics never follow symlinks inside .claudex/ either (v2.3.1).
     claudex_dir = Path(cwd) / ".claudex"
-    sessions_dir = claudex_dir / "sessions"
+    claudex_usable = claudex_dir.is_dir() and not claudex_dir.is_symlink()
+    if claudex_dir.is_symlink():
+        lines.append("\n.claudex/ is a symlink: ignored (Claudex refuses to use it)")
+
+    def _real_subdir(name: str) -> Optional[Path]:
+        d = claudex_dir / name
+        return d if claudex_usable and d.is_dir() and not d.is_symlink() else None
+
+    sessions_dir = _real_subdir("sessions")
     session_entries = []
-    if sessions_dir.is_dir():
+    if sessions_dir is not None:
         for f in sorted(sessions_dir.iterdir()):
-            if f.is_file() and f.suffix == ".md":
+            if f.suffix == ".md" and f.is_file() and not f.is_symlink():
                 try:
                     rounds = _read_session_rounds(f)
-                    stat = f.stat()
-                    age_secs = time.time() - stat.st_mtime
+                    st = f.lstat()
+                    age_secs = time.time() - st.st_mtime
                     if age_secs < 3600:
                         age_str = f"{int(age_secs / 60)}m ago"
                     else:
                         age_str = f"{age_secs / 3600:.1f}h ago"
-                    size_kb = stat.st_size / 1024
+                    size_kb = st.st_size / 1024
                     name = f.stem
                     session_entries.append(
                         f"  {name:<20s} Round {rounds}/{MAX_SESSION_ROUNDS}  "
                         f"({age_str}, {size_kb:.1f} KB)"
                     )
-                except OSError:
+                except (OSError, UnicodeDecodeError):
                     pass
 
     if session_entries:
@@ -3637,15 +3788,15 @@ async def codex_status(params: StatusInput) -> str:
         lines.append("\nSessions: none")
 
     # --- Recaps ---
-    recaps_dir = claudex_dir / "recaps"
+    recaps_dir = _real_subdir("recaps")
     recap_count = 0
     recap_bytes = 0
-    if recaps_dir.is_dir():
+    if recaps_dir is not None:
         for f in recaps_dir.iterdir():
-            if f.is_file():
+            if f.is_file() and not f.is_symlink():
                 try:
                     recap_count += 1
-                    recap_bytes += f.stat().st_size
+                    recap_bytes += f.lstat().st_size
                 except OSError:
                     pass
     if recap_count:
@@ -3653,34 +3804,32 @@ async def codex_status(params: StatusInput) -> str:
     else:
         lines.append("Recaps: none")
 
+    def _tree_bytes(top: Path) -> int:
+        total = 0
+        for root_path, _dirs, files in os.walk(top):  # followlinks=False
+            for fname in files:
+                try:
+                    total += os.lstat(os.path.join(root_path, fname)).st_size
+                except OSError:
+                    pass
+        return total
+
     # --- Artifact run dirs ---
     run_dir_count = 0
     run_dir_bytes = 0
-    if claudex_dir.is_dir():
+    if claudex_usable:
         for entry in claudex_dir.iterdir():
-            if entry.is_dir() and entry.name.startswith("run-") and not entry.is_symlink():
+            if entry.name.startswith("run-") and entry.is_dir() and not entry.is_symlink():
                 run_dir_count += 1
-                for root_path, _dirs, files in os.walk(entry):
-                    for fname in files:
-                        try:
-                            run_dir_bytes += os.path.getsize(os.path.join(root_path, fname))
-                        except OSError:
-                            pass
+                run_dir_bytes += _tree_bytes(entry)
     if run_dir_count:
         lines.append(f"Artifacts: {run_dir_count} run dir(s) ({run_dir_bytes / 1024:.1f} KB)")
     else:
         lines.append("Artifacts: none")
 
     # --- Total .claudex/ disk usage ---
-    total_bytes = 0
-    if claudex_dir.is_dir():
-        for root_path, _dirs, files in os.walk(claudex_dir):
-            for fname in files:
-                try:
-                    total_bytes += os.path.getsize(os.path.join(root_path, fname))
-                except OSError:
-                    pass
-        lines.append(f"\n.claudex/ total: {total_bytes / 1024:.1f} KB")
+    if claudex_usable:
+        lines.append(f"\n.claudex/ total: {_tree_bytes(claudex_dir) / 1024:.1f} KB")
 
     # --- Metrics ---
     metrics_summary = _get_metrics_summary()
@@ -4292,7 +4441,7 @@ def _write_job_file(job_id: str, *, status_only: bool = False) -> None:
         header += f"Finished: {datetime.now(timezone.utc).isoformat()}\n\n---\n\n"
         content = header + (job["result"] or "")
     try:
-        if _HAVE_DIR_FD and os.replace in os.supports_dir_fd:
+        if _HAVE_DIR_FD:
             _write_job_content_fd(path, content)
         else:
             _write_job_content_pathwise(path, content)
@@ -4302,19 +4451,29 @@ def _write_job_file(job_id: str, *, status_only: bool = False) -> None:
 
 
 def _write_job_content_fd(path: Path, content: str) -> None:
-    """Atomic 0600 write relative to the jobs dir fd (no symlink follows, v2.3.1)."""
-    path.parent.parent.mkdir(parents=True, exist_ok=True)
+    """0600 job record written relative to the jobs dir fd (no symlink follows).
+
+    Atomic via renameat when available (Linux, macOS); otherwise written in
+    place, which a crash could leave partial (readers then see a short body).
+    """
+    _ensure_parent_dir(path)
     sub_fd = _open_claudex_subdir(path.parent.parent, path.parent.name, create=True)
     try:
         try:
             os.fchmod(sub_fd, 0o700)
         except OSError:
             pass
+        flags = os.O_WRONLY | os.O_CREAT
+        if not _HAVE_RENAME_DIR_FD:
+            fd = _open_leaf(sub_fd, path.name, flags | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                os.fchmod(f.fileno(), 0o600)
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            return
         tmp_name = f".{path.name}.{uuid.uuid4().hex[:8]}.tmp"
-        fd = os.open(
-            tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW, 0o600,
-            dir_fd=sub_fd,
-        )
+        fd = _open_leaf(sub_fd, tmp_name, flags | os.O_EXCL, 0o600)
         try:
             # Atomic replace: a crash mid-write never destroys a valid record,
             # and job files are not world-readable.
@@ -4322,7 +4481,7 @@ def _write_job_content_fd(path: Path, content: str) -> None:
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_name, path.name, src_dir_fd=sub_fd, dst_dir_fd=sub_fd)
+            os.rename(tmp_name, path.name, src_dir_fd=sub_fd, dst_dir_fd=sub_fd)
         except OSError:
             try:
                 os.unlink(tmp_name, dir_fd=sub_fd)
@@ -4334,14 +4493,10 @@ def _write_job_content_fd(path: Path, content: str) -> None:
 
 
 def _write_job_content_pathwise(path: Path, content: str) -> None:
-    """Fallback for platforms without dir_fd support."""
+    """Fallback for platforms without dir_fd support (Windows): best-effort."""
     if path.parent.is_symlink() or path.parent.parent.is_symlink():
         raise OSError(f"refusing symlinked job directory: {path.parent}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
-        pass
     tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
