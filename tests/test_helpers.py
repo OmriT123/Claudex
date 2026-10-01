@@ -3352,6 +3352,213 @@ class TestCodexLogin:
 
 
 # =========================================================================
+# v2.3.1 security: no symlink following inside .claudex/ (real filesystem)
+# =========================================================================
+
+import time as _time
+
+
+def _make_old(path: Path, days: float = 3) -> None:
+    old = _time.time() - days * 86_400
+    os.utime(path, (old, old))
+
+
+class TestV231CleanupContainment:
+    """A repo could commit .claudex/<subdir> as a symlink; cleanup followed it
+    and deleted day-old files in the target (reported 2026-10-01)."""
+
+    @pytest.fixture(params=[True, False], ids=["dir_fd", "pathwise"])
+    def mode(self, request, monkeypatch):
+        import server as srv
+        if request.param and not srv._HAVE_DIR_FD:
+            pytest.skip("platform lacks dir_fd support")
+        monkeypatch.setattr(srv, "_HAVE_DIR_FD", request.param)
+        return request.param
+
+    @pytest.mark.parametrize("subdir", ["sessions", "recaps", "jobs"])
+    def test_symlinked_subdir_to_outside_is_not_followed(self, tmp_path, subdir, mode):
+        import server as srv
+        victim_dir = tmp_path / "victim"; victim_dir.mkdir()
+        victim = victim_dir / "precious.txt"; victim.write_text("keep me")
+        _make_old(victim)
+        claudex = tmp_path / "proj" / ".claudex"; claudex.mkdir(parents=True)
+        (claudex / subdir).symlink_to(victim_dir)
+        srv._cleanup_old_sessions(claudex)
+        assert victim.exists() and victim.read_text() == "keep me"
+
+    @pytest.mark.parametrize("subdir", ["sessions", "recaps", "jobs"])
+    def test_symlinked_subdir_to_inside_is_not_followed(self, tmp_path, subdir, mode):
+        import server as srv
+        claudex = tmp_path / "proj" / ".claudex"
+        other = claudex / "run-keep"; other.mkdir(parents=True)
+        f = other / "artifact.md"; f.write_text("x"); _make_old(f)
+        (claudex / subdir).symlink_to(other)
+        srv._cleanup_old_sessions(claudex)
+        assert f.exists()
+
+    def test_symlinked_claudex_dir_is_not_followed(self, tmp_path, mode):
+        import server as srv
+        victim_dir = tmp_path / "victim" / "jobs"; victim_dir.mkdir(parents=True)
+        victim = victim_dir / "precious.txt"; victim.write_text("keep"); _make_old(victim)
+        proj = tmp_path / "proj"; proj.mkdir()
+        (proj / ".claudex").symlink_to(tmp_path / "victim")
+        srv._cleanup_old_sessions(proj / ".claudex")
+        assert victim.exists()
+
+    def test_normal_cleanup_still_works(self, tmp_path, mode):
+        import server as srv
+        claudex = tmp_path / ".claudex"
+        for sub in ("sessions", "recaps", "jobs"):
+            (claudex / sub).mkdir(parents=True)
+            stale = claudex / sub / "stale.md"; stale.write_text("old"); _make_old(stale)
+            fresh = claudex / sub / "fresh.md"; fresh.write_text("new")
+        outside = tmp_path / "outside.md"; outside.write_text("o"); _make_old(outside)
+        (claudex / "sessions" / "leaf-link.md").symlink_to(outside)
+        srv._cleanup_old_sessions(claudex)
+        for sub in ("sessions", "recaps", "jobs"):
+            assert not (claudex / sub / "stale.md").exists()
+            assert (claudex / sub / "fresh.md").exists()
+        assert outside.exists()  # leaf symlinks are skipped, never followed
+
+    def test_prepare_run_dir_path_cannot_reach_outside(self, tmp_path, monkeypatch):
+        # End-to-end through the real trigger (_prepare_run_dir runs cleanup).
+        import server as srv
+        victim_dir = tmp_path / "victim"; victim_dir.mkdir()
+        victim = victim_dir / "precious.txt"; victim.write_text("keep"); _make_old(victim)
+        proj = tmp_path / "proj"; (proj / ".claudex").mkdir(parents=True)
+        (proj / ".claudex" / "jobs").symlink_to(victim_dir)
+        srv._prepare_run_dir(str(proj))
+        assert victim.exists()
+
+
+class TestV231NoFollowIO:
+    def test_symlink_to_sibling_is_rejected(self, tmp_path):
+        sessions = tmp_path / ".claudex" / "sessions"; sessions.mkdir(parents=True)
+        (sessions / "real.md").write_text("real")
+        (sessions / "alias.md").symlink_to("real.md")
+        assert _safe_claudex_path(str(tmp_path), "sessions", "alias.md") is None
+
+    def test_write_refuses_symlinked_subdir(self, tmp_path):
+        import server as srv
+        if not srv._HAVE_DIR_FD:
+            pytest.skip("platform lacks dir_fd support")
+        outside = tmp_path / "outside"; outside.mkdir()
+        claudex = tmp_path / "proj" / ".claudex"; claudex.mkdir(parents=True)
+        (claudex / "sessions").symlink_to(outside)
+        with pytest.raises(OSError):
+            srv._write_text_nofollow(claudex / "sessions" / "s.md", "x")
+        assert not (outside / "s.md").exists()
+
+    def test_write_refuses_leaf_symlink(self, tmp_path):
+        import server as srv
+        outside = tmp_path / "outside.md"; outside.write_text("original")
+        sessions = tmp_path / "proj" / ".claudex" / "sessions"; sessions.mkdir(parents=True)
+        (sessions / "s.md").symlink_to(outside)
+        with pytest.raises(OSError):
+            srv._write_text_nofollow(sessions / "s.md", "overwritten")
+        assert outside.read_text() == "original"
+
+    def test_job_file_refuses_symlinked_jobs_dir(self, tmp_path):
+        import server as srv
+        outside = tmp_path / "outside"; outside.mkdir()
+        proj = tmp_path / "proj"; (proj / ".claudex").mkdir(parents=True)
+        (proj / ".claudex" / "jobs").symlink_to(outside)
+        job_id = "job-abcdef123456"
+        srv._jobs[job_id] = {"project_dir": str(proj), "tool": "plan",
+                             "status": "completed", "result": "r"}
+        try:
+            srv._write_job_file(job_id)
+        finally:
+            srv._jobs.pop(job_id, None)
+        assert list(outside.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_collab_session_swapped_during_model_call(self, tmp_path):
+        # The session path is validated before the minutes-long model call;
+        # swapping .claudex/sessions for a symlink meanwhile must not redirect
+        # the write (the original report's TOCTOU follow-up).
+        import server as srv
+        proj = tmp_path / "proj"; sessions = proj / ".claudex" / "sessions"
+        sessions.mkdir(parents=True)
+        outside = tmp_path / "outside"; outside.mkdir()
+
+        async def swap_then_answer(*a, **k):
+            shutil.rmtree(sessions)
+            sessions.symlink_to(outside)
+            return "Codex says hi"
+
+        with patch.object(srv, "_run_codex", side_effect=swap_then_answer):
+            out = await srv.codex_collab(srv.CollaborateInput(
+                problem="a problem long enough", cc_analysis="analysis long enough",
+                project_dir=str(proj), session_id="swap-test"))
+        assert list(outside.iterdir()) == []
+        assert "Session document NOT updated" in out
+
+    @pytest.mark.asyncio
+    async def test_collab_refuses_symlinked_session_file(self, tmp_path):
+        import server as srv
+        proj = tmp_path / "proj"; sessions = proj / ".claudex" / "sessions"
+        sessions.mkdir(parents=True)
+        secret = tmp_path / "secret.md"; secret.write_text("<!-- claudex:rounds=1 -->")
+        (sessions / "s1.md").symlink_to(secret)
+        with patch.object(srv, "_run_codex", new_callable=AsyncMock, return_value="x"):
+            out = await srv.codex_collab(srv.CollaborateInput(
+                problem="a problem long enough", cc_analysis="analysis long enough",
+                project_dir=str(proj), session_id="s1"))
+        assert out.startswith("Error:")
+
+
+class TestV231DiffFailures:
+    @pytest.mark.asyncio
+    async def test_not_a_repo_is_an_error_not_nothing_to_review(self, tmp_path):
+        from server import codex_review_diff, ReviewDiffInput
+        plain = tmp_path / "plain"; plain.mkdir()
+        (plain / "a.py").write_text("x = 1\n")
+        out = await codex_review_diff(ReviewDiffInput(project_dir=str(plain)))
+        assert out.startswith("Error:")
+        assert "Nothing was reviewed" in out
+        assert "Nothing to review" not in out
+
+    @pytest.mark.asyncio
+    async def test_git_missing_is_an_error(self, tmp_path, monkeypatch):
+        import server as srv
+        repo = tmp_path / "r"; repo.mkdir()
+
+        async def no_git(*a, **k):
+            raise FileNotFoundError("git")
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", no_git)
+        out = await srv._get_git_diff(str(repo))
+        assert out.startswith("Error:") and "Nothing was reviewed" in out
+
+    @pytest.mark.asyncio
+    async def test_untracked_probe_failure_is_an_error(self, tmp_path, monkeypatch):
+        import server as srv
+        repo = tmp_path / "r"; repo.mkdir()
+        monkeypatch.setattr(srv, "_get_git_diff", AsyncMock(return_value=None))
+        monkeypatch.setattr(srv, "_git_cmd", AsyncMock(return_value=None))
+        out = await srv.codex_review_diff(srv.ReviewDiffInput(project_dir=str(repo)))
+        assert out.startswith("Error:") and "Nothing to review" not in out
+
+    @pytest.mark.asyncio
+    async def test_clean_repo_still_reports_nothing_to_review(self, tmp_path):
+        import subprocess as sp
+        from server import codex_review_diff, ReviewDiffInput
+        repo = tmp_path / "r"; repo.mkdir()
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                "--allow-empty", "-m", "i"], cwd=repo, check=True)
+        out = await codex_review_diff(ReviewDiffInput(project_dir=str(repo)))
+        assert "Nothing to review" in out
+
+
+def test_server_version_matches_manifests():
+    import server as srv
+    plugin = json.loads((PROJECT_ROOT / ".claude-plugin" / "plugin.json").read_text())
+    ext = json.loads((PROJECT_ROOT / "desktop-extension" / "manifest.json").read_text())
+    assert srv.SERVER_VERSION == plugin["version"] == ext["version"]
+
+
+# =========================================================================
 # Entry point for uv run --script
 # =========================================================================
 

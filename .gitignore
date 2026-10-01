@@ -3,7 +3,7 @@
 __pycache__/
 *.pyc
 _cc-config/
-desktop-extension/claudex.mcpb
+desktop-extension/*.mcpb
 .claude/settings.local.json
 .serena/
 .pytest_cache/

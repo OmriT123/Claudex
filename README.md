@@ -1,4 +1,4 @@
-# Claudex — Claude Code Plugin <sup>v2.3.0</sup>
+# Claudex — Claude Code Plugin <sup>v2.3.1</sup>
 
 Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, security-testing, debugging, verification, and decision support.
 

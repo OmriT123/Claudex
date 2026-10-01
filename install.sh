@@ -1,113 +1,84 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-# Claudex Installer — adds the marketplace and installs the plugin
+# Claudex installer: adds the marketplace, installs the plugin, and prepares
+# the server's Python dependencies so the first session starts instantly.
 # Usage: curl -fsSL https://raw.githubusercontent.com/OmriT123/Claudex/main/install.sh | bash
+#
+# Uses Claude Code's own plugin commands (no hand-edited JSON) and prepares
+# the dependencies of the version that was actually installed (v2.3.1).
+set -euo pipefail
 
 MARKETPLACE_NAME="omri-plugins"
 MARKETPLACE_REPO="OmriT123/claude-plugins"
-MARKETPLACE_URL="https://github.com/${MARKETPLACE_REPO}.git"
-PLUGIN_DIR="$HOME/.claude/plugins"
-MARKETPLACE_DIR="$PLUGIN_DIR/marketplaces/$MARKETPLACE_NAME"
-KNOWN_FILE="$PLUGIN_DIR/known_marketplaces.json"
+PLUGIN_ID="claudex@${MARKETPLACE_NAME}"
 
-echo "Installing Claudex — Claude Code's Codex teammate"
+echo "Installing Claudex: Claude Code's Codex teammate"
 echo ""
 
 # Check prerequisites
+missing=0
 for cmd in claude codex uv git; do
   if ! command -v "$cmd" &>/dev/null; then
     echo "Error: '$cmd' is not installed."
     case "$cmd" in
-      claude) echo "  Install Claude Code: https://docs.anthropic.com/en/docs/claude-code" ;;
-      codex)  echo "  Install: npm i -g @openai/codex && codex login" ;;
+      claude) echo "  Install Claude Code: https://code.claude.com/docs/en/setup" ;;
+      codex)  echo "  Install: npm i -g @openai/codex@latest && codex login" ;;
       uv)     echo "  Install: curl -LsSf https://astral.sh/uv/install.sh | sh" ;;
       git)    echo "  Install git from https://git-scm.com" ;;
     esac
-    exit 1
+    missing=1
   fi
 done
+[ "$missing" -eq 0 ] || exit 1
 
-# Ensure directories exist
-mkdir -p "$PLUGIN_DIR/marketplaces"
-
-# Clone or update the marketplace
-if [ -d "$MARKETPLACE_DIR/.git" ]; then
+# Add (or refresh) the marketplace through Claude Code itself
+if claude plugin marketplace list 2>/dev/null | grep -q "$MARKETPLACE_NAME"; then
   echo "Updating marketplace..."
-  git -C "$MARKETPLACE_DIR" pull --quiet
+  claude plugin marketplace update "$MARKETPLACE_NAME"
 else
-  if [ -d "$MARKETPLACE_DIR" ]; then
-    rm -rf "$MARKETPLACE_DIR"
-  fi
   echo "Adding marketplace..."
-  git clone --quiet "$MARKETPLACE_URL" "$MARKETPLACE_DIR"
+  claude plugin marketplace add "$MARKETPLACE_REPO"
 fi
 
-# Register the marketplace in known_marketplaces.json
-NOW=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
-
-if [ ! -f "$KNOWN_FILE" ]; then
-  # No file yet — create it
-  cat > "$KNOWN_FILE" << EOF
-{
-  "$MARKETPLACE_NAME": {
-    "source": {
-      "source": "github",
-      "repo": "$MARKETPLACE_REPO"
-    },
-    "installLocation": "$MARKETPLACE_DIR",
-    "lastUpdated": "$NOW"
-  }
-}
-EOF
-  echo "Created marketplace registry."
-elif ! grep -q "\"$MARKETPLACE_NAME\"" "$KNOWN_FILE"; then
-  # File exists but marketplace not registered — inject before final }
-  # Remove trailing whitespace/newline and closing brace, append new entry
-  ENTRY=$(cat << EOF
-,
-  "$MARKETPLACE_NAME": {
-    "source": {
-      "source": "github",
-      "repo": "$MARKETPLACE_REPO"
-    },
-    "installLocation": "$MARKETPLACE_DIR",
-    "lastUpdated": "$NOW"
-  }
-}
-EOF
-  )
-  # Replace the last } with the new entry
-  sed -i.bak '$s/}$//' "$KNOWN_FILE"
-  echo "$ENTRY" >> "$KNOWN_FILE"
-  rm -f "${KNOWN_FILE}.bak"
-  echo "Registered marketplace."
+# Install, or update an existing install
+echo ""
+if claude plugin list 2>/dev/null | grep -q "$PLUGIN_ID"; then
+  echo "Updating Claudex plugin..."
+  claude plugin update "$PLUGIN_ID"
 else
-  echo "Marketplace already registered."
+  echo "Installing Claudex plugin..."
+  claude plugin install "$PLUGIN_ID" --scope user
 fi
 
-# Install the plugin
-echo ""
-echo "Installing Claudex plugin..."
-claude plugin install "claudex@$MARKETPLACE_NAME"
+# Locate the installed copy from Claude Code's own records, not by globbing
+# the cache (which can hold several versions).
+install_path="$(
+  claude plugin list --json 2>/dev/null | awk -v id="$PLUGIN_ID" '
+    /"id":/          { cur = $0; sub(/.*"id": *"/, "", cur); sub(/".*/, "", cur) }
+    /"installPath":/ { if (cur == id) { p = $0; sub(/.*"installPath": *"/, "", p); sub(/".*/, "", p); print p; exit } }
+  '
+)"
+SERVER_PY="${install_path:+$install_path/server/server.py}"
 
-# Pre-warm uv dependencies so the MCP server starts instantly on first launch.
-# Without this, uv downloads packages on first startup, which can exceed
-# Claude Code's MCP connection timeout and leave the server in a failed state.
-CACHE_DIR="$PLUGIN_DIR/cache/$MARKETPLACE_NAME/claudex"
-SERVER_PY=$(find "$CACHE_DIR" -name "server.py" -path "*/server/server.py" 2>/dev/null | head -1)
-if [ -n "$SERVER_PY" ]; then
-  echo "Pre-warming dependencies (first run may take a few seconds)..."
-  uv run "$SERVER_PY" &>/dev/null &
-  WARM_PID=$!
-  sleep 3
-  kill "$WARM_PID" 2>/dev/null
-  wait "$WARM_PID" 2>/dev/null
-  echo "Dependencies cached."
+# Prepare dependencies with a bounded, checked step (uv resolves and installs,
+# then exits; nothing is started or killed).
+echo ""
+if [ -n "$SERVER_PY" ] && [ -f "$SERVER_PY" ]; then
+  echo "Preparing Python dependencies (first run may take a few seconds)..."
+  if uv sync --script "$SERVER_PY"; then
+    echo "Dependencies ready."
+  else
+    echo "Warning: dependency preparation failed. The plugin is installed; the"
+    echo "first session will retry. To retry now: uv sync --script \"$SERVER_PY\""
+    exit 1
+  fi
+else
+  echo "Warning: could not locate the installed plugin to prepare dependencies."
+  echo "The first session will prepare them on start (it can take a few seconds)."
 fi
 
 echo ""
-echo "Done! Start a new Claude Code session and try:"
-echo "  /mcp                              — verify codex tools are loaded"
-echo "  use codex_ping to test codex    — verify Codex connectivity"
-echo "  /codex:plan <your task>         — parallel planning with Codex"
+echo "Done! Set the folders Codex may work in, then start a new Claude Code session:"
+echo "  export CLAUDEX_ALLOWED_ROOTS=\"\$HOME/Projects\"   # add to your shell profile"
+echo "  /mcp                            : verify codex tools are loaded"
+echo "  use codex_ping to test codex    : verify Codex connectivity"
+echo "  /codex:plan <your task>         : parallel planning with Codex"
