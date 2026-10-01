@@ -13,7 +13,7 @@ Consult **OpenAI Codex as a specialist teammate** during planning, security-test
 
 **Cost note:** Each tool call = 1 message from the user's ChatGPT quota. Don't call Codex for tasks you're confident about.
 
-**Skip Codex when:** config-only changes, documentation edits, trivial renames, formatting-only commits, dependency version bumps with no code change, or when you're confident about a low-risk change.
+**Usually skip Codex (unless the user asked for it or their standing permission covers the task) when:** config-only changes, documentation edits, trivial renames, formatting-only commits, dependency version bumps with no code change, or when you're confident about a low-risk change.
 
 ---
 

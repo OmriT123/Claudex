@@ -738,16 +738,83 @@ def _distribution() -> str:
     return "manual launch or source checkout"
 
 
-def _config_path() -> Path:
-    """Per-user roots config file: a fixed OS location, independent of any env
-    override that a plugin host or project could influence (v2.4)."""
+def _windows_known_folder(guid: str) -> Optional[Path]:
+    """SHGetKnownFolderPath: the shell's folder, not an inherited env var."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                        ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+        u = uuid.UUID(guid)
+        g = _GUID(u.time_low, u.time_mid, u.time_hi_version,
+                  (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+        out = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(g), 0, None, ctypes.byref(out)) != 0:
+            return None
+        try:
+            return Path(out.value) if out.value else None
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(out)
+    except Exception:  # noqa: BLE001 - any failure means "unknown"
+        return None
+
+
+_FOLDERID_PROFILE = "5E6C858F-0E22-4760-9AFE-EA3317B67173"
+_FOLDERID_ROAMING_APPDATA = "3EB685DB-65F9-4CF6-A03A-E3EF65729F3D"
+
+
+def _account_home() -> Path:
+    """The OS account's home folder, independent of $HOME / %USERPROFILE%.
+
+    A project's Claude Code settings or an MCP host can set the server's
+    environment, so the revocation file and the protected-home checks must
+    not follow an inherited HOME (v2.4). Falls back to Path.home() only when
+    the account database has no answer.
+    """
     if os.name == "nt":
-        appdata = os.environ.get("APPDATA", "").strip()
-        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+        return _windows_known_folder(_FOLDERID_PROFILE) or Path.home()
+    try:
+        import pwd
+        home = pwd.getpwuid(os.getuid()).pw_dir
+        if home and os.path.isabs(home):
+            return Path(home)
+    except (ImportError, KeyError, OSError):
+        pass
+    return Path.home()
+
+
+def _home_dirs() -> list:
+    """Resolved home folders to protect: the account's and $HOME, if different."""
+    homes = []
+    for h in (_account_home(), Path.home()):
+        try:
+            r = h.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if r not in homes:
+            homes.append(r)
+    return homes
+
+
+def _default_config_path() -> Path:
+    """Per-user roots config file at a fixed OS location derived from the OS
+    account, not from env vars a plugin host or project could set (v2.4)."""
+    if os.name == "nt":
+        base = _windows_known_folder(_FOLDERID_ROAMING_APPDATA)
+        if base is None:
+            appdata = os.environ.get("APPDATA", "").strip()
+            base = Path(appdata) if os.path.isabs(appdata) else _account_home() / "AppData" / "Roaming"
         return base / "Botique" / "Claudex" / "config.json"
+    home = _account_home()
     if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "Botique" / "Claudex" / "config.json"
-    return Path.home() / ".config" / "botique-claudex" / "config.json"
+        return home / "Library" / "Application Support" / "Botique" / "Claudex" / "config.json"
+    return home / ".config" / "botique-claudex" / "config.json"
+
+
+def _config_path() -> Path:
+    return _default_config_path()
 
 
 @dataclass(frozen=True)
@@ -788,31 +855,85 @@ def _load_roots_config() -> tuple[str, list, str]:
     """
     path = _config_path()
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw = _read_roots_config_bytes(path)
     except FileNotFoundError:
         return "absent", [], str(path)
-    except (OSError, UnicodeDecodeError) as exc:
-        return "malformed", [], f"{path}: unreadable ({exc})"
+    except OSError as exc:
+        return "malformed", [], f"{path}: unreadable ({exc.strerror or exc})"
     try:
-        data = json.loads(raw)
-    except ValueError as exc:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
         return "malformed", [], f"{path}: invalid JSON ({exc})"
-    if not isinstance(data, dict) or data.get("version") != ROOTS_CONFIG_VERSION:
+    version = data.get("version") if isinstance(data, dict) else None
+    if type(version) is not int or version != ROOTS_CONFIG_VERSION:
         return "malformed", [], f"{path}: unsupported format (expected version {ROOTS_CONFIG_VERSION})"
-    if data.get("deny_all") is True:
+    deny_all = data.get("deny_all", False)
+    if type(deny_all) is not bool:
+        return "malformed", [], f"{path}: deny_all must be true or false"
+    if deny_all:
         return "revoked", [], str(path)
     entries = data.get("allowed_roots")
     if not isinstance(entries, list) or not all(isinstance(e, str) for e in entries):
         return "malformed", [], f"{path}: allowed_roots must be a list of paths"
     roots = []
     for entry in entries:
-        if not os.path.isabs(entry):
-            return "malformed", [], f"{path}: relative path {entry!r}"
+        if "\x00" in entry or not os.path.isabs(entry):
+            return "malformed", [], f"{path}: invalid path {entry!r}"
         try:
             roots.append(Path(entry).resolve())
-        except OSError as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             return "malformed", [], f"{path}: {entry!r} ({exc})"
     return "ok", roots, str(path)
+
+
+ROOTS_CONFIG_MAX_BYTES = 64 * 1024
+
+
+def _check_private(st, what: str) -> None:
+    """Owned by this account and not writable by group/others (POSIX)."""
+    if os.name == "nt":
+        return
+    if st.st_uid != os.getuid():
+        raise OSError(errno.EPERM, f"{what} is owned by another account")
+    if st.st_mode & 0o022:
+        raise OSError(errno.EPERM, f"{what} is writable by other accounts")
+
+
+def _read_roots_config_bytes(path: Path) -> bytes:
+    """Bounded, no-follow read of the roots config (v2.4).
+
+    The file and its own folder must be real (no symlink at either), owned by
+    this account and not writable by others; anything else raises, and the
+    caller treats it as unusable (deny-all), never as absent. Non-blocking, so
+    a FIFO cannot hang the server. FileNotFoundError only when it is missing.
+    """
+    if os.name == "nt" or not (_O_NOFOLLOW and _O_DIRECTORY):
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        with open(path, "rb") as f:
+            data = f.read(ROOTS_CONFIG_MAX_BYTES + 1)
+    else:
+        dir_fd = os.open(path.parent, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+        try:
+            _check_private(os.fstat(dir_fd), "the config folder")
+            fd = os.open(path.name, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError(errno.EINVAL, "not a regular file")
+            _check_private(st, "the config file")
+            with os.fdopen(fd, "rb") as f:
+                fd = -1
+                data = f.read(ROOTS_CONFIG_MAX_BYTES + 1)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    if len(data) > ROOTS_CONFIG_MAX_BYTES:
+        raise OSError(errno.EFBIG, "larger than 64 KB")
+    return data
 
 
 def _roots_resolution() -> _RootsResolution:
@@ -880,7 +1001,7 @@ def _cloud_default_roots() -> list[Path]:
         root = Path(raw).resolve()
     except OSError:
         return []
-    if not root.is_dir() or root == Path.home().resolve() or root == root.parent:
+    if not root.is_dir() or root in _home_dirs() or root == root.parent:
         return []
     return [root]
 
@@ -914,9 +1035,9 @@ def _roots_span_filesystem() -> bool:
     falsely claiming 'confinement active'. (A narrower per-file read denylist is
     tracked as a follow-up hardening task — see ROADMAP.)
     """
-    home = Path.home().resolve()
+    homes = _home_dirs()
     for r in _allowed_roots():
-        if r == home or r == r.parent:  # r == r.parent is true only at a FS/drive root
+        if r in homes or r == r.parent:  # r == r.parent is true only at a FS/drive root
             return True
     return False
 
@@ -966,16 +1087,17 @@ def _validate_project_dir(project_dir: Optional[str]) -> str:
         raise ValueError(f"Project directory does not exist: {cwd}")
     resolved = Path(cwd).resolve()
 
-    home = Path.home().resolve()
-    if resolved == home:
+    homes = _home_dirs()
+    if resolved in homes:
         raise ValueError(
             "Refusing to run Codex over the entire home directory. "
             "Pass a specific project directory."
         )
-    for denied in ALWAYS_DENIED_SUBPATHS:
-        denied_path = (home / denied).resolve()
-        if resolved == denied_path or resolved.is_relative_to(denied_path):
-            raise ValueError(f"Project directory is a protected location: {resolved}")
+    for home in homes:
+        for denied in ALWAYS_DENIED_SUBPATHS:
+            denied_path = (home / denied).resolve()
+            if resolved == denied_path or resolved.is_relative_to(denied_path):
+                raise ValueError(f"Project directory is a protected location: {resolved}")
 
     resolution = _roots_resolution()
     roots = resolution.roots
@@ -1369,6 +1491,32 @@ def _ensure_claudex_ignored(claudex_dir: Path) -> None:
             f.write(body)
     except OSError:
         pass  # exists already, or .claudex is unusable
+
+
+def _claudex_ignore_state(claudex_dir: Path) -> str:
+    """'ok', 'missing' or 'ineffective' for .claudex/.gitignore (diagnostics).
+
+    Claudex creates the file but never overwrites one a repository brought
+    along, so status reports when it does not ignore everything.
+    """
+    if not _HAVE_DIR_FD:
+        return "unknown"
+    try:
+        claudex_fd = _claudex_fd(claudex_dir, create=False)
+    except OSError:
+        return "missing"
+    try:
+        try:
+            fd = _open_leaf(claudex_fd, ".gitignore", os.O_RDONLY, 0)
+        except FileNotFoundError:
+            return "missing"
+        except OSError:
+            return "ineffective"
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
+            lines = [ln.strip() for ln in f.read(65_536).splitlines()]
+    finally:
+        os.close(claudex_fd)
+    return "ok" if "*" in lines else "ineffective"
 
 
 def _tree_bytes_fd(dir_fd: int, depth: int = 0) -> int:
@@ -2227,7 +2375,8 @@ class SecondOpinionInput(CodexBaseInput):
         max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "The user's original request, verbatim. Ensures Codex responds "
-            "to user intent, not just CC's interpretation."
+            "to user intent, not just CC's interpretation. "
+            "Only include what the user permits sharing with OpenAI; otherwise omit it or pass an approved, task-specific version."
         ),
     )
     context: Optional[str] = Field(
@@ -2266,7 +2415,8 @@ class ParallelPlanInput(CodexBaseInput):
         description=(
             "The user's original request, verbatim. Pass this EXACTLY as the user "
             "typed it — do not rephrase, interpret, or add your own framing. "
-            "This ensures Codex forms its own independent understanding."
+            "This ensures Codex forms its own independent understanding. "
+            "Only include what the user permits sharing with OpenAI; otherwise omit it or pass an approved, task-specific version."
         ),
     )
     constraints: Optional[str] = Field(
@@ -2305,7 +2455,8 @@ class BrainstormInput(CodexBaseInput):
         description=(
             "The user's original request, verbatim. Pass this EXACTLY as the user "
             "typed it — do not rephrase, interpret, or add your own framing. "
-            "This ensures Codex forms its own independent understanding."
+            "This ensures Codex forms its own independent understanding. "
+            "Only include what the user permits sharing with OpenAI; otherwise omit it or pass an approved, task-specific version."
         ),
     )
     context: Optional[str] = Field(
@@ -2342,7 +2493,8 @@ class CollaborateInput(CodexBaseInput):
         max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "The user's original request, verbatim. Ensures Codex responds "
-            "to user intent, not just CC's interpretation."
+            "to user intent, not just CC's interpretation. "
+            "Only include what the user permits sharing with OpenAI; otherwise omit it or pass an approved, task-specific version."
         ),
     )
     session_id: Optional[str] = Field(
@@ -2378,7 +2530,8 @@ class QuickReviewInput(CodexBaseInput):
         max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "The user's original request, verbatim. Ensures Codex responds "
-            "to user intent, not just CC's interpretation."
+            "to user intent, not just CC's interpretation. "
+            "Only include what the user permits sharing with OpenAI; otherwise omit it or pass an approved, task-specific version."
         ),
     )
     focus: Optional[str] = Field(
@@ -2472,7 +2625,10 @@ class ReviewDiffInput(CodexBaseInput):
     user_prompt: Optional[str] = Field(
         default=None,
         max_length=MAX_TEXT_FIELD_CHARS,
-        description="The user's original request, verbatim.",
+        description=(
+            "The user's original request, verbatim. "
+            "Only include what the user permits sharing with OpenAI; otherwise omit it or pass an approved, task-specific version."
+        ),
     )
 
 
@@ -3363,7 +3519,7 @@ async def codex_critique(params: SecondOpinionInput) -> str:
 
     if params.user_prompt:
         parts.append(
-            "## Original User Request (verbatim)\n"
+            "## Original User Request (as forwarded by Claude)\n"
             "```\n"
             f"{params.user_prompt}\n"
             "```\n"
@@ -3435,7 +3591,7 @@ async def codex_plan(params: ParallelPlanInput) -> str:
 
     if params.user_prompt:
         parts.append(
-            "## Original User Request (verbatim — form your own interpretation)\n"
+            "## Original User Request (as forwarded by Claude — form your own interpretation)\n"
             "```\n"
             f"{params.user_prompt}\n"
             "```\n"
@@ -3507,7 +3663,7 @@ async def codex_brainstorm(params: BrainstormInput) -> str:
 
     if params.user_prompt:
         parts.append(
-            "## Original User Request (verbatim — form your own interpretation)\n"
+            "## Original User Request (as forwarded by Claude — form your own interpretation)\n"
             "```\n"
             f"{params.user_prompt}\n"
             "```\n"
@@ -3683,7 +3839,7 @@ async def codex_collab(params: CollaborateInput) -> str:
 
     if params.user_prompt:
         parts.append(
-            "## Original User Request (verbatim)\n"
+            "## Original User Request (as forwarded by Claude)\n"
             "```\n"
             f"{params.user_prompt}\n"
             "```\n"
@@ -3837,7 +3993,7 @@ async def codex_review(params: QuickReviewInput) -> str:
 
     if params.user_prompt:
         parts.append(
-            "## Original User Request (verbatim)\n"
+            "## Original User Request (as forwarded by Claude)\n"
             "```\n"
             f"{params.user_prompt}\n"
             "```\n"
@@ -4196,7 +4352,7 @@ async def codex_review_diff(params: ReviewDiffInput) -> str:
 
     if params.user_prompt:
         parts.append(
-            "## Original User Request (verbatim)\n"
+            "## Original User Request (as forwarded by Claude)\n"
             "```\n"
             f"{params.user_prompt}\n"
             "```\n"
@@ -4372,6 +4528,12 @@ async def codex_status(params: StatusInput) -> str:
 
     if "total" in usage:
         lines.append(f"\n.claudex/ total: {usage['total'] / 1024:.1f} KB")
+        if _claudex_ignore_state(claudex_dir) == "ineffective":
+            lines.append(
+                "WARNING: .claudex/.gitignore exists but does not ignore everything "
+                "(Claudex never overwrites it). Session documents and artifacts can "
+                "be committed: make it contain a line with just `*`."
+            )
 
     # --- Metrics ---
     metrics_summary = _get_metrics_summary()
@@ -5247,8 +5409,12 @@ async def codex_result(params: JobResultInput) -> str:
         lines = ["Jobs this server session:"]
         for jid, j in sorted(_jobs.items(), key=lambda kv: kv[1]["submitted"]):
             elapsed = (j["finished"] or time.time()) - j["submitted"]
+            # A job whose project is no longer allowed (roots changed or
+            # revoked) is listed without its path (v2.4).
+            _, denied = _authorized_cwd(j["project_dir"])
+            where = "[project no longer allowed]" if denied else j["project_dir"]
             lines.append(
-                f"  {jid}  codex_{j['tool']:<12s} {j['status']:<9s} {elapsed:>5.0f}s  {j['project_dir']}"
+                f"  {jid}  codex_{j['tool']:<12s} {j['status']:<9s} {elapsed:>5.0f}s  {where}"
             )
         return "\n".join(lines)
 
@@ -5302,6 +5468,12 @@ async def codex_result(params: JobResultInput) -> str:
             "can be read from .claudex/jobs/. Use job_id='list' to see live jobs."
         )
 
+    # Re-check the job's project against the current roots: revoking or
+    # narrowing them also withholds results already in memory (v2.4).
+    _, _auth_err = _authorized_cwd(job["project_dir"])
+    if _auth_err:
+        return _auth_err
+
     if job["status"] in ("queued", "running") and params.wait_seconds > 0:
         task = _job_tasks.get(params.job_id)
         if task is not None:
@@ -5325,29 +5497,59 @@ async def codex_result(params: JobResultInput) -> str:
 # ---------------------------------------------------------------------------
 
 def _write_roots_config(data: dict) -> Path:
-    """Atomically write the per-user roots config (0600 file, 0700 dir)."""
+    """Atomically write the per-user roots config (0600 file, 0700 dir).
+
+    POSIX: the config folder is opened without following a symlink, must be
+    owned by this account, and the file is created and renamed relative to
+    that folder's fd, so nothing can redirect the write (v2.4).
+    """
     path = _config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.parent.mkdir(parents=True, exist_ok=True)
     try:
-        os.chmod(path.parent, 0o700)
-    except OSError:
+        os.mkdir(path.parent, 0o700)
+    except FileExistsError:
         pass
-    data = {**data, "version": ROOTS_CONFIG_VERSION,
-            "updated": datetime.now(timezone.utc).isoformat()}
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".config.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except OSError:
+    body = json.dumps({**data, "version": ROOTS_CONFIG_VERSION,
+                       "updated": datetime.now(timezone.utc).isoformat()}, indent=2) + "\n"
+    tmp_name = f".config.{uuid.uuid4().hex}.tmp"
+    if os.name == "nt" or not _HAVE_RENAME_DIR_FD:
+        tmp = path.parent / tmp_name
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
         try:
-            os.unlink(tmp)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
         except OSError:
-            pass
-        raise
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return path
+    dir_fd = os.open(path.parent, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+    try:
+        st = os.fstat(dir_fd)
+        if st.st_uid != os.getuid():
+            raise OSError(errno.EPERM, f"{path.parent} is owned by another account")
+        os.fchmod(dir_fd, 0o700)
+        fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+                     0o600, dir_fd=dir_fd)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
+            os.rename(tmp_name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except OSError:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dir_fd)
     return path
 
 
@@ -5359,15 +5561,16 @@ def _validate_configured_root(raw: str) -> tuple[Optional[Path], str]:
     if not os.path.isdir(expanded):
         return None, "is not an existing folder"
     resolved = Path(expanded).resolve()
-    home = Path.home().resolve()
+    homes = _home_dirs()
     if resolved == resolved.parent:
         return None, "is a filesystem root; pick your project folders"
-    if resolved == home:
+    if resolved in homes:
         return None, "is your whole home folder; pick your project folders"
-    for denied in ALWAYS_DENIED_SUBPATHS:
-        denied_path = (home / denied).resolve()
-        if resolved == denied_path or resolved.is_relative_to(denied_path):
-            return None, "is a protected location"
+    for home in homes:
+        for denied in ALWAYS_DENIED_SUBPATHS:
+            denied_path = (home / denied).resolve()
+            if resolved == denied_path or resolved.is_relative_to(denied_path):
+                return None, "is a protected location"
     return resolved, ""
 
 

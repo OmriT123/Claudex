@@ -4296,7 +4296,172 @@ def test_server_version_matches_manifests():
 
 def _write_cfg(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
     path.write_text(json.dumps(data))
+    os.chmod(path, 0o600)
+
+
+class TestV24ConfigIntegrity:
+    """Codex red team of v2.4: HOME/APPDATA redirection, config I/O identity,
+    strict schema, cached results after revocation, .gitignore claims."""
+
+    @pytest.fixture
+    def acct(self, tmp_path, monkeypatch):
+        # The OS account's home is tmp/acct; $HOME points somewhere else.
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX account database")
+        acct = tmp_path / "acct"; acct.mkdir()
+        fake = tmp_path / "fakehome"; fake.mkdir()
+        monkeypatch.setattr(srv, "_account_home", lambda: acct)
+        monkeypatch.setenv("HOME", str(fake))
+        monkeypatch.setattr(srv, "_config_path", srv._default_config_path)
+        return acct
+
+    def test_account_home_ignores_HOME(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        before = srv._default_config_path()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert srv._account_home() != tmp_path
+        assert srv._default_config_path() == before
+
+    def test_revocation_holds_when_HOME_is_redirected(self, tmp_path, acct, monkeypatch):
+        import server as srv
+        _write_cfg(srv._default_config_path(), {"version": 1, "deny_all": True, "allowed_roots": []})
+        assert str(acct) in str(srv._default_config_path())
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        assert srv._roots_resolution().source == "revoked"
+
+    def test_protected_dirs_of_the_account_home_stay_protected(self, tmp_path, acct, monkeypatch):
+        import server as srv
+        ssh = acct / ".ssh" / "keys"; ssh.mkdir(parents=True)
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        with pytest.raises(ValueError, match="protected"):
+            srv._validate_project_dir(str(ssh))
+        with pytest.raises(ValueError, match="entire home"):
+            srv._validate_project_dir(str(acct))
+
+    @pytest.mark.parametrize("kind", ["dangling", "elsewhere"])
+    def test_symlinked_config_file_denies(self, tmp_path, kind, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        cfg = srv._config_path(); cfg.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(cfg.parent, 0o700)
+        target = tmp_path / "other.json"
+        if kind == "elsewhere":
+            target.write_text(json.dumps({"version": 1, "allowed_roots": [str(tmp_path)]}))
+        cfg.symlink_to(target)
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        res = srv._roots_resolution()
+        assert res.source == "config-error" and res.roots == []
+
+    def test_symlinked_config_folder_denies(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        real = tmp_path / "real"; real.mkdir(mode=0o700)
+        (real / "config.json").write_text(json.dumps({"version": 1, "allowed_roots": [str(tmp_path)]}))
+        link = tmp_path / "linkdir"; link.symlink_to(real)
+        monkeypatch.setattr(srv, "_config_path", lambda: link / "config.json")
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        assert srv._roots_resolution().source == "config-error"
+
+    def test_config_writable_by_others_denies(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        cfg = srv._config_path()
+        _write_cfg(cfg, {"version": 1, "allowed_roots": [str(tmp_path)]})
+        os.chmod(cfg, 0o666)
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        res = srv._roots_resolution()
+        assert res.source == "config-error" and "other accounts" in res.detail
+
+    def test_fifo_and_oversized_config_deny_without_blocking(self, tmp_path, monkeypatch):
+        import server as srv
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("no FIFOs")
+        cfg = srv._config_path(); cfg.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(cfg.parent, 0o700)
+        os.mkfifo(cfg, 0o600)
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        assert srv._roots_resolution().source == "config-error"
+        cfg.unlink()
+        cfg.write_text(json.dumps({"version": 1, "allowed_roots": [], "pad": "x" * 70_000}))
+        os.chmod(cfg, 0o600)
+        assert srv._roots_resolution().source == "config-error"
+
+    @pytest.mark.parametrize("doc", [
+        {"version": 1, "deny_all": "true", "allowed_roots": []},
+        {"version": 1, "deny_all": 1, "allowed_roots": []},
+        {"version": True, "allowed_roots": []},
+        {"version": 1, "allowed_roots": ["/tmp/a\x00b"]},
+    ])
+    def test_malformed_documents_deny_and_never_fall_through(self, tmp_path, doc, monkeypatch):
+        import server as srv
+        _write_cfg(srv._config_path(), doc)
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        res = srv._roots_resolution()
+        assert res.source == "config-error" and res.roots == []
+
+    def test_writer_refuses_a_symlinked_folder(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        real = tmp_path / "victim"; real.mkdir(mode=0o700)
+        link = tmp_path / "cfgdir"; link.symlink_to(real)
+        monkeypatch.setattr(srv, "_config_path", lambda: link / "config.json")
+        with pytest.raises(OSError):
+            srv._write_roots_config({"deny_all": True, "allowed_roots": []})
+        assert list(real.iterdir()) == []
+
+    def test_writer_makes_private_files(self, tmp_path):
+        import server as srv
+        path = srv._write_roots_config({"deny_all": False, "allowed_roots": [str(tmp_path)]})
+        if os.name != "nt":
+            assert stat_mode(path) == 0o600 and stat_mode(path.parent) == 0o700
+        assert srv._load_roots_config()[0] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_revocation_withholds_cached_results(self, tmp_path, monkeypatch):
+        import server as srv
+        proj = tmp_path / "p"; proj.mkdir()
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        job_id = "job-0123456789ab"
+        srv._jobs[job_id] = {"project_dir": str(proj), "tool": "plan", "status": "completed",
+                             "submitted": 0.0, "finished": 1.0, "started_running": 0.0,
+                             "result": "SECRET-RESULT"}
+        try:
+            ok = await srv.codex_result(srv.JobResultInput(job_id=job_id))
+            assert ok == "SECRET-RESULT"
+            srv._write_roots_config({"deny_all": True, "allowed_roots": []})
+            denied = await srv.codex_result(srv.JobResultInput(job_id=job_id))
+            listing = await srv.codex_result(srv.JobResultInput(job_id="list"))
+        finally:
+            srv._jobs.pop(job_id, None)
+        assert denied.startswith("Error:") and "SECRET-RESULT" not in denied
+        assert str(proj) not in listing and "no longer allowed" in listing
+
+    def test_status_flags_an_ineffective_gitignore(self, tmp_path):
+        import server as srv
+        claudex = tmp_path / ".claudex"; claudex.mkdir()
+        (claudex / ".gitignore").write_text("")
+        assert srv._claudex_ignore_state(claudex) == "ineffective"
+        (claudex / ".gitignore").write_text("# x\n*\n")
+        assert srv._claudex_ignore_state(claudex) == "ok"
+
+    def test_prompts_do_not_claim_verbatim(self):
+        import server as srv
+        src = Path(srv.__file__).read_text()
+        assert "Original User Request (verbatim" not in src
+
+
+def stat_mode(path):
+    import stat as _stat
+    return _stat.S_IMODE(os.stat(path).st_mode)
 
 
 class TestV24RootsResolution:

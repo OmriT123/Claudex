@@ -36,7 +36,9 @@ or other people's confidential material you may not share.
 
 ## What is stored, and for how long
 
-In each project, under `.claudex/` (git-ignored automatically):
+In each project, under `.claudex/` (git-ignored: Claudex creates
+`.claudex/.gitignore` with `*`, never overwrites one a repository already has,
+and `codex_status` warns when that file does not ignore everything):
 
 | Folder | Content | Kept |
 |---|---|---|

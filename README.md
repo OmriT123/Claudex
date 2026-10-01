@@ -124,9 +124,14 @@ whichever way fits:
   setting until you run `--configure-roots` again. The file lives in
   `~/Library/Application Support/Botique/Claudex/config.json` (macOS),
   `~/.config/botique-claudex/config.json` (Linux) or
-  `%APPDATA%\Botique\Claudex\config.json` (Windows). It is never read from a
-  project, and no MCP tool can change it. Your home folder itself, filesystem
-  roots and protected locations are refused.
+  `%APPDATA%\Botique\Claudex\config.json` (Windows), located from your OS
+  account rather than from `HOME`/`APPDATA`, so a project that sets those
+  variables cannot point Claudex at another file. It is never read from a
+  project, and no MCP tool can change it. The file and its folder must belong
+  to you, must not be symlinks and must not be writable by other accounts;
+  otherwise every folder is denied. Your home folder itself, filesystem roots
+  and protected locations are refused. Revoking stops new calls and withholds
+  job results still held in memory; a Codex run already in progress finishes.
 
 - **Claude Code only**: export `CLAUDEX_ALLOWED_ROOTS` in your shell
   profile before launching `claude`; the plugin's server inherits Claude Code's
@@ -399,8 +404,10 @@ Codex can produce file artifacts â€” code snippets, test drafts, analysis docs â
 - Artifacts > 100KB are skipped
 - Run directories are cleaned up after 1 hour
 
-**Git:** no setup needed. Since v2.2 `.claudex/` contains a `*` `.gitignore`, so its
-files never show up as untracked or get committed (your own `.gitignore` is left alone).
+**Git:** no setup needed. Since v2.2 Claudex creates `.claudex/.gitignore` with `*`,
+so its files stay out of `git status` and commits (your own `.gitignore` is left
+alone). It never overwrites a `.claudex/.gitignore` a repository already has;
+`codex_status` warns when that file does not ignore everything.
 
 ## Defaults
 
