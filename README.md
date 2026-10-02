@@ -45,6 +45,12 @@ with clear CC/Codex attribution
 
 ## Prerequisites
 
+**Platform: macOS or Linux.** On Windows, install WSL2 (`wsl --install` in an
+administrator PowerShell, then reboot) and run Claude Code, Codex and uv inside
+the Ubuntu terminal. Native Windows and the Windows desktop app are not
+supported yet: Claudex is untested there and Codex's native Windows sandbox is
+still experimental.
+
 1. **Codex CLI ≥ 0.153.1** — the bridge to OpenAI. Older CLIs are rejected by the API for the default `gpt-6-astra` model (`requires a newer version of Codex`). Your ChatGPT account must also have GPT-6 Astra access (OpenAI is rolling it out in stages; Enterprise workspaces enable it explicitly) — Claudex never falls back to another model silently:
    ```bash
    npm i -g @openai/codex@latest
