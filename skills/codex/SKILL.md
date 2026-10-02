@@ -1,6 +1,6 @@
 ---
 name: codex
-description: "Use when entering plan mode for non-trivial tasks, when making architecture decisions, when debugging complex issues, when the user asks for a second opinion, when you need to verify correctness, or when evaluating tradeoffs between approaches. Auto-triggers during plan mode for complex implementations. Use for: auth changes, database schema, >100 LOC features, multi-file refactors, security-sensitive code."
+description: "Use when the user asks for Codex or a second AI opinion, or has given standing permission to consult Codex (e.g. in CLAUDE.md or account instructions), and an independent review would materially improve planning, architecture, debugging, verification or a tradeoff decision. Consulting sends task context and code that Codex reads to OpenAI through the user's own Codex account."
 ---
 
 # Codex — Claude Code Skill
@@ -13,7 +13,7 @@ Consult **OpenAI Codex as a specialist teammate** during planning, security-test
 
 **Cost note:** Each tool call = 1 message from the user's ChatGPT quota. Don't call Codex for tasks you're confident about.
 
-**Skip Codex when:** config-only changes, documentation edits, trivial renames, formatting-only commits, dependency version bumps with no code change, or when you're confident about a low-risk change.
+**Usually skip Codex (unless the user asked for it or their standing permission covers the task) when:** config-only changes, documentation edits, trivial renames, formatting-only commits, dependency version bumps with no code change, or when you're confident about a low-risk change.
 
 ---
 
@@ -55,7 +55,9 @@ What's your situation?
     └─ codex_submit → codex_result        (async job layer, v1.7)
 ```
 
-**Auto-trigger guidance:** Use Codex whenever a second perspective would **materially improve** the output — architecture decisions, complex implementations, subtle bugs, security-sensitive code, or anything the user will deploy to production. When in doubt, use it.
+**When to consult Codex (v2.4):** only when the user asks for it in this conversation, or has given standing permission that covers this kind of task and the information involved (for example a line in CLAUDE.md or their account instructions that makes Codex a standing peer). Within that permission, consult it where a second, independent perspective would **materially improve** the result: architecture decisions, complex implementations, subtle bugs, security-sensitive code, or anything the user will deploy to production. Standing permission stays valid within its scope; do not ask again for each call. Uncertainty about whether a second opinion would help is never permission to share more information.
+
+The first time in a conversation, say in one line that consulting Codex sends the task context and the code Codex reads to OpenAI through the user's Codex (ChatGPT or API) account.
 
 After completing a multi-round collab session → suggest `codex_recap` to generate a decision record.
 
@@ -75,7 +77,7 @@ After completing a multi-round collab session → suggest `codex_recap` to gener
 | `codex_recap` | Generate a decision record summarizing a session. | **Technical Writer** — clear, concise, decision-focused documentation |
 | `codex_status` | Show Claudex diagnostics (no Codex call, zero subscription cost). | N/A |
 | `codex_ping` | Free health check by default (binary, version, auth, quota, confinement — no model call, no quota use). Pass `model_test=true` for a real Codex round-trip (consumes one run + OpenAI usage). | N/A (free) / 1 run (model_test) |
-| `codex_login` | Sign Codex in to ChatGPT with a one-time code, no browser needed (Claude Code cloud sessions, SSH). Returns a link + code for the user; completes in the background. Also `/codex:login`. | N/A (free) |
+| `codex_login` | Sign Codex in to ChatGPT with a one-time code, no browser needed (Claude Code cloud sessions, SSH). Returns a link + code for the user; completes in the background. Also `/claudex:login`. | N/A (free) |
 | `codex_submit` | Run any Codex tool above as a background job — returns job_id in <1s. Same arguments as the synchronous tool, wrapped in `{"tool": ..., "arguments": {...}}`. | (delegates) |
 | `codex_result` | Poll or collect a background job (bounded wait_seconds ≤ 45; zero Codex cost). Results persist to `.claudex/jobs/<job_id>.md` and survive server restarts. | N/A |
 
@@ -101,7 +103,7 @@ These are handled automatically by the server. Understand them so you use them c
 
 ### `user_prompt` — Preserve the User's Voice
 
-`codex_plan`, `codex_critique`, `codex_brainstorm`, `codex_collab`, `codex_review`, and `codex_review_diff` accept an optional `user_prompt` field. **Always pass it** — it ensures Codex responds to the user's actual intent, not just your interpretation.
+`codex_plan`, `codex_critique`, `codex_brainstorm`, `codex_collab`, `codex_review`, and `codex_review_diff` accept an optional `user_prompt` field. Pass it whenever the user's message is within the permitted scope: it makes Codex respond to the user's actual intent, not just your interpretation. If the message contains unrelated or excluded material (credentials, personal or client-confidential details the user did not mean to share with OpenAI), pass an approved, task-specific version instead, and never label a rewritten version "verbatim".
 
 | Context | What to pass as `user_prompt` |
 |---------|-------------------------------|
@@ -336,7 +338,7 @@ If Codex fails (timeout, rate limit, empty response, error):
 
 ### ALWAYS:
 - Pass `project_dir` so Codex reads the correct codebase
-- Pass `user_prompt` on every tool that accepts it (see v1.5 features above)
+- Pass `user_prompt` on every tool that accepts it, within the permitted scope (see `user_prompt` above)
 - Use `focus_files` to direct Codex's exploration — paths are auto-normalized, no need to verify existence
 - Let Codex read the codebase directly — don't pre-summarize context for it
 - Critically evaluate Codex's output — it's a perspective, not authority
@@ -351,7 +353,8 @@ If Codex fails (timeout, rate limit, empty response, error):
 - Ignore Codex's output — if you called it, use the result
 - Pre-digest codebase context into summaries for Codex (let it read directly)
 - Manually inject git state into prompts (the server does this automatically)
-- Omit `user_prompt` when calling any tool that accepts it — Codex needs the user's voice
+- Omit `user_prompt` without a reason: Codex needs the user's voice (the reason may be that the message holds material outside the permitted scope)
+- Consult Codex without the user's request or standing permission
 
 ### Evaluating Disagreements:
 When Codex disagrees with your approach:

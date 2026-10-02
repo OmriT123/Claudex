@@ -1,7 +1,7 @@
 {
-  "name": "codex",
-  "description": "Get a second AI to review your code, stress-test your plans, and debug alongside Claude Code.",
-  "version": "2.3.0",
+  "name": "claudex",
+  "description": "Codex (OpenAI) as a second-opinion teammate for Claude: independent planning, plan critique, code and diff review, red-teaming, debugging and tradeoff analysis, in a read-only sandbox.",
+  "version": "3.0.0",
   "author": {
     "name": "Omri Tal",
     "url": "https://www.botique.co.il",

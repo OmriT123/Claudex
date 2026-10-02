@@ -18,6 +18,7 @@ Or directly:
 """
 
 import asyncio
+import errno
 import json
 import os
 import shutil
@@ -85,6 +86,11 @@ def _default_allowed_roots(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
     monkeypatch.setenv("CLAUDEX_STATE_DIR", str(tmp_path / ".claudex-state"))
+    # v2.4: never read the developer's real roots config.
+    import server as _srv
+    monkeypatch.setattr(_srv, "_config_path", lambda: tmp_path / ".claudex-config" / "config.json")
+    monkeypatch.delenv("CLAUDEX_PLUGIN_FOLDER", raising=False)
+    monkeypatch.delenv("CLAUDEX_DISTRIBUTION", raising=False)
     # v2.2: the suite may itself run inside a Claude Code cloud session; the
     # cloud-default root must never leak into tests that expect deny-all.
     monkeypatch.delenv("CLAUDE_CODE_REMOTE", raising=False)
@@ -2016,7 +2022,8 @@ class TestAllowedRootsPlaceholder:
         # until real roots are configured.
         monkeypatch.setenv(ALLOWED_ROOTS_ENV, "${user_config.allowed_roots}")
         project = tmp_path / "repo"; project.mkdir()
-        with pytest.raises(ValueError, match="No workspace roots configured"):
+        # v2.4: the message names the source that yielded nothing.
+        with pytest.raises(ValueError, match="yields no usable folder"):
             _validate_project_dir(str(project))
 
     def test_non_template_dollar_part_still_fails_closed(self, tmp_path, monkeypatch):
@@ -2712,7 +2719,17 @@ class TestPluginManifest:
         assert "mcpServers" not in mcp
         server = mcp["codex"]
         assert server["command"] == "uv"
-        assert server["args"][-1].endswith("server/server.py")
+        # v2.4: the full argv is the contract (locked, script mode).
+        assert server["args"] == ["run", "--locked", "--script", "${CLAUDE_PLUGIN_ROOT}/server/server.py"]
+        assert "env" not in server
+
+    def test_no_user_config_anywhere(self):
+        # The desktop app can leave a plugin MCP server that needs plugin
+        # settings unstarted (user_config_unsupported); one server config must
+        # start on every surface. Roots come from --configure-roots, the env
+        # var or the cloud default instead.
+        assert "userConfig" not in self._manifest()
+        assert "user_config" not in (PROJECT_ROOT / ".mcp.json").read_text()
 
     def test_declaration_not_moved_into_manifest(self):
         # Upstream anthropics/claude-code#16143 (open) drops plugin.json's
@@ -3200,7 +3217,7 @@ class TestCloudSessions:
 
 
 # =========================================================================
-# v2.3 — /codex:login (device-code sign-in without a browser)
+# v2.3 — /claudex:login (device-code sign-in without a browser)
 # =========================================================================
 
 class TestCodexLogin:
@@ -3331,7 +3348,7 @@ class TestCodexLogin:
         monkeypatch.setattr(srv, "_find_codex_bin", lambda: "codex")
         monkeypatch.setattr(srv.shutil, "which", lambda name: None)
         out = await srv.codex_login(srv.LoginInput())
-        assert out.startswith("Error:") and "/codex:login" in out
+        assert out.startswith("Error:") and "/claudex:login" in out
 
     @pytest.mark.asyncio
     async def test_ping_points_to_codex_login(self, tmp_path, monkeypatch):
@@ -3341,14 +3358,1498 @@ class TestCodexLogin:
         monkeypatch.setattr(srv, "_find_codex_bin", lambda: codex)
         _reset_version_cache(warning="", resolved=True)
         out = await srv.codex_ping(srv.PingInput())
-        assert "Not logged in — run /codex:login" in out
+        assert "Not logged in — run /claudex:login" in out
         _reset_version_cache()
 
     def test_command_is_wired_to_the_tool(self):
         text = (PROJECT_ROOT / "commands" / "login.md").read_text()
         front = text.split("---")[1]
         assert "name: login" in front
-        assert "mcp__plugin_codex_codex__codex_login" in front
+        assert "mcp__plugin_claudex_codex__codex_login" in front
+
+
+# =========================================================================
+# v2.3.1 security: no symlink following inside .claudex/ (real filesystem)
+# =========================================================================
+
+import time as _time
+
+
+def _make_old(path: Path, days: float = 3) -> None:
+    old = _time.time() - days * 86_400
+    os.utime(path, (old, old))
+
+
+class TestV231CleanupContainment:
+    """A repo could commit .claudex/<subdir> as a symlink; cleanup followed it
+    and deleted day-old files in the target (reported 2026-10-01)."""
+
+    @pytest.fixture(params=[True, False], ids=["dir_fd", "pathwise"])
+    def mode(self, request, monkeypatch):
+        import server as srv
+        if request.param and not srv._HAVE_DIR_FD:
+            pytest.skip("platform lacks dir_fd support")
+        monkeypatch.setattr(srv, "_HAVE_DIR_FD", request.param)
+        # "pathwise" stands for Windows, the only place the fallback runs.
+        monkeypatch.setattr(srv, "_PATHWISE_FALLBACK", not request.param)
+        return request.param
+
+    @pytest.mark.parametrize("subdir", ["sessions", "recaps", "jobs"])
+    def test_symlinked_subdir_to_outside_is_not_followed(self, tmp_path, subdir, mode):
+        import server as srv
+        victim_dir = tmp_path / "victim"; victim_dir.mkdir()
+        victim = victim_dir / "precious.txt"; victim.write_text("keep me")
+        _make_old(victim)
+        claudex = tmp_path / "proj" / ".claudex"; claudex.mkdir(parents=True)
+        (claudex / subdir).symlink_to(victim_dir)
+        srv._cleanup_old_sessions(claudex)
+        assert victim.exists() and victim.read_text() == "keep me"
+
+    @pytest.mark.parametrize("subdir", ["sessions", "recaps", "jobs"])
+    def test_symlinked_subdir_to_inside_is_not_followed(self, tmp_path, subdir, mode):
+        import server as srv
+        claudex = tmp_path / "proj" / ".claudex"
+        other = claudex / "run-keep"; other.mkdir(parents=True)
+        f = other / "artifact.md"; f.write_text("x"); _make_old(f)
+        (claudex / subdir).symlink_to(other)
+        srv._cleanup_old_sessions(claudex)
+        assert f.exists()
+
+    def test_symlinked_claudex_dir_is_not_followed(self, tmp_path, mode):
+        import server as srv
+        victim_dir = tmp_path / "victim" / "jobs"; victim_dir.mkdir(parents=True)
+        victim = victim_dir / "precious.txt"; victim.write_text("keep"); _make_old(victim)
+        proj = tmp_path / "proj"; proj.mkdir()
+        (proj / ".claudex").symlink_to(tmp_path / "victim")
+        srv._cleanup_old_sessions(proj / ".claudex")
+        assert victim.exists()
+
+    def test_normal_cleanup_still_works(self, tmp_path, mode):
+        import server as srv
+        claudex = tmp_path / ".claudex"
+        for sub in ("sessions", "recaps", "jobs"):
+            (claudex / sub).mkdir(parents=True)
+            stale = claudex / sub / "stale.md"; stale.write_text("old"); _make_old(stale)
+            fresh = claudex / sub / "fresh.md"; fresh.write_text("new")
+        outside = tmp_path / "outside.md"; outside.write_text("o"); _make_old(outside)
+        (claudex / "sessions" / "leaf-link.md").symlink_to(outside)
+        srv._cleanup_old_sessions(claudex)
+        for sub in ("sessions", "recaps", "jobs"):
+            assert not (claudex / sub / "stale.md").exists()
+            assert (claudex / sub / "fresh.md").exists()
+        assert outside.exists()  # leaf symlinks are skipped, never followed
+
+    def test_prepare_run_dir_path_cannot_reach_outside(self, tmp_path, monkeypatch):
+        # End-to-end through the real trigger (_prepare_run_dir runs cleanup).
+        import server as srv
+        victim_dir = tmp_path / "victim"; victim_dir.mkdir()
+        victim = victim_dir / "precious.txt"; victim.write_text("keep"); _make_old(victim)
+        proj = tmp_path / "proj"; (proj / ".claudex").mkdir(parents=True)
+        (proj / ".claudex" / "jobs").symlink_to(victim_dir)
+        srv._prepare_run_dir(str(proj))
+        assert victim.exists()
+
+
+class TestV231NoFollowIO:
+    def test_symlink_to_sibling_is_rejected(self, tmp_path):
+        sessions = tmp_path / ".claudex" / "sessions"; sessions.mkdir(parents=True)
+        (sessions / "real.md").write_text("real")
+        (sessions / "alias.md").symlink_to("real.md")
+        assert _safe_claudex_path(str(tmp_path), "sessions", "alias.md") is None
+
+    def test_write_refuses_symlinked_subdir(self, tmp_path):
+        import server as srv
+        if not srv._HAVE_DIR_FD:
+            pytest.skip("platform lacks dir_fd support")
+        outside = tmp_path / "outside"; outside.mkdir()
+        claudex = tmp_path / "proj" / ".claudex"; claudex.mkdir(parents=True)
+        (claudex / "sessions").symlink_to(outside)
+        with pytest.raises(OSError):
+            srv._write_text_nofollow(claudex / "sessions" / "s.md", "x")
+        assert not (outside / "s.md").exists()
+
+    def test_write_refuses_leaf_symlink(self, tmp_path):
+        import server as srv
+        outside = tmp_path / "outside.md"; outside.write_text("original")
+        sessions = tmp_path / "proj" / ".claudex" / "sessions"; sessions.mkdir(parents=True)
+        (sessions / "s.md").symlink_to(outside)
+        with pytest.raises(OSError):
+            srv._write_text_nofollow(sessions / "s.md", "overwritten")
+        assert outside.read_text() == "original"
+
+    def test_job_file_refuses_symlinked_jobs_dir(self, tmp_path):
+        import server as srv
+        outside = tmp_path / "outside"; outside.mkdir()
+        proj = tmp_path / "proj"; (proj / ".claudex").mkdir(parents=True)
+        (proj / ".claudex" / "jobs").symlink_to(outside)
+        job_id = "job-abcdef123456"
+        srv._jobs[job_id] = {"project_dir": str(proj), "tool": "plan",
+                             "status": "completed", "result": "r"}
+        try:
+            srv._write_job_file(job_id)
+        finally:
+            srv._jobs.pop(job_id, None)
+        assert list(outside.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_collab_session_swapped_during_model_call(self, tmp_path):
+        # The session path is validated before the minutes-long model call;
+        # swapping .claudex/sessions for a symlink meanwhile must not redirect
+        # the write (the original report's TOCTOU follow-up).
+        import server as srv
+        proj = tmp_path / "proj"; sessions = proj / ".claudex" / "sessions"
+        sessions.mkdir(parents=True)
+        outside = tmp_path / "outside"; outside.mkdir()
+
+        async def swap_then_answer(*a, **k):
+            shutil.rmtree(sessions)
+            sessions.symlink_to(outside)
+            return "Codex says hi"
+
+        with patch.object(srv, "_run_codex", side_effect=swap_then_answer):
+            out = await srv.codex_collab(srv.CollaborateInput(
+                problem="a problem long enough", cc_analysis="analysis long enough",
+                project_dir=str(proj), session_id="swap-test"))
+        assert list(outside.iterdir()) == []
+        assert "Session document NOT updated" in out
+
+    @pytest.mark.asyncio
+    async def test_collab_refuses_symlinked_session_file(self, tmp_path):
+        import server as srv
+        proj = tmp_path / "proj"; sessions = proj / ".claudex" / "sessions"
+        sessions.mkdir(parents=True)
+        secret = tmp_path / "secret.md"; secret.write_text("<!-- claudex:rounds=1 -->")
+        (sessions / "s1.md").symlink_to(secret)
+        with patch.object(srv, "_run_codex", new_callable=AsyncMock, return_value="x"):
+            out = await srv.codex_collab(srv.CollaborateInput(
+                problem="a problem long enough", cc_analysis="analysis long enough",
+                project_dir=str(proj), session_id="s1"))
+        assert out.startswith("Error:")
+
+
+class TestV231AnchoredIO:
+    """Codex R1 review (2026-10-01): operations must stay anchored even when
+    .claudex or a subdir is swapped for a symlink AFTER path validation."""
+
+    def _swap_claudex(self, proj, outside):
+        shutil.rmtree(proj / ".claudex")
+        (proj / ".claudex").symlink_to(outside)
+
+    def test_swap_after_validation_write_refused(self, tmp_path):
+        import server as srv
+        proj = tmp_path / "proj"; (proj / ".claudex" / "sessions").mkdir(parents=True)
+        outside = tmp_path / "outside"; (outside / "sessions").mkdir(parents=True)
+        path = srv._safe_claudex_path(str(proj), "sessions", "s.md")
+        assert path == proj / ".claudex" / "sessions" / "s.md"  # lexical, not resolved
+        self._swap_claudex(proj, outside)
+        with pytest.raises(OSError):
+            srv._write_text_nofollow(path, "x")
+        assert list((outside / "sessions").iterdir()) == []
+
+    def test_swap_after_validation_read_refused(self, tmp_path):
+        import server as srv
+        proj = tmp_path / "proj"; (proj / ".claudex" / "sessions").mkdir(parents=True)
+        outside = tmp_path / "outside"; (outside / "sessions").mkdir(parents=True)
+        (outside / "sessions" / "s.md").write_text("<!-- claudex:rounds=1 --> secret")
+        path = srv._safe_claudex_path(str(proj), "sessions", "s.md")
+        self._swap_claudex(proj, outside)
+        with pytest.raises(OSError):
+            srv._read_text_nofollow(path)
+
+    @pytest.mark.parametrize("atomic", [True, False], ids=["renameat", "in_place"])
+    def test_job_writer_both_modes(self, tmp_path, monkeypatch, atomic):
+        import server as srv
+        if not srv._HAVE_DIR_FD:
+            pytest.skip("platform lacks dir_fd support")
+        monkeypatch.setattr(srv, "_HAVE_RENAME_DIR_FD", atomic and srv._HAVE_RENAME_DIR_FD)
+        proj = tmp_path / "proj"; proj.mkdir()
+        job_id = "job-abcdef123456"
+        srv._jobs[job_id] = {"project_dir": str(proj), "tool": "plan",
+                             "status": "completed", "result": "the result"}
+        try:
+            srv._write_job_file(job_id)
+            srv._write_job_file(job_id)  # overwrite works in both modes
+        finally:
+            srv._jobs.pop(job_id, None)
+        f = proj / ".claudex" / "jobs" / f"{job_id}.md"
+        assert "Status: completed" in f.read_text() and "the result" in f.read_text()
+        assert oct(f.stat().st_mode & 0o777) == "0o600"
+        assert [p.name for p in f.parent.iterdir() if p.name.endswith(".tmp")] == []
+
+    def test_job_writer_selection_is_fd_based_on_posix(self):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX only")
+        assert srv._HAVE_DIR_FD and srv._HAVE_RENAME_DIR_FD
+
+    @pytest.mark.asyncio
+    async def test_fifo_job_file_is_refused_without_hanging(self, tmp_path):
+        import server as srv
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("no FIFOs")
+        proj = tmp_path / "proj"; jobs = proj / ".claudex" / "jobs"; jobs.mkdir(parents=True)
+        os.mkfifo(jobs / "job-abcdef123456.md")
+        out = await asyncio.wait_for(srv.codex_result(srv.JobResultInput(
+            job_id="job-abcdef123456", project_dir=str(proj))), timeout=5)
+        assert out.startswith("Error:")
+
+    def test_fifo_session_is_refused(self, tmp_path):
+        import server as srv
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("no FIFOs")
+        sessions = tmp_path / "proj" / ".claudex" / "sessions"; sessions.mkdir(parents=True)
+        os.mkfifo(sessions / "s.md")
+        with pytest.raises(OSError):
+            srv._read_session_text(sessions / "s.md")
+
+    def test_oversized_session_is_refused(self, tmp_path, monkeypatch):
+        import server as srv
+        monkeypatch.setattr(srv, "SESSION_FILE_MAX_CHARS", 100)
+        sessions = tmp_path / "proj" / ".claudex" / "sessions"; sessions.mkdir(parents=True)
+        (sessions / "big.md").write_text("x" * 500)
+        with pytest.raises(OSError):
+            srv._read_session_text(sessions / "big.md")
+
+    def test_run_dir_creation_and_artifacts_refuse_swapped_claudex(self, tmp_path):
+        import server as srv
+        proj = tmp_path / "proj"; proj.mkdir()
+        run_dir = srv._prepare_run_dir(str(proj))
+        outside = tmp_path / "outside"; (outside / run_dir.name).mkdir(parents=True)
+        self._swap_claudex(proj, outside)
+        out = (
+            "---FINAL-ANSWER---\n"
+            '<claudex-artifact filename="proof.txt" language="text">pwned</claudex-artifact>'
+        )
+        _, artifacts = srv._extract_and_save_artifacts(out, run_dir)
+        assert artifacts == []
+        assert not (outside / run_dir.name / "proof.txt").exists()
+        with pytest.raises(OSError):
+            srv._prepare_run_dir(str(proj))
+
+    def test_remove_run_dir_refuses_swapped_claudex(self, tmp_path):
+        import server as srv
+        proj = tmp_path / "proj"; proj.mkdir()
+        run_dir = srv._prepare_run_dir(str(proj))
+        outside = tmp_path / "outside"; (outside / run_dir.name).mkdir(parents=True)
+        keep = outside / run_dir.name / "keep.txt"; keep.write_text("k")
+        self._swap_claudex(proj, outside)
+        srv._remove_run_dir(run_dir)
+        assert keep.exists()
+
+    def test_stale_run_dir_cleanup_skips_symlinks(self, tmp_path):
+        import server as srv
+        claudex = tmp_path / "proj" / ".claudex"; claudex.mkdir(parents=True)
+        stale = claudex / "run-old"; stale.mkdir(); (stale / "a.txt").write_text("a")
+        _make_old(stale)
+        outside = tmp_path / "outside"; outside.mkdir()
+        keep = outside / "keep.txt"; keep.write_text("k"); _make_old(outside)
+        (claudex / "run-link").symlink_to(outside)
+        srv._cleanup_old_run_dirs(claudex)
+        assert not stale.exists() and keep.exists() and (claudex / "run-link").is_symlink()
+
+    def test_gitignore_not_created_through_symlink(self, tmp_path):
+        import server as srv
+        outside = tmp_path / "outside"; outside.mkdir()
+        proj = tmp_path / "proj"; proj.mkdir()
+        (proj / ".claudex").symlink_to(outside)
+        srv._ensure_claudex_ignored(proj / ".claudex")
+        assert not (outside / ".gitignore").exists()
+
+    @pytest.mark.asyncio
+    async def test_status_ignores_symlinked_subdirs(self, tmp_path):
+        import server as srv
+        outside = tmp_path / "outside"; outside.mkdir()
+        (outside / "secret_recap.md").write_text("x" * 5000)
+        (tmp_path / ".claudex").mkdir()
+        (tmp_path / ".claudex" / "recaps").symlink_to(outside)
+        out = await srv.codex_status(srv.StatusInput(project_dir=str(tmp_path)))
+        assert "Recaps: none" in out
+
+
+class TestV231CollabContinuity:
+    @pytest.mark.asyncio
+    async def test_existing_session_without_rounds_still_gives_context(self, tmp_path):
+        import server as srv
+        sessions = tmp_path / ".claudex" / "sessions"; sessions.mkdir(parents=True)
+        (sessions / "s1.md").write_text("# Session: s1\nEARLIER-NOTES-MARKER\n")
+        seen = {}
+
+        async def capture(prompt, **k):
+            seen["prompt"] = prompt
+            return "ok"
+        with patch.object(srv, "_run_codex", side_effect=capture):
+            await srv.codex_collab(srv.CollaborateInput(
+                problem="a problem long enough", cc_analysis="analysis long enough",
+                project_dir=str(tmp_path), session_id="s1"))
+        assert "EARLIER-NOTES-MARKER" in seen["prompt"]
+
+    @pytest.mark.asyncio
+    async def test_rollover_recap_failure_is_reported_and_context_kept(self, tmp_path):
+        import server as srv
+        sessions = tmp_path / ".claudex" / "sessions"; sessions.mkdir(parents=True)
+        (sessions / "s1.md").write_text(
+            f"# Session: s1\n<!-- claudex:rounds={srv.MAX_SESSION_ROUNDS} -->\n"
+            "\n---\n\n## Round 1\n\nDECISION-MARKER\n")
+        seen = {}
+
+        async def capture(prompt, **k):
+            seen["prompt"] = prompt
+            return "fine"
+        with patch.object(srv, "_run_codex_once", new_callable=AsyncMock,
+                          return_value="Error: recap timed out"), \
+             patch.object(srv, "_run_codex", side_effect=capture):
+            out = await srv.codex_collab(srv.CollaborateInput(
+                problem="a problem long enough", cc_analysis="analysis long enough",
+                project_dir=str(tmp_path), session_id="s1"))
+        assert "recap failed" in out and "s1-p2" in out
+        assert "DECISION-MARKER" in seen["prompt"]
+
+    @pytest.mark.asyncio
+    async def test_rollover_success_carries_recap(self, tmp_path):
+        import server as srv
+        sessions = tmp_path / ".claudex" / "sessions"; sessions.mkdir(parents=True)
+        (sessions / "s1.md").write_text(
+            f"# Session: s1\n<!-- claudex:rounds={srv.MAX_SESSION_ROUNDS} -->\n")
+        seen = {}
+
+        async def capture(prompt, **k):
+            seen["prompt"] = prompt
+            return "fine"
+        with patch.object(srv, "_run_codex_once", new_callable=AsyncMock,
+                          return_value="RECAP-MARKER decisions"), \
+             patch.object(srv, "_run_codex", side_effect=capture):
+            await srv.codex_collab(srv.CollaborateInput(
+                problem="a problem long enough", cc_analysis="analysis long enough",
+                project_dir=str(tmp_path), session_id="s1"))
+        assert "RECAP-MARKER" in seen["prompt"]
+        assert (tmp_path / ".claudex" / "recaps" / "s1_recap.md").exists()
+
+
+class TestV231RolloverState:
+    def _at_cap(self, tmp_path, sid="s1"):
+        import server as srv
+        sessions = tmp_path / ".claudex" / "sessions"; sessions.mkdir(parents=True, exist_ok=True)
+        (sessions / f"{sid}.md").write_text(
+            f"# Session: {sid}\n<!-- claudex:rounds={srv.MAX_SESSION_ROUNDS} -->\n"
+            "\n---\n\n## Round 1\n\nOLD-DECISION\n")
+        return sessions
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_roll_over_once(self, tmp_path):
+        import server as srv
+        sessions = self._at_cap(tmp_path)
+        recap = AsyncMock(return_value="RECAP-ONCE")
+        with patch.object(srv, "_run_codex_once", recap), \
+             patch.object(srv, "_run_codex", new_callable=AsyncMock, return_value="answer"):
+            outs = await asyncio.gather(*[
+                srv.codex_collab(srv.CollaborateInput(
+                    problem="a problem long enough", cc_analysis="analysis long enough",
+                    project_dir=str(tmp_path), session_id="s1"))
+                for _ in range(2)])
+        assert recap.await_count == 1
+        assert all("Session: s1-p2" in o for o in outs)
+        assert "continued-in=s1-p2" in (sessions / "s1.md").read_text()
+        assert not (sessions / "s1-p3.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_carried_decisions_survive_later_rounds(self, tmp_path):
+        import server as srv
+        self._at_cap(tmp_path)
+        prompts = []
+
+        async def capture(prompt, **k):
+            prompts.append(prompt)
+            return "answer"
+        with patch.object(srv, "_run_codex_once", new_callable=AsyncMock, return_value="RECAP-KEEP"), \
+             patch.object(srv, "_run_codex", side_effect=capture):
+            for _ in range(2):
+                await srv.codex_collab(srv.CollaborateInput(
+                    problem="a problem long enough", cc_analysis="analysis long enough",
+                    project_dir=str(tmp_path), session_id="s1"))
+        assert len(prompts) == 2 and all("RECAP-KEEP" in p for p in prompts)
+
+    @pytest.mark.asyncio
+    async def test_carried_recap_is_bounded(self, tmp_path):
+        import server as srv
+        self._at_cap(tmp_path)
+        prompts = []
+
+        async def capture(prompt, **k):
+            prompts.append(prompt)
+            return "answer"
+        huge = "R" * (srv.SESSION_MAX_BYTES * 2)
+        with patch.object(srv, "_run_codex_once", new_callable=AsyncMock, return_value=huge), \
+             patch.object(srv, "_run_codex", side_effect=capture):
+            await srv.codex_collab(srv.CollaborateInput(
+                problem="a problem long enough", cc_analysis="analysis long enough",
+                project_dir=str(tmp_path), session_id="s1"))
+        assert prompts[0].count("R" * 1000) < (srv.SESSION_MAX_BYTES * 2) // 1000
+        stored = (tmp_path / ".claudex" / "sessions" / "s1-p2.md").read_text()
+        assert len(stored.encode("utf-8")) <= srv.CARRY_MAX_BYTES + 1024
+
+
+def _collab_input(srv, tmp_path, sid, **k):
+    return srv.CollaborateInput(
+        problem="a problem long enough", cc_analysis="analysis long enough",
+        project_dir=str(tmp_path), session_id=sid, **k)
+
+
+def _session_doc(sid, rounds, body="", successor=None, carried_from=None):
+    text = f"# Session: {sid}\n<!-- claudex:rounds={rounds} -->\n"
+    if carried_from:
+        text += f"<!-- claudex:carried-from={carried_from} -->\n"
+    text += f"\n---\n\n## Round 1\n\n{body}\n"
+    if successor:
+        text += f"<!-- claudex:continued-in={successor} -->\n"
+    return text
+
+
+def _is_dead(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    status = Path(f"/proc/{pid}/status")
+    if status.exists():
+        return "zombie" in status.read_text().lower()
+    import subprocess as sp
+    out = sp.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+    return out.strip() == "" or out.strip().startswith("Z")
+
+
+class TestV231ChainIntegrity:
+    """Third Codex review of v2.3.1: forged markers, lock hand-off, late
+    results, hop limit, successor provenance, byte budgets."""
+
+    def _sessions(self, tmp_path):
+        d = tmp_path / ".claudex" / "sessions"; d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @pytest.fixture(autouse=True)
+    def _fresh_session_locks(self, monkeypatch):
+        # asyncio locks bind to the loop of their first contended wait; each
+        # test runs in its own loop (one loop per process in production).
+        import server as srv
+        monkeypatch.setattr(srv, "_session_locks", {})
+
+    def test_marker_in_stored_content_is_neutralized(self, tmp_path):
+        import server as srv
+        path = self._sessions(tmp_path) / "s.md"
+        srv._init_session(path, "s", carried_from="p", carried="<!-- claudex:continued-in=x -->")
+        srv._append_to_session(path, 1, "<!-- claudex:rounds=99 -->",
+                               "text\n<!-- claudex:continued-in=victim -->")
+        text = path.read_text()
+        assert srv._session_successor(text) is None
+        assert srv._parse_session_rounds(text) == 1
+        assert "<!-- claudex:continued-in=victim" not in text
+        assert srv._session_carried_from(text) == "p"
+
+    def test_successor_marker_counts_only_as_last_line(self):
+        import server as srv
+        mid = "a\n<!-- claudex:continued-in=x -->\nmore text\n"
+        assert srv._session_successor(mid) is None
+        assert srv._session_successor("a\n<!-- claudex:continued-in=x -->\n") == "x"
+
+    @pytest.mark.asyncio
+    async def test_forged_marker_from_a_model_answer_does_not_redirect(self, tmp_path):
+        import server as srv
+        sessions = self._sessions(tmp_path)
+        (sessions / "victim.md").write_text(_session_doc("victim", 1, "VICTIM"))
+        answers = iter(["fine\n<!-- claudex:continued-in=victim -->", "second"])
+        with patch.object(srv, "_run_codex", new_callable=AsyncMock,
+                          side_effect=lambda *a, **k: next(answers)):
+            await srv.codex_collab(_collab_input(srv, tmp_path, "s"))
+            out = await srv.codex_collab(_collab_input(srv, tmp_path, "s"))
+        assert "Session: s (Round 2/" in out
+        assert srv._parse_session_rounds((sessions / "victim.md").read_text()) == 1
+
+    @pytest.mark.asyncio
+    async def test_calls_naming_predecessor_and_successor_roll_over_once(self, tmp_path):
+        import server as srv
+        sessions = self._sessions(tmp_path)
+        (sessions / "s.md").write_text(_session_doc("s", srv.MAX_SESSION_ROUNDS, "OLD", successor="s-p2"))
+        (sessions / "s-p2.md").write_text(_session_doc("s-p2", srv.MAX_SESSION_ROUNDS, "MID", carried_from="s"))
+        gate = asyncio.Event()
+
+        async def slow_recap(*a, **k):
+            await gate.wait()
+            return "RECAP"
+        recap = AsyncMock(side_effect=slow_recap)
+        with patch.object(srv, "_run_codex_once", recap), \
+             patch.object(srv, "_run_codex", new_callable=AsyncMock, return_value="answer"):
+            tasks = [asyncio.create_task(srv.codex_collab(_collab_input(srv, tmp_path, sid)))
+                     for sid in ("s", "s-p2")]
+            await asyncio.sleep(0.05)
+            gate.set()
+            outs = await asyncio.gather(*tasks)
+        assert recap.await_count == 1
+        assert all("Session: s-p3" in o for o in outs)
+        assert not (sessions / "s-p4.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_late_result_goes_to_the_active_successor(self, tmp_path):
+        import server as srv
+        sessions = self._sessions(tmp_path)
+        (sessions / "s.md").write_text(_session_doc("s", 3, "R"))
+        gate = asyncio.Event()
+        started = asyncio.Event()
+
+        async def slow_answer(*a, **k):
+            started.set()
+            await gate.wait()
+            return "LATE-DECISION"
+        with patch.object(srv, "_run_codex", side_effect=slow_answer):
+            task = asyncio.create_task(srv.codex_collab(_collab_input(srv, tmp_path, "s")))
+            await started.wait()
+            # Meanwhile the session filled up and rolled over to s-p2.
+            (sessions / "s-p2.md").write_text(_session_doc("s-p2", 0, "CARRY", carried_from="s"))
+            (sessions / "s.md").write_text(
+                _session_doc("s", srv.MAX_SESSION_ROUNDS, "R", successor="s-p2"))
+            gate.set()
+            out = await task
+        assert "LATE-DECISION" in (sessions / "s-p2.md").read_text()
+        assert "LATE-DECISION" not in (sessions / "s.md").read_text()
+        assert "added to 's-p2'" in out and "Session: s-p2" in out
+
+    @pytest.mark.asyncio
+    async def test_chain_loop_is_an_error(self, tmp_path):
+        import server as srv
+        sessions = self._sessions(tmp_path)
+        (sessions / "a.md").write_text(_session_doc("a", 1, successor="b"))
+        (sessions / "b.md").write_text(_session_doc("b", 1, successor="a"))
+        with patch.object(srv, "_run_codex", new_callable=AsyncMock, return_value="x") as run:
+            out = await srv.codex_collab(_collab_input(srv, tmp_path, "a"))
+        assert out.startswith("Error:") and "loops" in out and run.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_over_long_chain_is_an_error_not_an_old_session(self, tmp_path):
+        import server as srv
+        sessions = self._sessions(tmp_path)
+        ids = ["s"] + [f"s-p{i}" for i in range(2, srv._SESSION_CHAIN_MAX_HOPS + 4)]
+        for cur, nxt in zip(ids, ids[1:]):
+            (sessions / f"{cur}.md").write_text(_session_doc(cur, 4, successor=nxt))
+        (sessions / f"{ids[-1]}.md").write_text(_session_doc(ids[-1], 1))
+        with patch.object(srv, "_run_codex", new_callable=AsyncMock, return_value="x") as run:
+            out = await srv.codex_collab(_collab_input(srv, tmp_path, "s"))
+        assert out.startswith("Error:") and "longer than" in out and run.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_unrelated_existing_successor_is_not_adopted(self, tmp_path):
+        import server as srv
+        sessions = self._sessions(tmp_path)
+        (sessions / "s.md").write_text(_session_doc("s", srv.MAX_SESSION_ROUNDS, "OLD"))
+        unrelated = _session_doc("s-p2", 1, "UNRELATED")
+        (sessions / "s-p2.md").write_text(unrelated)
+        with patch.object(srv, "_run_codex_once", new_callable=AsyncMock, return_value="NEW-CARRY"), \
+             patch.object(srv, "_run_codex", new_callable=AsyncMock, return_value="answer"):
+            out = await srv.codex_collab(_collab_input(srv, tmp_path, "s"))
+        assert "Session: s-p3" in out
+        assert (sessions / "s-p2.md").read_text() == unrelated
+        assert "NEW-CARRY" in (sessions / "s-p3.md").read_text()
+        assert srv._session_successor((sessions / "s.md").read_text()) == "s-p3"
+
+    @pytest.mark.asyncio
+    async def test_missing_successor_is_recreated_with_context(self, tmp_path):
+        import server as srv
+        sessions = self._sessions(tmp_path)
+        (sessions / "s.md").write_text(
+            _session_doc("s", srv.MAX_SESSION_ROUNDS, "KEEP-ME", successor="s-p2"))
+        prompts = []
+
+        async def capture(prompt, **k):
+            prompts.append(prompt)
+            return "answer"
+        with patch.object(srv, "_run_codex", side_effect=capture):
+            out = await srv.codex_collab(_collab_input(srv, tmp_path, "s"))
+        assert "KEEP-ME" in prompts[0] and "was missing" in out
+        assert srv._session_carried_from((sessions / "s-p2.md").read_text()) == "s"
+
+    @pytest.mark.parametrize("unit", ["a", "א"])
+    def test_truncate_utf8_stays_within_the_byte_budget(self, unit):
+        import server as srv
+        out = srv._truncate_utf8(unit * 64_000, srv.SESSION_MAX_BYTES)
+        assert len(out.encode("utf-8")) <= srv.SESSION_MAX_BYTES
+
+    @pytest.mark.parametrize("unit", ["a", "א"])
+    def test_large_carry_never_starves_the_newest_round(self, tmp_path, unit):
+        import server as srv
+        path = self._sessions(tmp_path) / "s.md"
+        srv._init_session(path, "s", carried_from="p", carried=unit * 100_000)
+        for n in range(1, 4):
+            srv._append_to_session(path, n, "analysis", unit * 20_000 + f" DECISION-{n}")
+        out = srv._truncate_session_content(path.read_text())
+        assert len(out.encode("utf-8")) <= srv.SESSION_MAX_BYTES
+        assert "DECISION-3" in out
+
+    @pytest.mark.asyncio
+    async def test_cancelled_handoff_keeps_other_calls_lock(self, tmp_path):
+        import server as srv
+        sessions = self._sessions(tmp_path)
+        (sessions / "s.md").write_text(_session_doc("s", 4, successor="s-p2"))
+        (sessions / "s-p2.md").write_text(_session_doc("s-p2", 1, carried_from="s"))
+        owner = srv._get_session_lock("s-p2")
+        await owner.acquire()
+        try:
+            waiter = asyncio.create_task(srv._lock_active_session(
+                str(tmp_path), "s", sessions / "s.md"))
+            await asyncio.sleep(0.01)
+            assert not waiter.done()
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            assert owner.locked()
+            assert not srv._get_session_lock("s").locked()
+        finally:
+            owner.release()
+
+    @pytest.mark.asyncio
+    async def test_recovered_successor_keeps_the_latest_round(self, tmp_path):
+        import server as srv
+        sessions = self._sessions(tmp_path)
+        pred = sessions / "s-p2.md"
+        srv._init_session(pred, "s-p2", carried_from="s", carried="X" * 100_000)
+        srv._append_to_session(pred, 4, "LATEST-START", "Y" * 40_000 + "LATEST-END")
+        pred.write_text(pred.read_text() + "\n<!-- claudex:continued-in=s-p3 -->\n")
+        lock, sid, _, recovered, note = await srv._lock_active_session(str(tmp_path), "s-p2", pred)
+        lock.release()
+        assert sid == "s-p3" and "was missing" in note
+        assert "LATEST-START" in recovered and "LATEST-END" in recovered
+        assert len(recovered.encode("utf-8")) <= srv.CARRY_MAX_BYTES + 1024
+
+    @pytest.mark.asyncio
+    async def test_failed_recap_rollover_keeps_the_latest_round(self, tmp_path):
+        import server as srv
+        sessions = self._sessions(tmp_path)
+        path = sessions / "s.md"
+        srv._init_session(path, "s", carried_from="r", carried="X" * 100_000)
+        for n in range(1, srv.MAX_SESSION_ROUNDS + 1):
+            srv._append_to_session(path, n, f"START-{n}", "Y" * 9_000 + f"END-{n}")
+        prompts = []
+
+        async def capture(prompt, **k):
+            prompts.append(prompt)
+            return "answer"
+        with patch.object(srv, "_run_codex_once", new_callable=AsyncMock,
+                          return_value="Error: recap failed"), \
+             patch.object(srv, "_run_codex", side_effect=capture):
+            out = await srv.codex_collab(_collab_input(srv, tmp_path, "s"))
+        last = srv.MAX_SESSION_ROUNDS
+        successor = (sessions / "s-p2.md").read_text()
+        assert f"END-{last}" in successor and f"START-{last}" in successor
+        assert f"END-{last}" in prompts[0] and "recap failed" in out
+
+    @pytest.mark.parametrize("budget", [0, 1, 11, 40, 100])
+    def test_tiny_truncation_budgets_hold(self, budget):
+        import server as srv
+        for fn in (srv._truncate_utf8, srv._truncate_middle_utf8):
+            assert len(fn("X" * 500, budget).encode("utf-8")) <= budget
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sid", ["foo bar", "foo@bar", "foo_bar"])
+    async def test_any_alias_of_an_id_reaches_its_successor(self, tmp_path, sid):
+        # Codex review 5: the raw id ('foo bar') was written into markers the
+        # parser could not read, so the next call started a third session.
+        import server as srv
+        recap = AsyncMock(return_value="RECAP-OF-PREDECESSOR")
+        prompts = []
+
+        async def answer(prompt, **kwargs):
+            prompts.append(prompt)
+            return "FIRST-SUCCESSOR-DECISION"
+        path = srv._safe_claudex_path(str(tmp_path), "sessions", sid + ".md")
+        srv._init_session(path, srv._canonical_session_id(sid))
+        for n in range(1, srv.MAX_SESSION_ROUNDS + 1):
+            srv._append_to_session(path, n, "old analysis", "old answer")
+        with patch.object(srv, "_run_codex_once", recap), \
+             patch.object(srv, "_run_codex", side_effect=answer), \
+             patch.object(srv, "_get_git_context", AsyncMock(return_value=None)):
+            await srv.codex_collab(_collab_input(srv, tmp_path, sid))
+            out = await srv.codex_collab(_collab_input(srv, tmp_path, sid))
+        assert "FIRST-SUCCESSOR-DECISION" in prompts[1]
+        assert recap.await_count == 1
+        assert len(list(path.parent.glob("*.md"))) == 2
+        assert "Session: foo_bar-p2 (Round 2/" in out
+
+    def test_posix_without_dir_fd_fails_closed(self, tmp_path, monkeypatch):
+        import server as srv
+        monkeypatch.setattr(srv, "_HAVE_DIR_FD", False)
+        monkeypatch.setattr(srv, "_PATHWISE_FALLBACK", False)
+        sessions = self._sessions(tmp_path)
+        old = sessions / "old.md"; old.write_text("x"); _make_old(old)
+        with pytest.raises(OSError) as exc:
+            srv._read_text_nofollow(old)
+        assert exc.value.errno == errno.ENOTSUP
+        srv._cleanup_old_sessions(tmp_path / ".claudex")
+        assert old.exists()
+        assert srv._claudex_usage(tmp_path / ".claudex") == {"unavailable": True}
+
+
+class TestV231GitLifecycle:
+    @pytest.mark.asyncio
+    async def test_unborn_head_is_attested_not_failed(self, tmp_path):
+        import subprocess as sp
+        import server as srv
+        repo = tmp_path / "r"; repo.mkdir()
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "a.py").write_text("x = 1\n")
+        sp.run(["git", "add", "a.py"], cwd=repo, check=True)
+        out = await srv._get_git_diff(str(repo), staged=True)
+        assert out is not None and "HEAD none (no commits yet)" in out
+
+    @pytest.mark.asyncio
+    async def test_head_failure_on_committed_repo_is_an_error(self, tmp_path, monkeypatch):
+        import subprocess as sp
+        import server as srv
+        repo = tmp_path / "r"; repo.mkdir()
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "a.py").write_text("x = 1\n")
+        sp.run(["git", "add", "-A"], cwd=repo, check=True)
+        sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "i"],
+               cwd=repo, check=True)
+        (repo / "a.py").write_text("x = 2\n")
+        real = srv._git_run
+
+        async def flaky(project_dir, *args, **k):
+            if args[:1] == ("rev-parse",):
+                return None, ""  # timed out / could not run
+            return await real(project_dir, *args, **k)
+        monkeypatch.setattr(srv, "_git_run", flaky)
+        out = await srv._get_git_diff(str(repo))
+        assert out.startswith("Error:") and "no commits yet" not in out
+
+    @pytest.mark.asyncio
+    async def test_head_of_committed_repo_is_a_sha(self, tmp_path):
+        import subprocess as sp
+        import server as srv
+        repo = tmp_path / "r"; repo.mkdir()
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                "--allow-empty", "-m", "i"], cwd=repo, check=True)
+        att = await srv._head_attestation(str(repo))
+        assert att and len(att) == 40
+
+    @pytest.mark.asyncio
+    async def test_git_timeout_kills_the_whole_process_group(self, tmp_path):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX only")
+        pidfile = tmp_path / "child.pid"
+        proc = await asyncio.create_subprocess_exec(
+            "sh", "-c", f"sleep 30 & echo $! > {pidfile}; wait",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True)
+        for _ in range(50):
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+            await asyncio.sleep(0.05)
+        child = int(pidfile.read_text())
+        with pytest.raises(asyncio.TimeoutError):
+            await srv._communicate_or_kill(proc, 0.2)
+        await asyncio.sleep(0.2)
+        try:
+            os.kill(child, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True
+        if alive:
+            # A zombie still answers kill(0); reaped or zombie both mean killed.
+            status = Path(f"/proc/{child}/status")
+            alive = not (status.exists() and "zombie" in status.read_text().lower())
+        assert not alive
+
+    @pytest.mark.asyncio
+    async def test_group_is_killed_after_its_leader_exited(self, tmp_path):
+        # A filter's background child keeps the pipes open after git exits.
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX only")
+        pidfile = tmp_path / "bg.pid"
+        proc = await asyncio.create_subprocess_exec(
+            "sh", "-c", f"sleep 30 & echo $! > {pidfile}; exit 0",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True)
+        for _ in range(50):
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+            await asyncio.sleep(0.05)
+        bg = int(pidfile.read_text())
+        with pytest.raises(asyncio.TimeoutError):
+            await srv._communicate_or_kill(proc, 0.3)
+        for _ in range(20):
+            if _is_dead(bg):
+                break
+            await asyncio.sleep(0.05)
+        assert _is_dead(bg)
+
+    def test_run_cleanup_survives_vanishing_entries(self, tmp_path, monkeypatch):
+        import server as srv
+        claudex = tmp_path / ".claudex"; claudex.mkdir()
+        real_scandir = srv.os.scandir
+
+        class Vanishing:
+            name = "run-gone"
+            def is_dir(self, follow_symlinks=True):
+                return True
+            def stat(self, follow_symlinks=True):
+                raise FileNotFoundError("gone")
+
+        class Ctx:
+            def __init__(self, it): self.it = it
+            def __enter__(self): return iter(self.it)
+            def __exit__(self, *a): return False
+
+        def fake_scandir(fd):
+            with real_scandir(fd) as it:
+                items = list(it)
+            return Ctx([Vanishing(), *items])
+        monkeypatch.setattr(srv.os, "scandir", fake_scandir)
+        srv._cleanup_old_run_dirs(claudex)  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_status_reports_symlinked_claudex(self, tmp_path):
+        import server as srv
+        outside = tmp_path / "outside"; (outside / "recaps").mkdir(parents=True)
+        (outside / "recaps" / "r.md").write_text("x")
+        proj = tmp_path / "proj"; proj.mkdir()
+        (proj / ".claudex").symlink_to(outside)
+        out = await srv.codex_status(srv.StatusInput(project_dir=str(proj)))
+        assert "is a symlink: ignored" in out and "Recaps: none" in out
+
+    @pytest.mark.asyncio
+    async def test_git_timeout_kills_the_process(self, monkeypatch):
+        import server as srv
+
+        class Hung:
+            returncode = None
+            killed = False
+            async def communicate(self):
+                await asyncio.sleep(60)
+            def kill(self):
+                Hung.killed = True
+            async def wait(self):
+                return -9
+
+        async def spawn(*a, **k):
+            return Hung()
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", spawn)
+        out = await srv._git_cmd(str(Path.cwd()), "status", timeout=0.05)
+        assert out is None and Hung.killed
+
+
+class TestV231DiffFailures:
+    @pytest.mark.asyncio
+    async def test_not_a_repo_is_an_error_not_nothing_to_review(self, tmp_path):
+        from server import codex_review_diff, ReviewDiffInput
+        plain = tmp_path / "plain"; plain.mkdir()
+        (plain / "a.py").write_text("x = 1\n")
+        out = await codex_review_diff(ReviewDiffInput(project_dir=str(plain)))
+        assert out.startswith("Error:")
+        assert "Nothing was reviewed" in out
+        assert "Nothing to review" not in out
+
+    @pytest.mark.asyncio
+    async def test_git_missing_is_an_error(self, tmp_path, monkeypatch):
+        import server as srv
+        repo = tmp_path / "r"; repo.mkdir()
+
+        async def no_git(*a, **k):
+            raise FileNotFoundError("git")
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", no_git)
+        out = await srv._get_git_diff(str(repo))
+        assert out.startswith("Error:") and "Nothing was reviewed" in out
+
+    @pytest.mark.asyncio
+    async def test_untracked_probe_failure_is_an_error(self, tmp_path, monkeypatch):
+        import server as srv
+        repo = tmp_path / "r"; repo.mkdir()
+        monkeypatch.setattr(srv, "_get_git_diff", AsyncMock(return_value=None))
+        monkeypatch.setattr(srv, "_git_cmd", AsyncMock(return_value=None))
+        out = await srv.codex_review_diff(srv.ReviewDiffInput(project_dir=str(repo)))
+        assert out.startswith("Error:") and "Nothing to review" not in out
+
+    @pytest.mark.asyncio
+    async def test_clean_repo_still_reports_nothing_to_review(self, tmp_path):
+        import subprocess as sp
+        from server import codex_review_diff, ReviewDiffInput
+        repo = tmp_path / "r"; repo.mkdir()
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                "--allow-empty", "-m", "i"], cwd=repo, check=True)
+        out = await codex_review_diff(ReviewDiffInput(project_dir=str(repo)))
+        assert "Nothing to review" in out
+
+
+def test_server_version_matches_manifests():
+    import server as srv
+    plugin = json.loads((PROJECT_ROOT / ".claude-plugin" / "plugin.json").read_text())
+    ext = json.loads((PROJECT_ROOT / "desktop-extension" / "manifest.json").read_text())
+    assert srv.SERVER_VERSION == plugin["version"] == ext["version"]
+
+
+# =========================================================================
+# v2.4: roots sources, config file, kill switch, CLI, lockfile
+# =========================================================================
+
+def _write_cfg(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    path.write_text(json.dumps(data))
+    os.chmod(path, 0o600)
+
+
+class TestV24ConfigIntegrity:
+    """Codex red team of v2.4: HOME/APPDATA redirection, config I/O identity,
+    strict schema, cached results after revocation, .gitignore claims."""
+
+    @pytest.fixture
+    def acct(self, tmp_path, monkeypatch):
+        # The OS account's home is tmp/acct; $HOME points somewhere else.
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX account database")
+        acct = tmp_path / "acct"; acct.mkdir()
+        fake = tmp_path / "fakehome"; fake.mkdir()
+        monkeypatch.setattr(srv, "_account_home", lambda: acct)
+        monkeypatch.setenv("HOME", str(fake))
+        monkeypatch.setattr(srv, "_config_path", srv._default_config_path)
+        return acct
+
+    def test_account_home_ignores_HOME(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        before = srv._default_config_path()
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert srv._account_home() != tmp_path
+        assert srv._default_config_path() == before
+
+    def test_revocation_holds_when_HOME_is_redirected(self, tmp_path, acct, monkeypatch):
+        import server as srv
+        _write_cfg(srv._default_config_path(), {"version": 1, "deny_all": True, "allowed_roots": []})
+        assert str(acct) in str(srv._default_config_path())
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        assert srv._roots_resolution().source == "revoked"
+
+    def test_protected_dirs_of_the_account_home_stay_protected(self, tmp_path, acct, monkeypatch):
+        import server as srv
+        ssh = acct / ".ssh" / "keys"; ssh.mkdir(parents=True)
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        with pytest.raises(ValueError, match="protected"):
+            srv._validate_project_dir(str(ssh))
+        with pytest.raises(ValueError, match="entire home"):
+            srv._validate_project_dir(str(acct))
+
+    @pytest.mark.parametrize("kind", ["dangling", "elsewhere"])
+    def test_symlinked_config_file_denies(self, tmp_path, kind, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        cfg = srv._config_path(); cfg.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(cfg.parent, 0o700)
+        target = tmp_path / "other.json"
+        if kind == "elsewhere":
+            target.write_text(json.dumps({"version": 1, "allowed_roots": [str(tmp_path)]}))
+        cfg.symlink_to(target)
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        res = srv._roots_resolution()
+        assert res.source == "config-error" and res.roots == []
+
+    def test_symlinked_config_folder_denies(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        real = tmp_path / "real"; real.mkdir(mode=0o700)
+        (real / "config.json").write_text(json.dumps({"version": 1, "allowed_roots": [str(tmp_path)]}))
+        link = tmp_path / "linkdir"; link.symlink_to(real)
+        monkeypatch.setattr(srv, "_config_path", lambda: link / "config.json")
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        assert srv._roots_resolution().source == "config-error"
+
+    def test_config_writable_by_others_denies(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        cfg = srv._config_path()
+        _write_cfg(cfg, {"version": 1, "allowed_roots": [str(tmp_path)]})
+        os.chmod(cfg, 0o666)
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        res = srv._roots_resolution()
+        assert res.source == "config-error" and "other accounts" in res.detail
+
+    def test_fifo_and_oversized_config_deny_without_blocking(self, tmp_path, monkeypatch):
+        import server as srv
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("no FIFOs")
+        cfg = srv._config_path(); cfg.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(cfg.parent, 0o700)
+        os.mkfifo(cfg, 0o600)
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        assert srv._roots_resolution().source == "config-error"
+        cfg.unlink()
+        cfg.write_text(json.dumps({"version": 1, "allowed_roots": [], "pad": "x" * 70_000}))
+        os.chmod(cfg, 0o600)
+        assert srv._roots_resolution().source == "config-error"
+
+    @pytest.mark.parametrize("doc", [
+        {"version": 1, "deny_all": "true", "allowed_roots": []},
+        {"version": 1, "deny_all": 1, "allowed_roots": []},
+        {"version": True, "allowed_roots": []},
+        {"version": 1, "allowed_roots": ["/tmp/a\x00b"]},
+    ])
+    def test_malformed_documents_deny_and_never_fall_through(self, tmp_path, doc, monkeypatch):
+        import server as srv
+        _write_cfg(srv._config_path(), doc)
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        res = srv._roots_resolution()
+        assert res.source == "config-error" and res.roots == []
+
+    def test_writer_refuses_a_symlinked_folder(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        real = tmp_path / "victim"; real.mkdir(mode=0o700)
+        link = tmp_path / "cfgdir"; link.symlink_to(real)
+        monkeypatch.setattr(srv, "_config_path", lambda: link / "config.json")
+        with pytest.raises(OSError):
+            srv._write_roots_config({"deny_all": True, "allowed_roots": []})
+        assert list(real.iterdir()) == []
+
+    def test_writer_makes_private_files(self, tmp_path):
+        import server as srv
+        path = srv._write_roots_config({"deny_all": False, "allowed_roots": [str(tmp_path)]})
+        if os.name != "nt":
+            assert stat_mode(path) == 0o600 and stat_mode(path.parent) == 0o700
+        assert srv._load_roots_config()[0] == "ok"
+
+    @pytest.mark.asyncio
+    async def test_revocation_withholds_cached_results(self, tmp_path, monkeypatch):
+        import server as srv
+        proj = tmp_path / "p"; proj.mkdir()
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        job_id = "job-0123456789ab"
+        srv._jobs[job_id] = {"project_dir": str(proj), "tool": "plan", "status": "completed",
+                             "submitted": 0.0, "finished": 1.0, "started_running": 0.0,
+                             "result": "SECRET-RESULT"}
+        try:
+            ok = await srv.codex_result(srv.JobResultInput(job_id=job_id))
+            assert ok == "SECRET-RESULT"
+            srv._write_roots_config({"deny_all": True, "allowed_roots": []})
+            denied = await srv.codex_result(srv.JobResultInput(job_id=job_id))
+            listing = await srv.codex_result(srv.JobResultInput(job_id="list"))
+        finally:
+            srv._jobs.pop(job_id, None)
+        assert denied.startswith("Error:") and "SECRET-RESULT" not in denied
+        assert str(proj) not in listing and "no longer allowed" in listing
+
+    @pytest.mark.parametrize("body,state", [
+        ("", "unverified"),
+        ("*\n!*\n", "unverified"),
+        ("*\n!sessions/\n", "unverified"),
+        ("# Created by Claudex\n*\n", "ok"),
+        (" *\n", "unverified"),
+        ("*  \n", "ok"),
+        ("*\r\n", "unverified"),
+        ("  # not a comment\n*\n", "unverified"),
+        ("*\n" + "#" * 70_000 + "\n", "unverified"),
+    ])
+    def test_gitignore_state_is_ok_only_for_exactly_star(self, tmp_path, body, state):
+        import server as srv
+        claudex = tmp_path / ".claudex"; claudex.mkdir()
+        (claudex / ".gitignore").write_text(body)
+        assert srv._claudex_ignore_state(claudex) == state
+
+    def test_gitignore_missing_is_reported(self, tmp_path):
+        import server as srv
+        claudex = tmp_path / ".claudex"; claudex.mkdir()
+        assert srv._claudex_ignore_state(claudex) == "missing"
+
+    @pytest.mark.asyncio
+    async def test_revocation_during_a_result_wait_withholds_it(self, tmp_path, monkeypatch):
+        import server as srv
+        proj = tmp_path / "p"; proj.mkdir()
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        job_id = "job-0123456789ac"
+        srv._jobs[job_id] = {"project_dir": str(proj), "tool": "plan", "status": "running",
+                             "submitted": 0.0, "finished": None, "started_running": 0.0,
+                             "result": None}
+
+        async def finish_after_revoke():
+            await asyncio.sleep(0.05)
+            srv._write_roots_config({"deny_all": True, "allowed_roots": []})
+            srv._jobs[job_id].update(status="completed", result="SECRET-LATE", finished=1.0)
+        srv._job_tasks[job_id] = asyncio.create_task(finish_after_revoke())
+        try:
+            out = await srv.codex_result(srv.JobResultInput(job_id=job_id, wait_seconds=5))
+        finally:
+            srv._jobs.pop(job_id, None)
+            srv._job_tasks.pop(job_id, None)
+        assert out.startswith("Error:") and "SECRET-LATE" not in out
+
+    def test_writable_ancestor_denies_even_without_a_file(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        shared = tmp_path / "shared"; shared.mkdir()
+        os.chmod(shared, 0o777)
+        monkeypatch.setattr(srv, "_config_path", lambda: shared / "botique-claudex" / "config.json")
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        res = srv._roots_resolution()
+        assert res.source == "config-error" and "writable by other accounts" in res.detail
+        with pytest.raises(OSError):
+            srv._write_roots_config({"deny_all": False, "allowed_roots": [str(tmp_path)]})
+
+    def test_chained_symlink_through_a_writable_folder_denies(self, tmp_path, monkeypatch):
+        # Codex red team 3: home/.config -> shared/hop -> safe/configs, with
+        # shared writable by others; removing hop used to read as "absent".
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        safe = tmp_path / "safe" / "configs" / "botique-claudex"; safe.mkdir(parents=True)
+        os.chmod(safe, 0o700)
+        shared = tmp_path / "shared"; shared.mkdir(); os.chmod(shared, 0o777)
+        (shared / "hop").symlink_to(tmp_path / "safe" / "configs")
+        home = tmp_path / "home"; home.mkdir()
+        (home / ".config").symlink_to(shared / "hop")
+        monkeypatch.setattr(srv, "_config_path", lambda: home / ".config" / "botique-claudex" / "config.json")
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        assert srv._roots_resolution().source == "config-error"
+        (shared / "hop").unlink()  # the other account removes the hop
+        res = srv._roots_resolution()
+        assert res.source == "config-error" and "writable by other accounts" in res.detail
+
+    def test_foreign_hop_in_a_sticky_shared_folder_denies(self, tmp_path, monkeypatch):
+        # Codex red team 4: a hop owned by another account inside a sticky
+        # shared folder (like /tmp) can be removed by its owner.
+        import server as srv
+        if os.name == "nt" or os.getuid() != 0:
+            pytest.skip("needs root to create a foreign-owned entry")
+        safe = tmp_path / "safe" / "botique-claudex"; safe.mkdir(parents=True)
+        os.chmod(safe, 0o700)
+        shared = tmp_path / "sticky"; shared.mkdir(); os.chmod(shared, 0o1777)
+        hop = shared / "hop"; hop.symlink_to(tmp_path / "safe")
+        os.lchown(hop, 4242, 4242)
+        home = tmp_path / "home"; home.mkdir()
+        (home / ".config").symlink_to(hop)
+        monkeypatch.setattr(srv, "_config_path", lambda: home / ".config" / "botique-claudex" / "config.json")
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(tmp_path))
+        res = srv._roots_resolution()
+        assert res.source == "config-error" and "another account in a shared folder" in res.detail
+        hop.unlink()  # its owner removes it
+        res = srv._roots_resolution()
+        assert res.source == "config-error" and "missing from a shared folder" in res.detail
+
+    def test_own_entries_in_a_sticky_shared_folder_are_fine(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        shared = tmp_path / "sticky"; shared.mkdir(); os.chmod(shared, 0o1777)
+        mine = shared / "mine"; mine.mkdir(mode=0o700)
+        monkeypatch.setattr(srv, "_config_path", lambda: mine / "botique-claudex" / "config.json")
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        assert srv._load_roots_config()[0] == "absent"
+
+    def test_safe_symlinked_dotfiles_still_work(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        dots = tmp_path / "dotfiles" / "config"; dots.mkdir(parents=True)
+        home = tmp_path / "home"; home.mkdir()
+        (home / ".config").symlink_to(dots)
+        monkeypatch.setattr(srv, "_config_path", lambda: home / ".config" / "botique-claudex" / "config.json")
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        assert srv._load_roots_config()[0] == "absent"
+        srv._write_roots_config({"deny_all": False, "allowed_roots": [str(tmp_path)]})
+        assert srv._roots_resolution().source == "config-file"
+
+    def test_symlink_inside_a_writable_folder_denies(self, tmp_path, monkeypatch):
+        import server as srv
+        if os.name == "nt":
+            pytest.skip("POSIX")
+        safe = tmp_path / "safe" / "botique-claudex"; safe.mkdir(parents=True, mode=0o700)
+        shared = tmp_path / "shared"; shared.mkdir(); os.chmod(shared, 0o777)
+        (shared / "cfg").symlink_to(tmp_path / "safe")
+        monkeypatch.setattr(srv, "_config_path", lambda: shared / "cfg" / "botique-claudex" / "config.json")
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        assert srv._roots_resolution().source == "config-error"
+
+    def test_prompts_do_not_claim_verbatim(self):
+        import server as srv
+        src = Path(srv.__file__).read_text()
+        assert "Original User Request (verbatim" not in src
+
+
+def stat_mode(path):
+    import stat as _stat
+    return _stat.S_IMODE(os.stat(path).st_mode)
+
+
+class TestV24RootsResolution:
+    @pytest.fixture
+    def cfg(self, tmp_path):
+        import server as srv
+        return srv._config_path()
+
+    @pytest.fixture
+    def clean_env(self, monkeypatch):
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+
+    def test_none_configured_denies(self, clean_env):
+        import server as srv
+        res = srv._roots_resolution()
+        assert res.roots == [] and res.source == "none"
+
+    def test_config_file_supplies_roots(self, tmp_path, cfg, clean_env):
+        import server as srv
+        proj = tmp_path / "projects"; proj.mkdir()
+        _write_cfg(cfg, {"version": 1, "allowed_roots": [str(proj)]})
+        res = srv._roots_resolution()
+        assert res.roots == [proj.resolve()] and res.source == "config-file"
+        assert srv._validate_project_dir(str(proj)) == str(proj.resolve())
+
+    def test_env_beats_config_file(self, tmp_path, cfg, monkeypatch):
+        import server as srv
+        a = tmp_path / "a"; a.mkdir(); b = tmp_path / "b"; b.mkdir()
+        _write_cfg(cfg, {"version": 1, "allowed_roots": [str(a)]})
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(b))
+        res = srv._roots_resolution()
+        assert res.source == "env" and res.roots == [b.resolve()]
+
+    def test_no_plugin_folder_source(self, tmp_path, cfg, clean_env, monkeypatch):
+        # The plugin folder setting was removed before release; a stray env
+        # var from a pre-release build must not grant a root.
+        import server as srv
+        a = tmp_path / "a"; a.mkdir(); b = tmp_path / "b"; b.mkdir()
+        _write_cfg(cfg, {"version": 1, "allowed_roots": [str(a)]})
+        monkeypatch.setenv("CLAUDEX_PLUGIN_FOLDER", str(b))
+        res = srv._roots_resolution()
+        assert res.source == "config-file" and res.roots == [a.resolve()]
+        assert not hasattr(srv, "PLUGIN_FOLDER_ENV")
+
+    def test_revocation_beats_everything(self, tmp_path, cfg, monkeypatch):
+        import server as srv
+        a = tmp_path / "a"; a.mkdir()
+        _write_cfg(cfg, {"version": 1, "deny_all": True, "allowed_roots": []})
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(a))
+        monkeypatch.setattr(srv, "_ARGV_ROOTS", [str(a)])
+        res = srv._roots_resolution()
+        assert res.roots == [] and res.source == "revoked"
+        with pytest.raises(ValueError, match="switched off"):
+            srv._validate_project_dir(str(a))
+
+    @pytest.mark.parametrize("content", [
+        "{not json",
+        json.dumps({"version": 99, "allowed_roots": []}),
+        json.dumps({"version": 1, "allowed_roots": "nope"}),
+        json.dumps({"version": 1, "allowed_roots": ["relative/x"]}),
+        json.dumps(["just", "a", "list"]),
+    ])
+    def test_malformed_config_denies_everything(self, tmp_path, cfg, monkeypatch, content):
+        import server as srv
+        a = tmp_path / "a"; a.mkdir()
+        cfg.parent.mkdir(parents=True, exist_ok=True); cfg.write_text(content)
+        monkeypatch.setenv("CLAUDEX_ALLOWED_ROOTS", str(a))
+        res = srv._roots_resolution()
+        assert res.roots == [] and res.source == "config-error"
+
+    def test_cloud_default_still_last(self, tmp_path, clean_env, monkeypatch):
+        import server as srv
+        proj = tmp_path / "cloudproj"; proj.mkdir()
+        monkeypatch.setenv("CLAUDE_CODE_REMOTE", "true")
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(proj))
+        assert srv._roots_resolution().source == "cloud-default"
+
+    def test_config_path_ignores_state_and_plugin_data_env(self, monkeypatch):
+        import importlib
+        import server as srv
+        real = srv.__dict__["_config_path"]
+        # The autouse fixture patched the module attribute; check the original
+        # function through a fresh import of the source.
+        spec = importlib.util.spec_from_file_location("server_fresh", srv.__file__)
+        fresh = importlib.util.module_from_spec(spec); spec.loader.exec_module(fresh)
+        monkeypatch.setenv("CLAUDEX_STATE_DIR", "/tmp/elsewhere")
+        monkeypatch.setenv("CLAUDE_PLUGIN_DATA", "/tmp/plugin-data")
+        path = str(fresh._config_path())
+        assert "elsewhere" not in path and "plugin-data" not in path
+        assert path.endswith("config.json")
+        del real
+
+
+class TestV24RootsCli:
+    def _cli(self, *args):
+        import server as srv
+        return srv._roots_cli(list(args))
+
+    def test_configure_writes_resolved_roots(self, tmp_path, capsys):
+        import server as srv
+        proj = tmp_path / "projects"; proj.mkdir()
+        assert self._cli("--configure-roots", str(proj)) == 0
+        data = json.loads(srv._config_path().read_text())
+        assert data["allowed_roots"] == [str(proj.resolve())] and data["deny_all"] is False
+        assert oct(srv._config_path().stat().st_mode & 0o777) == "0o600"
+
+    @pytest.mark.parametrize("bad", ["relative", "/definitely/missing/dir", "/"])
+    def test_configure_rejects_bad_folders_and_writes_nothing(self, bad, tmp_path, capsys):
+        import server as srv
+        assert self._cli("--configure-roots", bad) == 2
+        assert not srv._config_path().exists()
+
+    def test_configure_rejects_home_and_protected(self, tmp_path, monkeypatch):
+        import server as srv
+        home = tmp_path / "home"; (home / ".ssh").mkdir(parents=True)
+        monkeypatch.setattr(srv.Path, "home", classmethod(lambda cls: home))
+        monkeypatch.setenv("HOME", str(home))
+        assert self._cli("--configure-roots", str(home)) == 2
+        assert self._cli("--configure-roots", str(home / ".ssh")) == 2
+        assert not srv._config_path().exists()
+
+    def test_revoke_then_reconfigure(self, tmp_path, monkeypatch):
+        import server as srv
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        proj = tmp_path / "p"; proj.mkdir()
+        assert self._cli("--revoke-roots") == 0
+        assert srv._roots_resolution().source == "revoked"
+        assert self._cli("--configure-roots", str(proj)) == 0
+        assert srv._roots_resolution().source == "config-file"
+
+    def test_show_roots(self, capsys):
+        assert self._cli("--show-roots") == 0
+        out = capsys.readouterr().out
+        assert "Config file:" in out and "This shell resolves:" in out
+
+    def test_cli_not_exposed_as_tool(self):
+        import server as srv
+        names = {t.name for t in srv.mcp._tool_manager.list_tools()}
+        assert not any("root" in n for n in names)
+
+
+class TestV24Diagnostics:
+    @pytest.mark.asyncio
+    async def test_status_reports_source_build_and_config(self, tmp_path, monkeypatch):
+        import server as srv
+        monkeypatch.setenv("CLAUDEX_DISTRIBUTION", "mcpb")
+        out = await srv.codex_status(srv.StatusInput())
+        assert "(source: CLAUDEX_ALLOWED_ROOTS)" in out
+        assert "desktop extension (.mcpb)" in out
+        assert "Server file:" in out and "Roots config:" in out
+        assert f"build {srv._build_id()}" in out
+
+    @pytest.mark.asyncio
+    async def test_status_deny_all_shows_configure_command(self, monkeypatch):
+        import server as srv
+        monkeypatch.delenv("CLAUDEX_ALLOWED_ROOTS", raising=False)
+        out = await srv.codex_status(srv.StatusInput())
+        assert "DENY-ALL" in out and "--configure-roots" in out
+
+
+class TestV24Lockfile:
+    def _uv_new_enough(self):
+        uv = shutil.which("uv")
+        if not uv:
+            return None
+        out = subprocess.run([uv, "--version"], capture_output=True, text=True).stdout.split()
+        import server as srv
+        return uv if len(out) > 1 and srv._version_at_least(out[1], "0.11.4") else None
+
+    def test_metadata_declares_uv_floor(self):
+        head = (PROJECT_ROOT / "server" / "server.py").read_text().split("# ///\n")[0]
+        assert 'required-version = ">=0.11.4"' in head
+
+    def test_lockfile_shipped_and_small_enough_for_directory(self):
+        lock = PROJECT_ROOT / "server" / "server.py.lock"
+        assert lock.is_file()
+        assert lock.stat().st_size < 256 * 1024  # directory holds non-image files >= 256 KiB
+
+    def test_lockfile_is_fresh(self):
+        uv = self._uv_new_enough()
+        if not uv:
+            pytest.skip("uv >= 0.11.4 not on PATH")
+        r = subprocess.run([uv, "lock", "--script", str(PROJECT_ROOT / "server" / "server.py"), "--check"],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+
+    def test_every_launcher_is_locked(self):
+        for rel in ("install.sh", "cloud/setup.sh"):
+            text = (PROJECT_ROOT / rel).read_text()
+            assert "uv sync --locked --script" in text, rel
+        mf = json.loads((PROJECT_ROOT / "desktop-extension" / "manifest.json").read_text())
+        launcher = mf["server"]["mcp_config"]["args"][1]
+        assert 'exec uv run --locked --script "${__dirname}/server/server.py"' in launcher
+        assert "CLAUDEX_DISTRIBUTION=mcpb" in launcher
+
+    def test_mcpb_bundle_carries_the_lock(self, tmp_path):
+        if not shutil.which("zip"):
+            pytest.skip("zip not installed")
+        work = tmp_path / "repo"
+        shutil.copytree(PROJECT_ROOT / "desktop-extension", work / "desktop-extension")
+        (work / "server").mkdir()
+        for name in ("server.py", "server.py.lock"):
+            shutil.copy(PROJECT_ROOT / "server" / name, work / "server" / name)
+        env = {**os.environ, "CLAUDEX_SKIP_MCPB_VALIDATE": "1"}
+        r = subprocess.run(["bash", str(work / "desktop-extension" / "build.sh")],
+                           capture_output=True, text=True, env=env)
+        assert r.returncode == 0, r.stderr
+        import zipfile
+        names = zipfile.ZipFile(work / "desktop-extension" / "claudex.mcpb").namelist()
+        assert "server/server.py.lock" in names and "server/server.py" in names
+
+    def test_build_refuses_without_lock(self, tmp_path):
+        work = tmp_path / "repo"
+        shutil.copytree(PROJECT_ROOT / "desktop-extension", work / "desktop-extension")
+        (work / "server").mkdir()
+        shutil.copy(PROJECT_ROOT / "server" / "server.py", work / "server" / "server.py")
+        env = {**os.environ, "CLAUDEX_SKIP_MCPB_VALIDATE": "1"}
+        r = subprocess.run(["bash", str(work / "desktop-extension" / "build.sh")],
+                           capture_output=True, text=True, env=env)
+        assert r.returncode != 0 and "server.py.lock missing" in r.stderr
+
+
+# =========================================================================
+# v3.0: plugin renamed codex -> claudex
+# =========================================================================
+
+class TestV3Rename:
+    def test_manifest_name_is_claudex(self):
+        pj = json.loads((PROJECT_ROOT / ".claude-plugin" / "plugin.json").read_text())
+        assert pj["name"] == "claudex"
+
+    def test_server_key_and_tool_names_unchanged(self):
+        import server as srv
+        mcp = json.loads((PROJECT_ROOT / ".mcp.json").read_text())
+        assert list(mcp) == ["codex"]
+        assert srv.mcp.name == "codex"
+        names = {t.name for t in srv.mcp._tool_manager.list_tools()}
+        assert {"codex_plan", "codex_submit", "codex_result", "codex_login"} <= names
+
+    def test_every_command_uses_the_new_tool_prefix(self):
+        for cmd in sorted((PROJECT_ROOT / "commands").glob("*.md")):
+            front = cmd.read_text().split("---")[1]
+            assert "mcp__plugin_codex_codex__" not in front, cmd.name
+            for tool in re.findall(r"mcp__plugin_[a-z]+_[a-z]+__\w+", front):
+                assert tool.startswith("mcp__plugin_claudex_codex__"), (cmd.name, tool)
+
+    def test_no_old_command_names_in_shipped_runtime_files(self):
+        shipped = [PROJECT_ROOT / "server" / "server.py", PROJECT_ROOT / "install.sh",
+                   PROJECT_ROOT / "cloud" / "setup.sh",
+                   *sorted((PROJECT_ROOT / "commands").glob("*.md")),
+                   *sorted((PROJECT_ROOT / "skills").rglob("SKILL.md"))]
+        for f in shipped:
+            assert "/codex:" not in f.read_text(), f.name
+
+    def test_skill_lives_in_skills_codex_and_keeps_its_name(self):
+        skill = PROJECT_ROOT / "skills" / "codex" / "SKILL.md"
+        assert skill.is_file() and not (PROJECT_ROOT / "skills" / "claudex").exists()
+        assert "\nname: codex\n" in skill.read_text().split("---")[1] + "\n"
+
+    def test_upgrade_notice_links_to_the_changelog_heading(self):
+        import re as _re
+        heading = next(l for l in (PROJECT_ROOT / "CHANGELOG.md").read_text().splitlines()
+                       if l.startswith("## 3.0.0"))
+        slug = _re.sub(r"[^a-z0-9 _-]", "", heading[3:].strip().lower()).replace(" ", "-")
+        assert f"CHANGELOG.md#{slug})" in (PROJECT_ROOT / "README.md").read_text()
 
 
 # =========================================================================

@@ -4,6 +4,11 @@
 #     "mcp[cli]>=1.0.0,<2.0.0",
 #     "pydantic>=2.0.0",
 # ]
+#
+# [tool.uv]
+# # Older uv silently ignores --locked when the script lockfile is missing
+# # (fixed in uv 0.11.4); uv enforces this floor before resolving anything.
+# required-version = ">=0.11.4"
 # ///
 """
 Claudex MCP Server
@@ -32,6 +37,7 @@ Requires:
 
 import asyncio
 import atexit
+import errno
 import json
 import math
 import os
@@ -39,10 +45,12 @@ import re
 import shutil
 import logging
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -56,6 +64,7 @@ from pydantic import BaseModel, Field, ConfigDict
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = "gpt-6-astra"  # GPT-6 Astra (v2.1); per-call `model` override stays
+SERVER_VERSION = "3.0.0"  # kept equal to plugin.json + desktop-extension/manifest.json (tested)
 DEFAULT_REASONING_EFFORT = "high"  # on every tool; Astra's own default is "medium"
 EXEC_TIMEOUT_SECONDS = 1200  # 20 min max per Codex call
 # Floor for the default model: older CLIs are rejected by the API (HTTP 400
@@ -89,6 +98,17 @@ _UNEXPANDED_TEMPLATE_RE = re.compile(r"\$\{user_config\.[^}]*\}")
 # var. Never applies locally; an explicit env var or --allowed-roots always wins.
 CLOUD_SESSION_ENV = "CLAUDE_CODE_REMOTE"
 PROJECT_DIR_ENV = "CLAUDE_PROJECT_DIR"
+# v2.4: one more roots source, below argv/env in precedence: a per-user
+# config file written ONLY by the terminal command
+# `server.py --configure-roots <dir>...` / `--revoke-roots`. It lives in a
+# fixed OS location (never the project, never CLAUDE_PLUGIN_DATA), so every
+# surface on the machine sees the same file and a renamed/updated plugin keeps
+# it. `--revoke-roots` is a kill switch that beats every source.
+# There is deliberately no plugin `userConfig` folder option: the desktop app
+# can leave a plugin MCP server that needs plugin settings unstarted
+# (user_config_unsupported), which would take Claudex down in chat/Cowork, and
+# the option only duplicated --configure-roots for one Claude Code folder.
+ROOTS_CONFIG_VERSION = 1
 ALWAYS_DENIED_SUBPATHS = (
     ".ssh", ".aws", ".gnupg", ".codex", ".config/gh",
     "Library/Keychains", "Library/Application Support/Claude",
@@ -607,6 +627,11 @@ _metrics: dict[str, dict] = {}
 _session_locks: dict[str, asyncio.Lock] = {}
 
 
+def _canonical_session_id(session_id: str) -> str:
+    """The session id as stored: the sanitized file-name form."""
+    return re.sub(r'[^a-zA-Z0-9_\-.]', '_', session_id)
+
+
 def _get_session_lock(session_id: str) -> asyncio.Lock:
     """Get or create an async lock for a session.
 
@@ -614,7 +639,7 @@ def _get_session_lock(session_id: str) -> asyncio.Lock:
     'foo bar' and 'foo@bar' map to the same session file, so they must share
     one lock — keying by raw ID allowed alias writes to bypass locking.
     """
-    key = re.sub(r'[^a-zA-Z0-9_\-.]', '_', session_id)
+    key = _canonical_session_id(session_id)
     if key not in _session_locks:
         _session_locks[key] = asyncio.Lock()
     return _session_locks[key]
@@ -687,20 +712,120 @@ def _find_codex_bin() -> str:
     return "codex"  # Let it fail with a clear FileNotFoundError
 
 
-def _allowed_roots() -> list[Path]:
-    """Resolve configured workspace roots (argv --allowed-roots wins over env).
+_BUILD_ID: Optional[str] = None
 
-    Deny-by-default (v2.0): an empty result means _validate_project_dir
-    REJECTS every project directory — never "unrestricted".
+
+def _build_id() -> str:
+    """First 12 hex of sha256(server.py): identifies the exact running build."""
+    global _BUILD_ID
+    if _BUILD_ID is None:
+        import hashlib
+        try:
+            _BUILD_ID = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+        except OSError:
+            _BUILD_ID = "unknown"
+    return _BUILD_ID
+
+
+def _distribution() -> str:
+    """Which packaging launched this server (diagnostics only, v2.4)."""
+    if os.environ.get("CLAUDEX_DISTRIBUTION") == "mcpb":
+        return "desktop extension (.mcpb)"
+    if os.environ.get(CLOUD_SESSION_ENV) == "true":
+        return "plugin in a Claude Code cloud session"
+    if os.environ.get("CLAUDE_PLUGIN_ROOT"):
+        return "plugin"
+    return "manual launch or source checkout"
+
+
+def _windows_known_folder(guid: str) -> Optional[Path]:
+    """SHGetKnownFolderPath: the shell's folder, not an inherited env var."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                        ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+        u = uuid.UUID(guid)
+        g = _GUID(u.time_low, u.time_mid, u.time_hi_version,
+                  (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+        out = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(g), 0, None, ctypes.byref(out)) != 0:
+            return None
+        try:
+            return Path(out.value) if out.value else None
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(out)
+    except Exception:  # noqa: BLE001 - any failure means "unknown"
+        return None
+
+
+_FOLDERID_PROFILE = "5E6C858F-0E22-4760-9AFE-EA3317B67173"
+_FOLDERID_ROAMING_APPDATA = "3EB685DB-65F9-4CF6-A03A-E3EF65729F3D"
+
+
+def _account_home() -> Path:
+    """The OS account's home folder, independent of $HOME / %USERPROFILE%.
+
+    A project's Claude Code settings or an MCP host can set the server's
+    environment, so the revocation file and the protected-home checks must
+    not follow an inherited HOME (v2.4). Falls back to Path.home() only when
+    the account database has no answer.
     """
-    if _ARGV_ROOTS is not None:
-        parts = list(_ARGV_ROOTS)
-    else:
-        raw = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
-        if not raw:
-            return _cloud_default_roots()
-        # os.pathsep, not a literal ':' — a ':' split corrupts C:\ paths on Windows.
-        parts = raw.split(os.pathsep)
+    if os.name == "nt":
+        return _windows_known_folder(_FOLDERID_PROFILE) or Path.home()
+    try:
+        import pwd
+        home = pwd.getpwuid(os.getuid()).pw_dir
+        if home and os.path.isabs(home):
+            return Path(home)
+    except (ImportError, KeyError, OSError):
+        pass
+    return Path.home()
+
+
+def _home_dirs() -> list:
+    """Resolved home folders to protect: the account's and $HOME, if different."""
+    homes = []
+    for h in (_account_home(), Path.home()):
+        try:
+            r = h.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if r not in homes:
+            homes.append(r)
+    return homes
+
+
+def _default_config_path() -> Path:
+    """Per-user roots config file at a fixed OS location derived from the OS
+    account, not from env vars a plugin host or project could set (v2.4)."""
+    if os.name == "nt":
+        base = _windows_known_folder(_FOLDERID_ROAMING_APPDATA)
+        if base is None:
+            appdata = os.environ.get("APPDATA", "").strip()
+            base = Path(appdata) if os.path.isabs(appdata) else _account_home() / "AppData" / "Roaming"
+        return base / "Botique" / "Claudex" / "config.json"
+    home = _account_home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "Botique" / "Claudex" / "config.json"
+    return home / ".config" / "botique-claudex" / "config.json"
+
+
+def _config_path() -> Path:
+    return _default_config_path()
+
+
+@dataclass(frozen=True)
+class _RootsResolution:
+    roots: list
+    source: str   # revoked | argv | env | config-file | config-error | cloud-default | none
+    detail: str = ""
+
+
+def _parse_root_parts(parts) -> list[Path]:
+    """Shared parser for argv/env root lists (unchanged v2.0 semantics)."""
     roots = []
     for part in parts:
         part = part.strip()
@@ -721,6 +846,216 @@ def _allowed_roots() -> list[Path]:
     return roots
 
 
+def _load_roots_config() -> tuple[str, list, str]:
+    """(state, roots, detail) for the per-user config file.
+
+    state: absent | ok | revoked | malformed. A file that exists but cannot be
+    read or parsed is 'malformed' and denies everything (it might have been a
+    revocation), never falls through to a weaker source.
+    """
+    path = _config_path()
+    try:
+        raw = _read_roots_config_bytes(path)
+    except FileNotFoundError:
+        return "absent", [], str(path)
+    except OSError as exc:
+        return "malformed", [], f"{path}: unreadable ({exc.strerror or exc})"
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        return "malformed", [], f"{path}: invalid JSON ({exc})"
+    version = data.get("version") if isinstance(data, dict) else None
+    if type(version) is not int or version != ROOTS_CONFIG_VERSION:
+        return "malformed", [], f"{path}: unsupported format (expected version {ROOTS_CONFIG_VERSION})"
+    deny_all = data.get("deny_all", False)
+    if type(deny_all) is not bool:
+        return "malformed", [], f"{path}: deny_all must be true or false"
+    if deny_all:
+        return "revoked", [], str(path)
+    entries = data.get("allowed_roots")
+    if not isinstance(entries, list) or not all(isinstance(e, str) for e in entries):
+        return "malformed", [], f"{path}: allowed_roots must be a list of paths"
+    roots = []
+    for entry in entries:
+        if "\x00" in entry or not os.path.isabs(entry):
+            return "malformed", [], f"{path}: invalid path {entry!r}"
+        try:
+            roots.append(Path(entry).resolve())
+        except (OSError, ValueError, RuntimeError) as exc:
+            return "malformed", [], f"{path}: {entry!r} ({exc})"
+    return "ok", roots, str(path)
+
+
+ROOTS_CONFIG_MAX_BYTES = 64 * 1024
+
+
+def _check_private(st, what: str) -> None:
+    """Owned by this account and not writable by group/others (POSIX)."""
+    if os.name == "nt":
+        return
+    if st.st_uid != os.getuid():
+        raise OSError(errno.EPERM, f"{what} is owned by another account")
+    if st.st_mode & 0o022:
+        raise OSError(errno.EPERM, f"{what} is writable by other accounts")
+
+
+def _check_safe_dir(d: Path, uid: int) -> bool:
+    """Raise unless d is safe; True when it is a sticky shared folder (/tmp)."""
+    st = os.stat(d)
+    if st.st_uid not in (uid, 0):
+        raise OSError(errno.EPERM, f"{d} belongs to another account")
+    if st.st_mode & 0o022:
+        if not st.st_mode & stat.S_ISVTX:
+            raise OSError(errno.EPERM, f"{d} is writable by other accounts")
+        return True
+    return False
+
+
+def _check_config_ancestors(path: Path) -> None:
+    """POSIX: resolve the config folder's path one component at a time from
+    `/`, following every symlink, and require each directory traversed to
+    belong to this account or root and not be writable by other accounts
+    (sticky directories such as /tmp excepted), as ssh's StrictModes does.
+    Otherwise another account could move the folder or a symlink hop away
+    (a revocation would read as "absent") or swap it (v2.4). Inside a sticky
+    shared folder every entry traversed must belong to this account or root,
+    and a missing entry there fails closed. Elsewhere a missing component
+    ends the walk: its parent was checked, so the absence is real.
+    """
+    if os.name == "nt":
+        return
+    uid = os.getuid()
+    pending = list(Path(os.path.abspath(path.parent)).parts[1:])
+    cur = Path("/")
+    shared = _check_safe_dir(cur, uid)
+    hops = 0
+    while pending:
+        name = pending.pop(0)
+        if name in ("", "."):
+            continue
+        if name == "..":
+            cur = cur.parent
+            shared = _check_safe_dir(cur, uid)
+            continue
+        nxt = cur / name
+        try:
+            st = os.lstat(nxt)
+        except FileNotFoundError:
+            if shared:
+                # In a sticky shared folder (like /tmp) another account may
+                # have removed its own entry: absence proves nothing there.
+                raise OSError(errno.EPERM, f"{nxt} is missing from a shared folder")
+            return
+        if shared and st.st_uid not in (uid, 0):
+            # Its owner can remove or replace it despite the sticky bit.
+            raise OSError(errno.EPERM, f"{nxt} belongs to another account in a shared folder")
+        if stat.S_ISLNK(st.st_mode):
+            hops += 1
+            if hops > 40:
+                raise OSError(errno.ELOOP, "too many symlinks", str(path))
+            target = Path(os.readlink(nxt))
+            if target.is_absolute():
+                cur = Path("/")
+                shared = _check_safe_dir(cur, uid)
+                pending = list(target.parts[1:]) + pending
+            else:
+                pending = list(target.parts) + pending
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(errno.ENOTDIR, "not a directory", str(nxt))
+        cur = nxt
+        shared = _check_safe_dir(cur, uid)
+
+
+def _read_roots_config_bytes(path: Path) -> bytes:
+    """Bounded, no-follow read of the roots config (v2.4).
+
+    The file and its own folder must be real (no symlink at either), owned by
+    this account and not writable by others; anything else raises, and the
+    caller treats it as unusable (deny-all), never as absent. Non-blocking, so
+    a FIFO cannot hang the server. FileNotFoundError only when it is missing
+    and every folder leading to it is safe (_check_config_ancestors).
+    Windows: leaf checks only, until the Windows port (README says so).
+    """
+    _check_config_ancestors(path)
+    if os.name == "nt" or not (_O_NOFOLLOW and _O_DIRECTORY):
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        with open(path, "rb") as f:
+            data = f.read(ROOTS_CONFIG_MAX_BYTES + 1)
+    else:
+        dir_fd = os.open(path.parent, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+        try:
+            _check_private(os.fstat(dir_fd), "the config folder")
+            fd = os.open(path.name, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError(errno.EINVAL, "not a regular file")
+            _check_private(st, "the config file")
+            with os.fdopen(fd, "rb") as f:
+                fd = -1
+                data = f.read(ROOTS_CONFIG_MAX_BYTES + 1)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    if len(data) > ROOTS_CONFIG_MAX_BYTES:
+        raise OSError(errno.EFBIG, "larger than 64 KB")
+    return data
+
+
+def _roots_resolution() -> _RootsResolution:
+    """Resolve workspace roots and say where they came from (v2.4).
+
+    Precedence: revocation (config kill switch) > --allowed-roots argv >
+    CLAUDEX_ALLOWED_ROOTS > config file > Claude Code cloud default > none.
+    Empty values mean "not set"; an unusable value in the source that was
+    selected denies everything, without falling through.
+    """
+    state, cfg_roots, cfg_detail = _load_roots_config()
+    if state == "revoked":
+        return _RootsResolution([], "revoked", cfg_detail)
+    if state == "malformed":
+        return _RootsResolution([], "config-error", cfg_detail)
+    if _ARGV_ROOTS is not None:
+        return _RootsResolution(_parse_root_parts(_ARGV_ROOTS), "argv", "--allowed-roots")
+    raw = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
+    if raw:
+        # os.pathsep, not a literal ':' — a ':' split corrupts C:\ paths on Windows.
+        return _RootsResolution(_parse_root_parts(raw.split(os.pathsep)), "env", ALLOWED_ROOTS_ENV)
+    if state == "ok":
+        return _RootsResolution(cfg_roots, "config-file", cfg_detail)
+    cloud = _cloud_default_roots()
+    if cloud:
+        return _RootsResolution(cloud, "cloud-default", PROJECT_DIR_ENV)
+    return _RootsResolution([], "none", "")
+
+
+_ROOTS_SOURCE_LABELS = {
+    "revoked": "revoked by --revoke-roots",
+    "config-error": "unusable config file",
+    "argv": "--allowed-roots",
+    "env": ALLOWED_ROOTS_ENV,
+    "config-file": "config file (--configure-roots)",
+    "cloud-default": f"Claude Code cloud session default ({PROJECT_DIR_ENV})",
+    "none": "not configured",
+}
+
+
+def _allowed_roots() -> list[Path]:
+    """Resolved workspace roots. Deny-by-default (v2.0): an empty result means
+    _validate_project_dir REJECTS every project directory, never "unrestricted"."""
+    return list(_roots_resolution().roots)
+
+
+def _configure_roots_command(placeholder: str = "/path/to/your/projects") -> str:
+    """The exact terminal command that configures roots for this server file."""
+    return f'uv run --locked --script "{Path(__file__).resolve()}" --configure-roots {placeholder}'
+
+
 def _cloud_default_roots() -> list[Path]:
     """[CLAUDE_PROJECT_DIR] in a Claude Code cloud session, else [] (deny-all).
 
@@ -737,18 +1072,14 @@ def _cloud_default_roots() -> list[Path]:
         root = Path(raw).resolve()
     except OSError:
         return []
-    if not root.is_dir() or root == Path.home().resolve() or root == root.parent:
+    if not root.is_dir() or root in _home_dirs() or root == root.parent:
         return []
     return [root]
 
 
 def _roots_are_cloud_default() -> bool:
     """True when the active roots come from _cloud_default_roots()."""
-    return (
-        _ARGV_ROOTS is None
-        and not os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
-        and bool(_cloud_default_roots())
-    )
+    return _roots_resolution().source == "cloud-default"
 
 
 def _authorized_cwd(
@@ -775,11 +1106,42 @@ def _roots_span_filesystem() -> bool:
     falsely claiming 'confinement active'. (A narrower per-file read denylist is
     tracked as a follow-up hardening task — see ROADMAP.)
     """
-    home = Path.home().resolve()
+    homes = _home_dirs()
     for r in _allowed_roots():
-        if r == home or r == r.parent:  # r == r.parent is true only at a FS/drive root
+        if r in homes or r == r.parent:  # r == r.parent is true only at a FS/drive root
             return True
     return False
+
+
+def _no_roots_message(resolution: "_RootsResolution") -> str:
+    """Actionable deny-all explanation, specific to why no roots resolved (v2.4)."""
+    configure = _configure_roots_command()
+    if resolution.source == "revoked":
+        return (
+            f"Claudex is switched off on this computer: workspace roots were revoked "
+            f"({resolution.detail}). To re-enable, run in a terminal: {configure}"
+        )
+    if resolution.source == "config-error":
+        return (
+            f"The Claudex roots config is unusable, so every project directory is "
+            f"denied: {resolution.detail}. Rewrite it in a terminal: {configure}"
+        )
+    if resolution.source in ("argv", "env"):
+        return (
+            f"Every project directory is denied: {resolution.detail} is set but "
+            "yields no usable folder (unexpanded template or invalid parts were "
+            "discarded). Point it at real project folders, separated by "
+            f"'{os.pathsep}', then restart the client (it is read at spawn)."
+        )
+    return (
+        "No workspace roots configured, so every project directory is denied "
+        "(deny-by-default since v2.0). Choose the folders Codex may work in, "
+        f"one way: (1) in a terminal: {configure}  (works for every Claude app on "
+        f"this computer, no restart); (2) Claude Code: export {ALLOWED_ROOTS_ENV} "
+        "in your shell profile, then restart; "
+        "(3) desktop extension: pick folders in its settings. "
+        "See README: 'Workspace confinement (required)'."
+    )
 
 
 def _validate_project_dir(project_dir: Optional[str]) -> str:
@@ -796,33 +1158,27 @@ def _validate_project_dir(project_dir: Optional[str]) -> str:
         raise ValueError(f"Project directory does not exist: {cwd}")
     resolved = Path(cwd).resolve()
 
-    home = Path.home().resolve()
-    if resolved == home:
+    homes = _home_dirs()
+    if resolved in homes:
         raise ValueError(
             "Refusing to run Codex over the entire home directory. "
             "Pass a specific project directory."
         )
-    for denied in ALWAYS_DENIED_SUBPATHS:
-        denied_path = (home / denied).resolve()
-        if resolved == denied_path or resolved.is_relative_to(denied_path):
-            raise ValueError(f"Project directory is a protected location: {resolved}")
+    for home in homes:
+        for denied in ALWAYS_DENIED_SUBPATHS:
+            denied_path = (home / denied).resolve()
+            if resolved == denied_path or resolved.is_relative_to(denied_path):
+                raise ValueError(f"Project directory is a protected location: {resolved}")
 
-    roots = _allowed_roots()
+    resolution = _roots_resolution()
+    roots = resolution.roots
     if not roots:
-        raise ValueError(
-            "No workspace roots configured — all project directories are denied "
-            f"(deny-by-default since v2.0). Fix: set {ALLOWED_ROOTS_ENV} to your "
-            f"project folder(s), separated by '{os.pathsep}', in your shell profile "
-            "or as an env block in your MCP client config, then restart the client "
-            "— roots are read at spawn. If the server was started with --allowed-roots "
-            "<paths>, those win and the env var is ignored; fix that flag instead. "
-            "Claude Desktop users: pick folders in the extension settings. "
-            "See README → 'Workspace confinement (required)'."
-        )
+        raise ValueError(_no_roots_message(resolution))
     if not any(resolved == r or resolved.is_relative_to(r) for r in roots):
         raise ValueError(
             f"Project directory {resolved} is outside the allowed workspace roots "
-            f"({ALLOWED_ROOTS_ENV}). Allowed: {', '.join(str(r) for r in roots)}"
+            f"(source: {_ROOTS_SOURCE_LABELS.get(resolution.source, resolution.source)}). "
+            f"Allowed: {', '.join(str(r) for r in roots)}"
         )
     return str(resolved)
 
@@ -878,6 +1234,14 @@ def _safe_claudex_path(
     if not safe_name or safe_name.startswith('.'):
         logger.warning("Invalid filename rejected: %r", filename)
         return None
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", subdir):
+        logger.warning("Invalid .claudex subdir rejected: %r", subdir)
+        return None
+    # Lexical path, never resolve()d (v2.3.1): resolving follows a .claudex or
+    # subdir swapped for a symlink between these checks and the I/O, and the
+    # result would no longer carry the .claudex anchor that _open_nofollow
+    # walks with directory fds. These checks give early, friendly errors; the
+    # fd walk at I/O time is what enforces containment.
     claudex_dir = Path(project_dir) / ".claudex"
     if claudex_dir.is_symlink():
         logger.warning("Symlink rejected at .claudex/ directory: %s", claudex_dir)
@@ -886,48 +1250,282 @@ def _safe_claudex_path(
     if subdir_path.is_symlink():
         logger.warning("Symlink rejected at .claudex/%s directory: %s", subdir, subdir_path)
         return None
-    base_dir = subdir_path.resolve()
-    # Ensure resolved base_dir is still under .claudex
-    claudex_resolved = claudex_dir.resolve()
-    if not base_dir.is_relative_to(claudex_resolved):
-        logger.warning("Subdir escape rejected: %s not under %s", base_dir, claudex_resolved)
-        return None
-    target = (base_dir / safe_name).resolve()
-    if not target.is_relative_to(base_dir):
-        logger.warning("Path traversal attempt rejected: %r -> %s", filename, target)
-        return None
+    target = subdir_path / safe_name
     if target.is_symlink():
         logger.warning("Symlink rejected at target: %s", target)
         return None
     return target
 
 
+# --- No-follow file I/O inside .claudex/ (v2.3.1) ---
+#
+# Every read, write, create and delete under <project>/.claudex/ is anchored
+# to directory file descriptors. The project directory (already validated and
+# resolved by _authorized_cwd) is opened by path; .claudex, its subdirectory
+# and the file are then each opened RELATIVE to their parent's fd with
+# O_NOFOLLOW. A symlink at any of them, committed in the repo or swapped in
+# while a call runs (collab waits minutes for the model), fails with
+# ELOOP/ENOTDIR instead of redirecting the operation outside the workspace.
+# Files must also be regular files: FIFOs/devices are refused, and opens are
+# non-blocking so a FIFO can never stall the server's event loop.
+#
+# Paths stay lexical (<project>/.claudex/<subdir>/<name>, never resolve()d):
+# resolving would follow a swapped .claudex and lose the anchor.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+# True on Linux and macOS. The path-based fallbacks below exist only for
+# platforms without *at() support (Windows), where they are best-effort.
+_HAVE_DIR_FD = bool(
+    _O_NOFOLLOW
+    and _O_DIRECTORY
+    and os.open in os.supports_dir_fd
+    and os.unlink in os.supports_dir_fd
+    and os.mkdir in os.supports_dir_fd
+    and os.rmdir in os.supports_dir_fd
+    and os.scandir in os.supports_fd
+)
+# os.replace never appears in os.supports_dir_fd (only os.rename does, and on
+# POSIX rename atomically replaces the destination too).
+_HAVE_RENAME_DIR_FD = _HAVE_DIR_FD and os.rename in os.supports_dir_fd
+# Path-based fallbacks are allowed only on Windows. A POSIX system without the
+# *at() calls fails closed: O_NOFOLLOW guards only the last path component,
+# so a path walk could follow a swapped .claudex or subdir.
+_PATHWISE_FALLBACK = (not _HAVE_DIR_FD) and os.name == "nt"
+
+
+def _no_fd_support() -> OSError:
+    return OSError(
+        errno.ENOTSUP,
+        "this platform lacks the fd-relative file calls Claudex needs for .claudex/",
+    )
+
+
+def _open_dir_nofollow(path, dir_fd: Optional[int] = None) -> int:
+    """Open a directory without following a symlink at its last component."""
+    return os.open(path, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=dir_fd)
+
+
+def _claudex_fd(claudex_dir: Path, *, create: bool) -> int:
+    """fd for <project>/.claudex, opened relative to the project dir's fd."""
+    parent_fd = os.open(claudex_dir.parent, os.O_RDONLY | _O_DIRECTORY)
+    try:
+        if create:
+            try:
+                os.mkdir(claudex_dir.name, 0o777, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+        return _open_dir_nofollow(claudex_dir.name, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _open_claudex_subdir(claudex_dir: Path, subdir: str, *, create: bool) -> int:
+    """fd for .claudex/<subdir>, refusing symlinks at both levels."""
+    claudex_fd = _claudex_fd(claudex_dir, create=create)
+    try:
+        if create:
+            try:
+                os.mkdir(subdir, 0o777, dir_fd=claudex_fd)
+            except FileExistsError:
+                pass
+        return _open_dir_nofollow(subdir, dir_fd=claudex_fd)
+    finally:
+        os.close(claudex_fd)
+
+
+def _is_claudex_path(path: Path) -> bool:
+    return path.parent.parent.name == ".claudex"
+
+
+def _open_leaf(dir_fd: Optional[int], name, flags: int, mode: int) -> int:
+    """Open a regular file with O_NOFOLLOW|O_NONBLOCK; refuse anything else."""
+    fd = os.open(name, flags | _O_NOFOLLOW | _O_NONBLOCK, mode, dir_fd=dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", str(name))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _open_nofollow(path: Path, flags: int, mode: int = 0o644) -> int:
+    """os.open() that never follows a symlink inside .claudex/ (see above).
+
+    Paths outside a .claudex/<subdir>/ shape (only used by tests) get the leaf
+    checks without the directory walk.
+    """
+    path = Path(path)
+    if _is_claudex_path(path):
+        if not _HAVE_DIR_FD:
+            if not _PATHWISE_FALLBACK:
+                raise _no_fd_support()
+            return _open_leaf(None, path, flags, mode)
+        sub_fd = _open_claudex_subdir(
+            path.parent.parent, path.parent.name, create=bool(flags & os.O_CREAT)
+        )
+        try:
+            return _open_leaf(sub_fd, path.name, flags, mode)
+        finally:
+            os.close(sub_fd)
+    return _open_leaf(None, path, flags, mode)
+
+
+def _read_text_nofollow(path: Path, max_chars: Optional[int] = None) -> str:
+    fd = _open_nofollow(path, os.O_RDONLY)
+    with os.fdopen(fd, "r", encoding="utf-8") as f:
+        return f.read() if max_chars is None else f.read(max_chars)
+
+
+def _write_text_nofollow(path: Path, content: str, mode: int = 0o644) -> None:
+    fd = _open_nofollow(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def _rmtree_fd(parent_fd: int, name: str) -> None:
+    """Remove the directory <parent_fd>/<name> without following any symlink."""
+    dir_fd = _open_dir_nofollow(name, dir_fd=parent_fd)
+    try:
+        with os.scandir(dir_fd) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    _rmtree_fd(dir_fd, entry.name)
+                else:
+                    os.unlink(entry.name, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _remove_run_dir(run_dir: Path) -> None:
+    """Best-effort removal of one .claudex/run-<id> directory."""
+    try:
+        if _HAVE_DIR_FD:
+            claudex_fd = _claudex_fd(run_dir.parent, create=False)
+            try:
+                _rmtree_fd(claudex_fd, run_dir.name)
+            finally:
+                os.close(claudex_fd)
+        elif (_PATHWISE_FALLBACK and not run_dir.is_symlink()
+              and not run_dir.parent.is_symlink()):
+            shutil.rmtree(run_dir)
+    except OSError:
+        pass
+
+
+def _ensure_parent_dir(path: Path) -> None:
+    """Make sure <project>/.claudex exists (subdirs are created fd-relative)."""
+    if _HAVE_DIR_FD and _is_claudex_path(path):
+        os.close(_claudex_fd(path.parent.parent, create=True))
+    elif _is_claudex_path(path) and not _PATHWISE_FALLBACK:
+        raise _no_fd_support()
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+
 def _cleanup_old_run_dirs(claudex_dir: Path) -> None:
     """Best-effort removal of run directories older than RUN_DIR_MAX_AGE_SECONDS."""
-    if not claudex_dir.is_dir():
-        return
     cutoff = time.time() - RUN_DIR_MAX_AGE_SECONDS
-    for entry in claudex_dir.iterdir():
-        if entry.is_symlink():
-            continue  # Never follow symlinks during cleanup
-        if entry.is_dir() and entry.name.startswith("run-"):
+    if not _HAVE_DIR_FD:
+        if not _PATHWISE_FALLBACK or claudex_dir.is_symlink() or not claudex_dir.is_dir():
+            return
+        for entry in claudex_dir.iterdir():
+            if entry.is_symlink():
+                continue  # Never follow symlinks during cleanup
+            if entry.is_dir() and entry.name.startswith("run-"):
+                try:
+                    if entry.stat().st_mtime < cutoff:
+                        shutil.rmtree(entry)
+                        logger.info("Cleaned up stale run dir: %s", entry.name)
+                except OSError:
+                    pass  # best-effort
+        return
+    try:
+        claudex_fd = _claudex_fd(claudex_dir, create=False)
+    except OSError:
+        return  # missing, not a directory, or a symlink: nothing to clean
+    try:
+        stale = []
+        with os.scandir(claudex_fd) as entries:
+            for e in entries:
+                try:
+                    if (e.name.startswith("run-")
+                            and e.is_dir(follow_symlinks=False)
+                            and e.stat(follow_symlinks=False).st_mtime < cutoff):
+                        stale.append(e.name)
+                except OSError:
+                    pass  # vanished meanwhile: best-effort
+        for name in stale:
             try:
-                if entry.stat().st_mtime < cutoff:
-                    shutil.rmtree(entry)
-                    logger.info("Cleaned up stale run dir: %s", entry.name)
+                _rmtree_fd(claudex_fd, name)
+                logger.info("Cleaned up stale run dir: %s", name)
             except OSError:
                 pass  # best-effort
+    finally:
+        os.close(claudex_fd)
+
+
+_CLEANUP_SUBDIRS = ("sessions", "recaps", "jobs")
 
 
 def _cleanup_old_sessions(claudex_dir: Path) -> None:
-    """Best-effort removal of session/recap files older than SESSION_MAX_AGE_SECONDS."""
-    if not claudex_dir.is_dir():
+    """Best-effort removal of session/recap/job files older than SESSION_MAX_AGE_SECONDS.
+
+    v2.3.1 security fix: a repository could commit .claudex/<subdir> as a
+    symlink to any directory, and this cleanup followed it and deleted that
+    directory's day-old files. Now .claudex and each subdir are opened with
+    O_NOFOLLOW and files are unlinked relative to the subdir's fd, so a
+    symlinked (or mid-cleanup swapped) directory is skipped, never followed.
+    """
+    cutoff = time.time() - SESSION_MAX_AGE_SECONDS
+    if not _HAVE_DIR_FD:
+        if _PATHWISE_FALLBACK:
+            _cleanup_old_sessions_pathwise(claudex_dir, cutoff)
         return
-    for subdir_name in ("sessions", "recaps", "jobs"):
+    try:
+        claudex_fd = _claudex_fd(claudex_dir, create=False)
+    except OSError:
+        return  # missing, not a directory, or a symlink: nothing to clean
+    try:
+        for subdir_name in _CLEANUP_SUBDIRS:
+            try:
+                sub_fd = _open_dir_nofollow(subdir_name, dir_fd=claudex_fd)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                logger.warning(
+                    "Cleanup skipped .claudex/%s: not a real directory (symlink?)",
+                    subdir_name,
+                )
+                continue
+            try:
+                with os.scandir(sub_fd) as entries:
+                    for entry in entries:
+                        try:
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                            if entry.stat(follow_symlinks=False).st_mtime >= cutoff:
+                                continue
+                            os.unlink(entry.name, dir_fd=sub_fd)
+                            logger.info("Cleaned up stale %s: %s", subdir_name, entry.name)
+                        except OSError:
+                            pass  # best-effort
+            finally:
+                os.close(sub_fd)
+    finally:
+        os.close(claudex_fd)
+
+
+def _cleanup_old_sessions_pathwise(claudex_dir: Path, cutoff: float) -> None:
+    """Fallback for platforms without dir_fd support: refuse symlinks by path."""
+    if claudex_dir.is_symlink() or not claudex_dir.is_dir():
+        return
+    for subdir_name in _CLEANUP_SUBDIRS:
         subdir = claudex_dir / subdir_name
-        if not subdir.is_dir():
+        if subdir.is_symlink() or not subdir.is_dir():
             continue
-        cutoff = time.time() - SESSION_MAX_AGE_SECONDS
         for entry in subdir.iterdir():
             if entry.is_symlink():
                 continue
@@ -946,21 +1544,162 @@ def _ensure_claudex_ignored(claudex_dir: Path) -> None:
     touching the user's own .gitignore (the same trick virtualenvs and tool
     caches use). Best-effort: never follows symlinks, never overwrites.
     """
-    if claudex_dir.is_symlink() or not claudex_dir.is_dir():
-        return
-    path = claudex_dir / ".gitignore"
-    if path.is_symlink() or path.exists():
-        return
+    body = "# Created by Claudex: keeps its scratch files out of git.\n*\n"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     try:
-        fd = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o644,
-        )
+        if _HAVE_DIR_FD:
+            claudex_fd = _claudex_fd(claudex_dir, create=False)
+            try:
+                fd = _open_leaf(claudex_fd, ".gitignore", flags, 0o644)
+            finally:
+                os.close(claudex_fd)
+        else:
+            if (not _PATHWISE_FALLBACK or claudex_dir.is_symlink()
+                    or not claudex_dir.is_dir()):
+                return
+            fd = _open_leaf(None, claudex_dir / ".gitignore", flags, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write("# Created by Claudex: keeps its scratch files out of git.\n*\n")
+            f.write(body)
     except OSError:
-        pass
+        pass  # exists already, or .claudex is unusable
+
+
+def _claudex_ignore_state(claudex_dir: Path) -> str:
+    """'ok', 'missing' or 'unverified' for .claudex/.gitignore (diagnostics).
+
+    Claudex creates the file but never overwrites one a repository brought
+    along. Only a file whose rules are exactly `*` (what Claudex writes) is
+    reported ok; any other rule (a negation like `!*`, say) is 'unverified',
+    since git applies the last matching rule. Files git already tracks stay
+    tracked either way.
+    """
+    if not _HAVE_DIR_FD:
+        return "unknown"
+    try:
+        claudex_fd = _claudex_fd(claudex_dir, create=False)
+    except OSError:
+        return "missing"
+    try:
+        try:
+            fd = _open_leaf(claudex_fd, ".gitignore", os.O_RDONLY, 0)
+        except FileNotFoundError:
+            return "missing"
+        except OSError:
+            return "unverified"
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read(65_537)
+    finally:
+        os.close(claudex_fd)
+    if len(raw) > 65_536:
+        return "unverified"
+    # Git semantics: '#' starts a comment only in column 0, leading spaces are
+    # part of a pattern, unescaped trailing spaces are ignored.
+    rules = []
+    for line in raw.decode("utf-8", errors="replace").split("\n"):
+        if line.startswith("#"):
+            continue
+        rule = line.rstrip(" ")
+        if rule:
+            rules.append(rule)
+    return "ok" if rules == ["*"] else "unverified"
+
+
+def _tree_bytes_fd(dir_fd: int, depth: int = 0) -> int:
+    """Bytes of regular files under a directory fd, never following symlinks."""
+    total = 0
+    if depth > 32:
+        return total
+    with os.scandir(dir_fd) as entries:
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    sub_fd = _open_dir_nofollow(entry.name, dir_fd=dir_fd)
+                    try:
+                        total += _tree_bytes_fd(sub_fd, depth + 1)
+                    finally:
+                        os.close(sub_fd)
+                elif entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _claudex_usage(claudex_dir: Path) -> dict:
+    """fd-anchored inventory of .claudex/ for codex_status (no symlink follows)."""
+    usage: dict = {}
+    if not _HAVE_DIR_FD:
+        usage["unavailable"] = True  # never report "none" for files we did not look at
+        return usage
+    if claudex_dir.is_symlink():
+        usage["refused"] = True
+        return usage
+    try:
+        claudex_fd = _claudex_fd(claudex_dir, create=False)
+    except OSError:
+        return usage
+    try:
+        sessions = []
+        try:
+            sub_fd = _open_dir_nofollow("sessions", dir_fd=claudex_fd)
+        except OSError:
+            sub_fd = None
+        if sub_fd is not None:
+            try:
+                with os.scandir(sub_fd) as entries:
+                    names = sorted(
+                        e.name for e in entries
+                        if e.name.endswith(".md") and e.is_file(follow_symlinks=False)
+                    )
+                for name in names:
+                    try:
+                        fd = _open_leaf(sub_fd, name, os.O_RDONLY, 0)
+                        st = os.fstat(fd)
+                        with os.fdopen(fd, "r", encoding="utf-8") as f:
+                            text = f.read(SESSION_FILE_MAX_CHARS)
+                        sessions.append((name[:-3], _parse_session_rounds(text), st.st_mtime, st.st_size))
+                    except (OSError, UnicodeDecodeError):
+                        pass
+            finally:
+                os.close(sub_fd)
+        usage["sessions"] = sessions
+        try:
+            sub_fd = _open_dir_nofollow("recaps", dir_fd=claudex_fd)
+        except OSError:
+            sub_fd = None
+        count = size = 0
+        if sub_fd is not None:
+            try:
+                with os.scandir(sub_fd) as entries:
+                    for e in entries:
+                        try:
+                            if e.is_file(follow_symlinks=False):
+                                count += 1
+                                size += e.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            pass
+            finally:
+                os.close(sub_fd)
+        usage["recaps"] = (count, size)
+        runs = run_bytes = 0
+        with os.scandir(claudex_fd) as entries:
+            run_names = [e.name for e in entries
+                         if e.name.startswith("run-") and e.is_dir(follow_symlinks=False)]
+        for name in run_names:
+            try:
+                sub_fd = _open_dir_nofollow(name, dir_fd=claudex_fd)
+            except OSError:
+                continue
+            try:
+                runs += 1
+                run_bytes += _tree_bytes_fd(sub_fd)
+            finally:
+                os.close(sub_fd)
+        usage["runs"] = (runs, run_bytes)
+        usage["total"] = _tree_bytes_fd(claudex_fd)
+    finally:
+        os.close(claudex_fd)
+    return usage
 
 
 _PROXY_403_RE = re.compile(
@@ -1013,7 +1752,18 @@ def _prepare_run_dir(project_dir: str) -> Path:
     _cleanup_old_sessions(claudex_dir)
 
     run_dir = claudex_dir / f"run-{uuid.uuid4()}"
-    run_dir.mkdir(parents=True, exist_ok=False)
+    if _HAVE_DIR_FD:
+        # Created relative to the .claudex fd (v2.3.1): a .claudex swapped for
+        # a symlink after the check above fails here instead of redirecting.
+        claudex_fd = _claudex_fd(claudex_dir, create=True)
+        try:
+            os.mkdir(run_dir.name, 0o777, dir_fd=claudex_fd)
+        finally:
+            os.close(claudex_fd)
+    elif _PATHWISE_FALLBACK:
+        run_dir.mkdir(parents=True, exist_ok=False)
+    else:
+        raise _no_fd_support()
     _ensure_claudex_ignored(claudex_dir)
     return run_dir
 
@@ -1075,8 +1825,10 @@ def _extract_and_save_artifacts(
             )
             continue
 
-        target = (run_dir / filename).resolve()
-        if not target.is_relative_to(run_dir.resolve()):
+        # Lexical target (v2.3.1): the write below walks .claudex/run-<id>
+        # with directory fds, so containment does not depend on resolve().
+        target = run_dir / filename
+        if target.parent != run_dir:
             logger.warning(
                 "Artifact rejected — path traversal attempt: %r", filename
             )
@@ -1101,9 +1853,10 @@ def _extract_and_save_artifacts(
             )
             continue
 
-        # Write with exclusive create to avoid overwriting via symlink race
+        # Exclusive, no-follow, fd-anchored create (v2.3.1)
         try:
-            with open(target, "x", encoding="utf-8") as f:
+            fd = _open_nofollow(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(content)
             artifacts.append((filename, language))
             logger.info("Artifact saved: %s (%s)", filename, language)
@@ -1139,50 +1892,193 @@ def _auto_session_id(problem: str) -> str:
     return f"{slug}-{suffix}" if slug else f"session-{suffix}"
 
 
-def _init_session(session_path: Path, session_id: str) -> None:
-    """Create a new session document with structured header."""
-    session_path.parent.mkdir(parents=True, exist_ok=True)
-    _ensure_claudex_ignored(session_path.parent.parent)
+# Server-written session markers. Text that comes from Claude, Codex or a
+# recap is neutralized before it is stored (_neutralize_markers), and the
+# successor marker counts only as the document's last line, so session content
+# cannot forge a redirect to another session (v2.3.1).
+_SUCCESSOR_MARKER = "<!-- claudex:continued-in={} -->"
+_SUCCESSOR_RE = re.compile(r"\n<!-- claudex:continued-in=([A-Za-z0-9_.-]+) -->\s*\Z")
+_CARRIED_FROM_MARKER = "<!-- claudex:carried-from={} -->"
+_SESSION_CHAIN_MAX_HOPS = 16
+# A rollover carries at most this much into the successor's header, so the
+# newest rounds always keep most of the SESSION_MAX_BYTES context budget.
+CARRY_MAX_BYTES = SESSION_MAX_BYTES // 4
+_TRUNCATED_SUFFIX = "\n[truncated]"
+
+
+def _neutralize_markers(text: str) -> str:
+    return text.replace("<!-- claudex:", "<!-- claudex (quoted):")
+
+
+def _session_successor(content: str) -> Optional[str]:
+    match = _SUCCESSOR_RE.search(content)
+    return match.group(1) if match else None
+
+
+def _session_carried_from(content: str) -> Optional[str]:
+    """The predecessor a session was created for (header only)."""
+    head = content[:2048]
+    match = re.search(r"<!-- claudex:carried-from=([A-Za-z0-9_.-]+) -->", head)
+    return match.group(1) if match else None
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    """At most max_bytes of UTF-8, suffix included."""
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text
+    suffix = _TRUNCATED_SUFFIX.encode("utf-8")
+    if max_bytes < len(suffix):
+        return data[:max(0, max_bytes)].decode("utf-8", errors="ignore")
+    return data[:max_bytes - len(suffix)].decode("utf-8", errors="ignore") + _TRUNCATED_SUFFIX
+
+
+def _truncate_middle_utf8(text: str, max_bytes: int) -> str:
+    """At most max_bytes of UTF-8: the start and the end, the middle cut."""
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text
+    cut = "\n[... truncated ...]\n"
+    if max_bytes < len(cut.encode("utf-8")) + 64:
+        return _truncate_utf8(text, max_bytes)
+    half = (max_bytes - len(cut.encode("utf-8"))) // 2
+    head = data[:half].decode("utf-8", errors="ignore")
+    tail = data[len(data) - half:].decode("utf-8", errors="ignore") if half else ""
+    return head + cut + tail
+
+
+def _init_session(
+    session_path: Path, session_id: str, *,
+    carried_from: Optional[str] = None, carried: str = "",
+) -> None:
+    """Create a new session document with structured header.
+
+    A chained session (rollover) starts with the decisions carried over from
+    its predecessor, so they stay in context for every later round.
+    """
+    _ensure_parent_dir(session_path)
     timestamp = datetime.now(timezone.utc).isoformat()
-    session_path.write_text(
+    body = (
         f"# Session: {session_id}\n"
         f"Started: {timestamp}\n"
-        f"<!-- claudex:rounds=0 -->\n\n"
+        f"<!-- claudex:rounds=0 -->\n"
     )
+    if carried_from:
+        carried = _truncate_middle_utf8(_neutralize_markers(carried), CARRY_MAX_BYTES)
+        body += (
+            f"{_CARRIED_FROM_MARKER.format(carried_from)}\n\n"
+            f"## Carried over from '{carried_from}'\n\n{carried}\n\n"
+        )
+    else:
+        body += "\n"
+    _write_text_nofollow(session_path, body)
+    _ensure_claudex_ignored(session_path.parent.parent)
 
 
 def _append_to_session(
     session_path: Path, round_num: int, cc_analysis: str, codex_response: str
 ) -> None:
     """Append a round to an existing session document and update round count."""
-    content = session_path.read_text()
+    content = _read_session_text(session_path)
     # Update round count in structured header
-    content = re.sub(r'<!-- claudex:rounds=\d+ -->', f'<!-- claudex:rounds={round_num} -->', content)
+    content = re.sub(r'<!-- claudex:rounds=\d+ -->', f'<!-- claudex:rounds={round_num} -->', content, count=1)
     content += (
         f"\n---\n\n"
         f"## Round {round_num}\n\n"
-        f"### CC Analysis\n{cc_analysis}\n\n"
-        f"### Codex Response\n{codex_response}\n"
+        f"### CC Analysis\n{_neutralize_markers(cc_analysis)}\n\n"
+        f"### Codex Response\n{_neutralize_markers(codex_response)}\n"
     )
-    session_path.write_text(content)
+    _write_text_nofollow(session_path, content)
+
+
+SESSION_FILE_MAX_CHARS = 4_000_000  # far above SESSION_MAX_BYTES; bounds memory
+
+
+def _read_session_text(session_path: Path) -> str:
+    """Bounded, no-follow read of a session document (v2.3.1)."""
+    content = _read_text_nofollow(session_path, max_chars=SESSION_FILE_MAX_CHARS + 1)
+    if len(content) > SESSION_FILE_MAX_CHARS:
+        raise OSError(errno.EFBIG, "session document too large", str(session_path))
+    return content
+
+
+def _parse_session_rounds(content: str) -> int:
+    match = re.search(r'<!-- claudex:rounds=(\d+) -->', content)
+    return int(match.group(1)) if match else 0
 
 
 def _read_session_rounds(session_path: Path) -> int:
     """Parse round count from structured header line."""
-    if not session_path.exists():
+    try:
+        content = _read_session_text(session_path)
+    except FileNotFoundError:
         return 0
-    content = session_path.read_text()
-    match = re.search(r'<!-- claudex:rounds=(\d+) -->', content)
-    return int(match.group(1)) if match else 0
+    return _parse_session_rounds(content)
+
+
+def _session_unusable_error(exc: OSError) -> str:
+    return (
+        f"{ERROR_PREFIX}Session document unusable ({exc.strerror or exc}). "
+        ".claudex/sessions must be a real directory of regular files; a "
+        "symlink there is refused. Remove it or start a new session_id."
+    )
 
 
 def _get_truncated_session(
     session_path: Path, max_bytes: int = SESSION_MAX_BYTES
 ) -> str:
-    """Read session content, truncating oldest rounds first if over max_bytes."""
-    if not session_path.exists():
+    """Read session content, truncating oldest rounds first if over max_bytes.
+
+    Returns "" for a missing file. Other OSErrors (e.g. ELOOP for a symlink)
+    propagate: callers must not treat an unusable session as an empty one.
+    """
+    try:
+        content = _read_session_text(session_path)
+    except FileNotFoundError:
         return ""
-    content = session_path.read_text()
+    return _truncate_session_content(content, max_bytes)
+
+
+def _split_session(content: str) -> tuple[str, list]:
+    parts = re.split(r'(\n---\n\n## Round \d+)', content)
+    rounds = [parts[i] + (parts[i + 1] if i + 1 < len(parts) else "")
+              for i in range(1, len(parts), 2)]
+    return parts[0], rounds
+
+
+def _carry_from_document(content: str, max_bytes: int = CARRY_MAX_BYTES) -> str:
+    """Decisions to carry from a session document into its successor.
+
+    Newest rounds first, so the latest decision always survives (an
+    oversized newest round keeps its start and end); what is left of the
+    budget goes to the document's own carried section. Used when the recap
+    failed and when a missing successor is recreated (v2.3.1).
+    """
+    header, rounds = _split_session(_without_successor_marker(content))
+    budget = max_bytes - 1024  # room for neutralization and headings
+    kept: list = []
+    used = 0
+    for rnd in reversed(rounds):
+        size = len(rnd.encode("utf-8"))
+        if used + size > budget:
+            if not kept:
+                kept.append(_truncate_middle_utf8(rnd, budget))
+                used = budget
+            break
+        kept.insert(0, rnd)
+        used += size
+    text = "".join(kept)
+    carried_idx = header.find("## Carried over from")
+    room = budget - used
+    if carried_idx != -1 and room > 512:
+        text = _truncate_middle_utf8(header[carried_idx:], room) + text
+    if len(kept) < len(rounds):
+        text = "[Earlier rounds omitted]\n" + text
+    return text
+
+
+def _truncate_session_content(content: str, max_bytes: int = SESSION_MAX_BYTES) -> str:
+    """Drop oldest rounds until the session fits in max_bytes."""
     if len(content.encode("utf-8")) <= max_bytes:
         return content
     # Split into header + rounds and drop oldest rounds first.
@@ -1191,18 +2087,28 @@ def _get_truncated_session(
     parts = re.split(r'(\n---\n\n## Round \d+)', content)
     # parts[0] is header, then alternating [delimiter+heading, content] pairs
     header = parts[0]
+    if len(header.encode("utf-8")) > max_bytes // 2:
+        # A large carried section never crowds out the rounds.
+        header = _truncate_middle_utf8(header, max_bytes // 2)
     rounds = []
     for i in range(1, len(parts), 2):
         if i + 1 < len(parts):
             rounds.append(parts[i] + parts[i + 1])
         else:
             rounds.append(parts[i])
-    # Drop oldest rounds until within limit
-    while rounds and len((header + "".join(rounds)).encode("utf-8")) > max_bytes:
+    note = "[Earlier rounds truncated]\n"
+    newest = rounds[-1] if rounds else ""
+    # Drop oldest rounds until within limit (byte-accurate, note included)
+    while rounds and len((header + note + "".join(rounds)).encode("utf-8")) > max_bytes:
         rounds.pop(0)
-    if not rounds:
-        return header[:max_bytes]
-    return header + "[Earlier rounds truncated]\n" + "".join(rounds)
+    if rounds:
+        return header + note + "".join(rounds)
+    # Even the newest round alone does not fit: keep its start and its end
+    # (the conclusion) rather than dropping the latest decision.
+    room = max_bytes - len((header + note).encode("utf-8"))
+    if newest and room > 256:
+        return header + note + _truncate_middle_utf8(newest, room)
+    return _truncate_utf8(header, max_bytes)
 
 
 def _chain_session_id(session_id: str) -> str:
@@ -1212,6 +2118,107 @@ def _chain_session_id(session_id: str) -> str:
         base, num = match.group(1), int(match.group(2))
         return f"{base}-p{num + 1}"
     return f"{session_id}-p2"
+
+
+class _SessionChainError(Exception):
+    """A session chain that cannot be followed safely (message is user-facing)."""
+
+
+def _read_session_or_none(session_path: Path) -> Optional[str]:
+    try:
+        return _read_session_text(session_path)
+    except FileNotFoundError:
+        return None
+    except UnicodeDecodeError:
+        return ""  # Treat corrupted session as empty
+
+
+def _without_successor_marker(content: str) -> str:
+    match = _SUCCESSOR_RE.search(content)
+    return content[:match.start()] if match else content
+
+
+async def _lock_active_session(cwd: str, session_id: str, session_path: Path):
+    """Follow continued-in markers to the active session, hand over hand (v2.3.1).
+
+    Returns (lock, session_id, session_path, existing, note) with the active
+    session's lock held; the caller releases it. existing is None for a new
+    session. Raises _SessionChainError for a loop, an over-long chain or an
+    invalid successor name, OSError for an unusable document. A successor
+    whose file is missing is recreated from its predecessor's latest rounds,
+    so the chain never silently loses its context.
+    """
+    held = _get_session_lock(session_id)
+    await held.acquire()
+    try:
+        note = ""
+        visited = [session_id]
+        existing = _read_session_or_none(session_path)
+        while existing:
+            successor = _session_successor(existing)
+            if not successor:
+                break
+            if successor in visited:
+                raise _SessionChainError(f"session chain loops back to '{successor}'")
+            if len(visited) > _SESSION_CHAIN_MAX_HOPS:
+                raise _SessionChainError(
+                    f"the chain from '{visited[0]}' is longer than "
+                    f"{_SESSION_CHAIN_MAX_HOPS} sessions"
+                )
+            next_path = _safe_claudex_path(cwd, "sessions", f"{successor}.md")
+            if next_path is None:
+                raise _SessionChainError(
+                    f"'{session_id}' continues in an invalid session id"
+                )
+            predecessor_id, predecessor_text = session_id, existing
+            # Release, then wait for the successor's lock. Only a lock this
+            # call actually acquired is ever released (a cancelled wait must
+            # not release another call's lock).
+            held.release()
+            held = None
+            nxt = _get_session_lock(successor)
+            await nxt.acquire()
+            held = nxt
+            visited.append(successor)
+            session_id, session_path = successor, next_path
+            existing = _read_session_or_none(session_path)
+            if existing is None:
+                _init_session(
+                    session_path, session_id, carried_from=predecessor_id,
+                    carried=_carry_from_document(predecessor_text),
+                )
+                existing = _read_session_text(session_path)
+                note += (
+                    f"\n\n(Session '{session_id}' was missing; it was recreated "
+                    f"with '{predecessor_id}''s latest rounds as context.)"
+                )
+        return held, session_id, session_path, existing, note
+    except BaseException:
+        if held is not None:
+            held.release()
+        raise
+
+
+def _create_successor(cwd: str, old_session_id: str, carried: str):
+    """Create (or adopt) the successor of a session that hit the round cap.
+
+    A file already at the chained name is adopted only if it was created for
+    this predecessor (carried-from marker); anything else is skipped, so an
+    unrelated session is never taken over. Returns (id, path, text).
+    """
+    candidate = old_session_id
+    for _ in range(50):
+        candidate = _chain_session_id(candidate)
+        path = _safe_claudex_path(cwd, "sessions", f"{candidate}.md")
+        if path is None:
+            raise _SessionChainError("the chained session id is invalid")
+        text = _read_session_or_none(path)
+        if text is None:
+            _init_session(path, candidate, carried_from=old_session_id, carried=carried)
+            return candidate, path, _read_session_text(path)
+        if _session_carried_from(text) == old_session_id:
+            return candidate, path, text
+    raise _SessionChainError("no free successor session id")
 
 
 # --- File list normalization ---
@@ -1259,6 +2266,76 @@ _GIT_SAFE_CONFIG = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/nul
 _GIT_DIFF_SAFE_FLAGS = ("--no-ext-diff", "--no-textconv")
 
 
+def _kill_own_group(proc) -> None:
+    """SIGKILL the process group of a child started with start_new_session=True.
+
+    Such a child leads a new group whose id equals its pid for as long as any
+    member lives, so the group is signalled by that id even after the leader
+    exited (a git filter's background child can keep the pipes open while git
+    is gone). A pid is not reused while a group with that id exists. The
+    server's own group is never signalled. No killpg (Windows): the process.
+    """
+    try:
+        pid = int(proc.pid)
+        if pid <= 1 or pid == os.getpgrp():
+            raise OSError("refusing to signal this process group")
+        os.killpg(pid, 9)
+    except (AttributeError, ProcessLookupError, PermissionError, OSError, TypeError, ValueError):
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
+async def _communicate_or_kill(proc, timeout: float):
+    """communicate() with a deadline; on timeout kill and reap the process tree
+    so a hung git (or a repo's filter program and its children) never outlives
+    the request. Spawn with start_new_session=True."""
+    try:
+        return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        _kill_own_group(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
+        raise
+
+
+async def _git_run(project_dir: str, *args: str, timeout: int = 2) -> tuple[Optional[int], str]:
+    """(returncode, stdout) for a git command; returncode None when git could
+    not be run or timed out (distinguishes "no such ref" from "git failed")."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", *_GIT_SAFE_CONFIG, *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=project_dir,
+            env=_sanitized_codex_env(),
+            start_new_session=True,
+        )
+        stdout, _ = await _communicate_or_kill(proc, timeout)
+        return proc.returncode, stdout.decode(errors="replace").strip()
+    except (asyncio.TimeoutError, OSError):
+        return None, ""
+
+
+async def _head_attestation(project_dir: str) -> Optional[str]:
+    """HEAD sha, "none (no commits yet)" for an unborn branch, or None on failure."""
+    rc, sha = await _git_run(project_dir, "rev-parse", "--verify", "-q", "HEAD")
+    if rc == 0 and sha:
+        return sha
+    if rc != 1:
+        return None  # git failed or timed out
+    rc_ref, ref = await _git_run(project_dir, "symbolic-ref", "-q", "HEAD")
+    if rc_ref != 0 or not ref:
+        return None  # detached and unresolvable, or git failed
+    rc_show, _ = await _git_run(project_dir, "show-ref", "--verify", "-q", ref)
+    if rc_show == 1:
+        return "none (no commits yet)"  # HEAD names a branch that has no commit
+    return None
+
+
 async def _git_cmd(project_dir: str, *args: str, timeout: int = 2) -> Optional[str]:
     """Run a git command and return stdout, or None on failure.
 
@@ -1273,8 +2350,9 @@ async def _git_cmd(project_dir: str, *args: str, timeout: int = 2) -> Optional[s
             stderr=asyncio.subprocess.PIPE,
             cwd=project_dir,
             env=_sanitized_codex_env(),
+            start_new_session=True,  # own group: a timeout kills filters too
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        stdout, _ = await _communicate_or_kill(proc, timeout)
         if proc.returncode != 0:
             return None
         return stdout.decode(errors="replace").strip()
@@ -1382,7 +2460,8 @@ class SecondOpinionInput(CodexBaseInput):
         max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "The user's original request, verbatim. Ensures Codex responds "
-            "to user intent, not just CC's interpretation."
+            "to user intent, not just CC's interpretation. "
+            "Only include what the user permits sharing with OpenAI; otherwise omit it or pass an approved, task-specific version."
         ),
     )
     context: Optional[str] = Field(
@@ -1421,7 +2500,8 @@ class ParallelPlanInput(CodexBaseInput):
         description=(
             "The user's original request, verbatim. Pass this EXACTLY as the user "
             "typed it — do not rephrase, interpret, or add your own framing. "
-            "This ensures Codex forms its own independent understanding."
+            "This ensures Codex forms its own independent understanding. "
+            "Only include what the user permits sharing with OpenAI; otherwise omit it or pass an approved, task-specific version."
         ),
     )
     constraints: Optional[str] = Field(
@@ -1460,7 +2540,8 @@ class BrainstormInput(CodexBaseInput):
         description=(
             "The user's original request, verbatim. Pass this EXACTLY as the user "
             "typed it — do not rephrase, interpret, or add your own framing. "
-            "This ensures Codex forms its own independent understanding."
+            "This ensures Codex forms its own independent understanding. "
+            "Only include what the user permits sharing with OpenAI; otherwise omit it or pass an approved, task-specific version."
         ),
     )
     context: Optional[str] = Field(
@@ -1497,7 +2578,8 @@ class CollaborateInput(CodexBaseInput):
         max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "The user's original request, verbatim. Ensures Codex responds "
-            "to user intent, not just CC's interpretation."
+            "to user intent, not just CC's interpretation. "
+            "Only include what the user permits sharing with OpenAI; otherwise omit it or pass an approved, task-specific version."
         ),
     )
     session_id: Optional[str] = Field(
@@ -1533,7 +2615,8 @@ class QuickReviewInput(CodexBaseInput):
         max_length=MAX_TEXT_FIELD_CHARS,
         description=(
             "The user's original request, verbatim. Ensures Codex responds "
-            "to user intent, not just CC's interpretation."
+            "to user intent, not just CC's interpretation. "
+            "Only include what the user permits sharing with OpenAI; otherwise omit it or pass an approved, task-specific version."
         ),
     )
     focus: Optional[str] = Field(
@@ -1627,7 +2710,10 @@ class ReviewDiffInput(CodexBaseInput):
     user_prompt: Optional[str] = Field(
         default=None,
         max_length=MAX_TEXT_FIELD_CHARS,
-        description="The user's original request, verbatim.",
+        description=(
+            "The user's original request, verbatim. "
+            "Only include what the user permits sharing with OpenAI; otherwise omit it or pass an approved, task-specific version."
+        ),
     )
 
 
@@ -1901,7 +2987,7 @@ async def _run_codex_once(
         return (
             f"{ERROR_PREFIX}Codex CLI not found. Install it with:\n"
             "  npm i -g @openai/codex\n"
-            "Then sign in: /codex:login (or `codex login` in a terminal)"
+            "Then sign in: /claudex:login (or `codex login` in a terminal)"
         )
 
     # Reserve one execution from the durable daily cap at the SINGLE real
@@ -1994,21 +3080,11 @@ async def _run_codex_once(
     def _kill_tree(p) -> None:
         """Kill the process group (children included), falling back to the process.
 
-        Refuses pgid <= 1 defensively — killing init's group would take down
-        the host session (start_new_session=True guarantees pgid == child pid
-        in practice, so a real child always passes).
+        start_new_session=True makes the group id equal the child's pid, so
+        commands Codex started are killed even after codex itself exited
+        (v2.3.1); pid <= 1 and the server's own group are refused.
         """
-        try:
-            pid = int(p.pid)
-            pgid = os.getpgid(pid)
-            if pid <= 1 or pgid <= 1:
-                raise OSError(f"refusing to kill pgid {pgid}")
-            os.killpg(pgid, 9)
-        except (ProcessLookupError, PermissionError, OSError, TypeError, ValueError):
-            try:
-                p.kill()
-            except (ProcessLookupError, OSError):
-                pass
+        _kill_own_group(p)
 
     proc = None
     try:
@@ -2053,7 +3129,7 @@ async def _run_codex_once(
         return (
             f"{ERROR_PREFIX}Codex CLI not found. Install it with:\n"
             "  npm i -g @openai/codex\n"
-            "Then sign in: /codex:login (or `codex login` in a terminal)"
+            "Then sign in: /claudex:login (or `codex login` in a terminal)"
         )
     except OSError as exc:
         return f"{ERROR_PREFIX}Failed to start Codex: {exc}"
@@ -2124,7 +3200,7 @@ async def _run_codex_once(
             return network_error
         if "not authenticated" in err_msg.lower() or "login" in err_msg.lower():
             return (
-                f"{ERROR_PREFIX}Codex is not signed in. Run /codex:login (a one-time "
+                f"{ERROR_PREFIX}Codex is not signed in. Run /claudex:login (a one-time "
                 "code, no browser needed), or `codex login` in a terminal."
             )
         if "rate limit" in err_msg.lower() or "429" in err_msg:
@@ -2179,8 +3255,8 @@ async def _run_codex_once(
             )
             cleaned_output += "\n".join(lines)
         else:
-            # No artifacts — clean up the empty run dir
-            shutil.rmtree(run_dir, ignore_errors=True)
+            # No artifacts: clean up the empty run dir (fd-anchored, v2.3.1)
+            _remove_run_dir(run_dir)
     except OSError as exc:
         logger.warning("Artifact directory setup failed: %s", exc)
         cleaned_output = output  # Fall back to raw output
@@ -2528,7 +3604,7 @@ async def codex_critique(params: SecondOpinionInput) -> str:
 
     if params.user_prompt:
         parts.append(
-            "## Original User Request (verbatim)\n"
+            "## Original User Request (as forwarded by Claude)\n"
             "```\n"
             f"{params.user_prompt}\n"
             "```\n"
@@ -2600,7 +3676,7 @@ async def codex_plan(params: ParallelPlanInput) -> str:
 
     if params.user_prompt:
         parts.append(
-            "## Original User Request (verbatim — form your own interpretation)\n"
+            "## Original User Request (as forwarded by Claude — form your own interpretation)\n"
             "```\n"
             f"{params.user_prompt}\n"
             "```\n"
@@ -2672,7 +3748,7 @@ async def codex_brainstorm(params: BrainstormInput) -> str:
 
     if params.user_prompt:
         parts.append(
-            "## Original User Request (verbatim — form your own interpretation)\n"
+            "## Original User Request (as forwarded by Claude — form your own interpretation)\n"
             "```\n"
             f"{params.user_prompt}\n"
             "```\n"
@@ -2753,22 +3829,37 @@ async def codex_collab(params: CollaborateInput) -> str:
     # --- Session management: check round cap ---
     session_path = None
     session_context = ""
+    rollover_note = ""
     if params.session_id:
+        if "\x00" in params.session_id:
+            return f"{ERROR_PREFIX}Invalid session_id — contains unsafe characters."
+        # One canonical id (the file name's form) for the file, the lock, the
+        # chain markers and successor names, so 'foo bar' and 'foo_bar' are
+        # the same session and its markers stay parseable (v2.3.1).
+        params.session_id = _canonical_session_id(params.session_id)
         session_path = _safe_claudex_path(cwd, "sessions", f"{params.session_id}.md")
         if session_path is None:
             return f"{ERROR_PREFIX}Invalid session_id — contains unsafe characters."
-        if session_path.exists():
-            try:
-                rounds = _read_session_rounds(session_path)
-            except (UnicodeDecodeError, OSError):
-                rounds = 0  # Treat corrupted session as empty
-            if rounds >= MAX_SESSION_ROUNDS:
+        # A session that already rolled over points at its successor, so the
+        # call continues in the active session; its lock is held from here on
+        # (handed over along the chain), including a rollover's recap call, so
+        # two calls cannot both roll the same session over (v2.3.1).
+        try:
+            lock, params.session_id, session_path, existing, rollover_note = (
+                await _lock_active_session(cwd, params.session_id, session_path)
+            )
+        except _SessionChainError as exc:
+            return f"{ERROR_PREFIX}Session chain unusable: {exc}. Start a new session_id."
+        except OSError as exc:
+            return _session_unusable_error(exc)
+        try:
+            if existing is not None and _parse_session_rounds(existing) >= MAX_SESSION_ROUNDS:
                 # Auto-rollover: generate recap, then start chained session
                 logger.info(
                     "Session '%s' hit round cap (%d). Auto-rolling over.",
                     params.session_id, MAX_SESSION_ROUNDS,
                 )
-                old_session_content = _get_truncated_session(session_path)
+                old_session_content = _truncate_session_content(existing)
                 recap_result = await _run_codex_once(
                     RECAP_SYSTEM + "\n---\n"
                     f"## Session Log\n{old_session_content}\n\n"
@@ -2779,27 +3870,53 @@ async def codex_collab(params: CollaborateInput) -> str:
                     timeout=1200,
                     tool_name="codex_collab_recap",
                 )
+                recap_ok = not recap_result.startswith(ERROR_PREFIX)
                 # Save recap
                 recap_path = _safe_claudex_path(cwd, "recaps", f"{params.session_id}_recap.md")
-                if recap_path and not recap_result.startswith(ERROR_PREFIX):
+                if recap_path and recap_ok:
                     try:
-                        recap_path.parent.mkdir(parents=True, exist_ok=True)
+                        _ensure_parent_dir(recap_path)
+                        _write_text_nofollow(recap_path, recap_result)
                         _ensure_claudex_ignored(recap_path.parent.parent)
-                        recap_path.write_text(recap_result)
                         logger.info("Auto-recap saved: %s", recap_path.name)
                     except OSError as exc:
                         logger.warning("Auto-recap save failed: %s", exc)
-
-                # Chain session
-                new_session_id = _chain_session_id(params.session_id)
-                params.session_id = new_session_id
-                session_path = _safe_claudex_path(cwd, "sessions", f"{new_session_id}.md")
-                if session_path is None:
-                    return f"{ERROR_PREFIX}Invalid chained session_id — contains unsafe characters."
-                session_context = ""
+                try:
+                    old_session_id, old_session_path = params.session_id, session_path
+                    new_session_id, new_path, successor_text = _create_successor(
+                        cwd, old_session_id,
+                        recap_result if recap_ok else _carry_from_document(existing),
+                    )
+                    # Re-read right before marking: nothing awaited since the
+                    # recap returned, so this is the current document.
+                    current = _read_session_text(old_session_path)
+                    _write_text_nofollow(
+                        old_session_path,
+                        current.rstrip("\n") + f"\n{_SUCCESSOR_MARKER.format(new_session_id)}\n",
+                    )
+                except _SessionChainError as exc:
+                    return f"{ERROR_PREFIX}Session rollover failed: {exc}. Start a new session_id."
+                except UnicodeDecodeError as exc:
+                    return f"{ERROR_PREFIX}Session rollover failed: {exc}"
+                except OSError as exc:
+                    return _session_unusable_error(exc)
+                if not recap_ok:
+                    rollover_note += (
+                        f"\n\n(Session '{old_session_id}' reached {MAX_SESSION_ROUNDS} "
+                        f"rounds and its recap failed: {recap_result[:300]}. "
+                        f"'{new_session_id}' was started with the latest earlier rounds "
+                        "as context instead.)"
+                    )
+                # The successor's lock is not taken: in this event loop nothing
+                # can interleave before the prompt is built, and later calls
+                # reach it through the marker (and its own lock).
+                params.session_id, session_path = new_session_id, new_path
+                session_context = _truncate_session_content(successor_text)
                 logger.info("Session rolled over to '%s'.", new_session_id)
-            else:
-                session_context = _get_truncated_session(session_path)
+            elif existing:
+                session_context = _truncate_session_content(existing)
+        finally:
+            lock.release()
 
     # --- Build prompt ---
     system_prompt = _build_collaborate_system(params.request_type)
@@ -2807,7 +3924,7 @@ async def codex_collab(params: CollaborateInput) -> str:
 
     if params.user_prompt:
         parts.append(
-            "## Original User Request (verbatim)\n"
+            "## Original User Request (as forwarded by Claude)\n"
             "```\n"
             f"{params.user_prompt}\n"
             "```\n"
@@ -2854,44 +3971,76 @@ async def codex_collab(params: CollaborateInput) -> str:
 
     # --- Update session document (locked to prevent concurrent corruption) ---
     if params.session_id and session_path is not None and not result.startswith(ERROR_PREFIX):
-        async with _get_session_lock(params.session_id):
-            try:
-                if not session_path.exists():
-                    _init_session(session_path, params.session_id)
-                # Strip metadata footer before writing to session (avoid polluting context)
-                session_result = result
-                if "\n\n---\n_Codex:" in session_result:
-                    session_result = session_result.rsplit("\n\n---\n_Codex:", 1)[0]
-                rounds = _read_session_rounds(session_path) + 1
-                _append_to_session(session_path, rounds, params.cc_analysis, session_result)
-
-                # --- Artifact-session linking ---
-                if "## Artifacts Created" in result:
-                    try:
-                        artifact_idx = result.index("## Artifacts Created")
-                        artifact_end = result.find("\n\n---\n_Codex:", artifact_idx)
-                        if artifact_end == -1:
-                            artifact_section = result[artifact_idx:]
-                        else:
-                            artifact_section = result[artifact_idx:artifact_end]
-                        session_content = session_path.read_text()
-                        session_content += f"\n\n### Artifacts (Round {rounds})\n{artifact_section}\n"
-                        session_path.write_text(session_content)
-                    except (ValueError, OSError) as exc:
-                        logger.warning("Artifact-session linking failed: %s", exc)
-
-                session_line = (
-                    f"\n\nSession: {params.session_id} "
-                    f"(Round {rounds}/{MAX_SESSION_ROUNDS})"
+        try:
+            # Re-validate after the (minutes-long) model call: the tree may
+            # have changed meanwhile. The writes below are no-follow too.
+            fresh_path = _safe_claudex_path(cwd, "sessions", f"{params.session_id}.md")
+            if fresh_path is None or fresh_path != session_path:
+                raise OSError("session path changed during the Codex call")
+            # The session may have rolled over while Codex was working: the
+            # round then goes to the active successor, never to a document
+            # that is already continued elsewhere.
+            lock, active_id, active_path, active_text, late_note = (
+                await _lock_active_session(cwd, params.session_id, session_path)
+            )
+        except (OSError, UnicodeDecodeError, _SessionChainError) as exc:
+            logger.warning("Session update failed: %s", exc)
+            result += (
+                f"\n\n(Session document NOT updated: {exc}. "
+                ".claudex/sessions must be a real directory of regular files.)"
+            )
+            return result + rollover_note
+        try:
+            if active_id != params.session_id:
+                late_note += (
+                    f"\n\n('{params.session_id}' rolled over while Codex was "
+                    f"working; this round was added to '{active_id}'.)"
                 )
-                if session_was_auto:
-                    session_line += " [auto-generated]"
-                session_line += f"\nDocument: .claudex/sessions/{session_path.name}"
-                result += session_line
-            except (OSError, UnicodeDecodeError) as exc:
-                logger.warning("Session update failed: %s", exc)
+            if active_text is None:
+                _init_session(active_path, active_id)
+            # Strip metadata footer before writing to session (avoid polluting context)
+            session_result = result
+            if "\n\n---\n_Codex:" in session_result:
+                session_result = session_result.rsplit("\n\n---\n_Codex:", 1)[0]
+            rounds = _read_session_rounds(active_path) + 1
+            _append_to_session(active_path, rounds, params.cc_analysis, session_result)
 
-    return result
+            # --- Artifact-session linking ---
+            if "## Artifacts Created" in result:
+                try:
+                    artifact_idx = result.index("## Artifacts Created")
+                    artifact_end = result.find("\n\n---\n_Codex:", artifact_idx)
+                    if artifact_end == -1:
+                        artifact_section = result[artifact_idx:]
+                    else:
+                        artifact_section = result[artifact_idx:artifact_end]
+                    session_content = _read_session_text(active_path)
+                    session_content += (
+                        f"\n\n### Artifacts (Round {rounds})\n"
+                        f"{_neutralize_markers(artifact_section)}\n"
+                    )
+                    _write_text_nofollow(active_path, session_content)
+                except (ValueError, OSError) as exc:
+                    logger.warning("Artifact-session linking failed: %s", exc)
+
+            session_line = (
+                f"\n\nSession: {active_id} "
+                f"(Round {rounds}/{MAX_SESSION_ROUNDS})"
+            )
+            if session_was_auto:
+                session_line += " [auto-generated]"
+            session_line += f"\nDocument: .claudex/sessions/{active_path.name}"
+            result += session_line + late_note
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning("Session update failed: %s", exc)
+            result += (
+                f"\n\n(Session document NOT updated: {exc}. "
+                ".claudex/sessions must be a real directory of regular files.)"
+            )
+        finally:
+            lock.release()
+
+    return result + rollover_note
 
 
 @mcp.tool(
@@ -2929,7 +4078,7 @@ async def codex_review(params: QuickReviewInput) -> str:
 
     if params.user_prompt:
         parts.append(
-            "## Original User Request (verbatim)\n"
+            "## Original User Request (as forwarded by Claude)\n"
             "```\n"
             f"{params.user_prompt}\n"
             "```\n"
@@ -3064,10 +4213,16 @@ async def codex_recap(params: RecapInput) -> str:
     session_path = _safe_claudex_path(cwd, "sessions", f"{params.session_id}.md")
     if session_path is None:
         return f"{ERROR_PREFIX}Invalid session_id — contains unsafe characters."
-    if not session_path.exists():
+    try:
+        raw_session = _read_session_text(session_path)
+    except FileNotFoundError:
         return f"{ERROR_PREFIX}Session '{params.session_id}' not found in .claudex/sessions/."
+    except UnicodeDecodeError:
+        raw_session = ""
+    except OSError as exc:
+        return _session_unusable_error(exc)
 
-    session_content = _get_truncated_session(session_path)
+    session_content = _truncate_session_content(raw_session) if raw_session else ""
     if not session_content:
         return f"{ERROR_PREFIX}Session '{params.session_id}' exists but is empty or unreadable."
 
@@ -3101,9 +4256,9 @@ async def codex_recap(params: RecapInput) -> str:
         recap_path = _safe_claudex_path(cwd, "recaps", f"{params.session_id}_recap.md")
         if recap_path:
             try:
-                recap_path.parent.mkdir(parents=True, exist_ok=True)
+                _ensure_parent_dir(recap_path)
+                _write_text_nofollow(recap_path, result)
                 _ensure_claudex_ignored(recap_path.parent.parent)
-                recap_path.write_text(result)
                 result += f"\n\nDecision record saved to: .claudex/recaps/{recap_path.name}"
             except OSError as exc:
                 logger.warning("Recap save failed: %s", exc)
@@ -3111,8 +4266,21 @@ async def codex_recap(params: RecapInput) -> str:
     return result
 
 
+def _git_failure(what: str, detail: str) -> str:
+    """v2.3.1: a git failure is an error, never "nothing to review"."""
+    return (
+        f"{ERROR_PREFIX}Could not read the git diff ({what}: {detail}). "
+        "Nothing was reviewed. Check that the project is a git repository and "
+        "git is on PATH, then retry."
+    )
+
+
 async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]:
     """Get git diff content with review-integrity guarantees (v1.8.0).
+
+    Returns None only when git ran successfully and the diff is empty; any git
+    failure (missing binary, not a repository, timeout) returns an Error: string
+    so callers can never report a failed read as "no changes" (v2.3.1).
 
     - Includes DELETIONS (removed authorization checks are security-relevant).
     - Reports untracked files by name so a review never silently omits them.
@@ -3133,10 +4301,12 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
             stderr=asyncio.subprocess.PIPE,
             cwd=project_dir,
             env=_sanitized_codex_env(),  # drop GIT_DIR/GIT_EXTERNAL_DIFF/etc. (see _git_cmd)
+            start_new_session=True,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        stdout, stderr = await _communicate_or_kill(proc, 5)
         if proc.returncode != 0:
-            return None
+            tail = stderr.decode(errors="replace").strip()[-300:] or f"exit {proc.returncode}"
+            return _git_failure("git diff --name-only", tail)
         changed_files = [f for f in stdout.decode(errors="replace").strip().split("\n") if f]
         if len(changed_files) > DIFF_MAX_FILES:
             return (
@@ -3155,10 +4325,12 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
             stderr=asyncio.subprocess.PIPE,
             cwd=project_dir,
             env=_sanitized_codex_env(),  # drop GIT_DIR/GIT_EXTERNAL_DIFF/etc. (see _git_cmd)
+            start_new_session=True,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        stdout, stderr = await _communicate_or_kill(proc, 5)
         if proc.returncode != 0:
-            return None
+            tail = stderr.decode(errors="replace").strip()[-300:] or f"exit {proc.returncode}"
+            return _git_failure("git diff", tail)
 
         diff_text = stdout.decode(errors="replace")
         if not diff_text.strip():
@@ -3166,12 +4338,21 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
 
         # --- Attestation: bind the review to an exact repository state ---
         import hashlib
-        head_sha = await _git_cmd(project_dir, "rev-parse", "HEAD") or "unknown"
+        # An unborn branch (no commits yet) is legitimate: the diff is vs the
+        # index. Anything else is a git failure, never an attestation.
+        head_sha = await _head_attestation(project_dir)
+        if head_sha is None:
+            return _git_failure("git rev-parse HEAD", "could not resolve HEAD")
         diff_hash = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()[:16]
         untracked = await _git_cmd(
             project_dir, "ls-files", "--others", "--exclude-standard"
         )
-        _all_untracked = [f for f in (untracked or "").split("\n") if f]
+        if untracked is None:
+            return _git_failure(
+                "git ls-files --others",
+                "could not list untracked files, so the review could not attest to them",
+            )
+        _all_untracked = [f for f in untracked.split("\n") if f]
         untracked_count = len(_all_untracked)
         untracked_files = _all_untracked[:50]
 
@@ -3194,8 +4375,10 @@ async def _get_git_diff(project_dir: str, staged: bool = False) -> Optional[str]
                 note += f" ... and {untracked_count - len(untracked_files)} more (list incomplete)"
             header_lines.append(note)
         return "\n".join(header_lines) + "\n\n" + diff_text
-    except (asyncio.TimeoutError, OSError):
-        return None
+    except asyncio.TimeoutError:
+        return _git_failure("timeout", "git did not answer within 5s")
+    except OSError as exc:
+        return _git_failure("git unavailable", str(exc))
 
 
 @mcp.tool(
@@ -3228,7 +4411,12 @@ async def codex_review_diff(params: ReviewDiffInput) -> str:
         # v1.8.0: untracked-only changes must never read as "nothing to review" —
         # a brand-new untracked file is exactly where a backdoor hides.
         untracked_probe = await _git_cmd(cwd, "ls-files", "--others", "--exclude-standard")
-        untracked_list = [f for f in (untracked_probe or "").split("\n") if f]
+        if untracked_probe is None:
+            return _git_failure(
+                "git ls-files --others",
+                "the diff was empty but untracked files could not be listed",
+            )
+        untracked_list = [f for f in untracked_probe.split("\n") if f]
         diff_type = "staged" if params.staged else "unstaged"
         if untracked_list:
             shown = ", ".join(untracked_list[:50])
@@ -3249,7 +4437,7 @@ async def codex_review_diff(params: ReviewDiffInput) -> str:
 
     if params.user_prompt:
         parts.append(
-            "## Original User Request (verbatim)\n"
+            "## Original User Request (as forwarded by Claude)\n"
             "```\n"
             f"{params.user_prompt}\n"
             "```\n"
@@ -3332,31 +4520,23 @@ async def codex_status(params: StatusInput) -> str:
     lines.append(f"Timeout:       {EXEC_TIMEOUT_SECONDS}s (default, per-tool overrides available)")
     lines.append(f"Tools:         13 (8 Codex-calling + codex_submit/codex_result + codex_status + codex_ping + codex_login)")
 
-    # --- Workspace confinement (v1.8.2) ---
-    raw_roots = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
-    active_roots = _allowed_roots()
+    # --- Workspace confinement (v1.8.2; sources reported since v2.4) ---
+    resolution = _roots_resolution()
+    active_roots = resolution.roots
+    source_label = _ROOTS_SOURCE_LABELS.get(resolution.source, resolution.source)
     if active_roots:
         lines.append(f"Roots:         {os.pathsep.join(str(r) for r in active_roots)}")
-        if _roots_are_cloud_default():
-            lines.append(
-                f"               (Claude Code cloud session default: {PROJECT_DIR_ENV}; "
-                f"set {ALLOWED_ROOTS_ENV} to override)"
-            )
+        lines.append(f"               (source: {source_label})")
         if _roots_span_filesystem():
-            lines.append("               (confinement NOMINAL — a root spans the whole filesystem or home; narrow it)")
-        if any(_UNEXPANDED_TEMPLATE_RE.fullmatch(p.strip()) for p in raw_roots.split(os.pathsep)):
+            lines.append("               (confinement NOMINAL: a root spans the whole filesystem or home; narrow it)")
+        raw_roots = os.environ.get(ALLOWED_ROOTS_ENV, "").strip()
+        if resolution.source == "env" and any(
+            _UNEXPANDED_TEMPLATE_RE.fullmatch(p.strip()) for p in raw_roots.split(os.pathsep)
+        ):
             lines.append("               (unexpanded template part(s) in the configured value were ignored)")
-    elif raw_roots:
-        lines.append(
-            f"Roots:         DENY-ALL — {ALLOWED_ROOTS_ENV} was set but yielded no "
-            "usable roots (unexpanded template or invalid parts discarded); every "
-            "project directory is rejected until it names a real folder"
-        )
     else:
-        lines.append(
-            f"Roots:         DENY-ALL — {ALLOWED_ROOTS_ENV} not configured; every "
-            "project directory is rejected (deny-by-default). Set it to enable Claudex."
-        )
+        lines.append(f"Roots:         DENY-ALL ({source_label}): every project directory is rejected")
+        lines.append(f"               {_no_roots_message(resolution)}")
 
     # --- Daily execution cap (durable, per-user state) ---
     lines.append(f"Run cap:       {_run_cap_status_value()}")
@@ -3368,13 +4548,16 @@ async def codex_status(params: StatusInput) -> str:
 
     # Plugin version — resolve relative to server.py, not project dir
     plugin_json = Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"
-    plugin_version = "unknown"
+    plugin_version = SERVER_VERSION  # .mcpb bundles ship no plugin.json
     if plugin_json.is_file():
         try:
             plugin_version = json.loads(plugin_json.read_text()).get("version", "unknown")
         except (OSError, ValueError):
             pass
-    lines.append(f"Plugin:        v{plugin_version}")
+    lines.append(f"Plugin:        v{plugin_version} (build {_build_id()}, {_distribution()})")
+    lines.append(f"Server file:   {Path(__file__).resolve()}")
+    cfg_state = _load_roots_config()[0]
+    lines.append(f"Roots config:  {_config_path()} ({cfg_state})")
     lines.append(f"Author:        Omri Tal | botique.co.il | hello@botique.co.il")
 
     # --- Project-state sections require an authorized project dir ---
@@ -3387,81 +4570,61 @@ async def codex_status(params: StatusInput) -> str:
         lines.append(f"\nMetrics (this session):\n{metrics_summary}")
         return "\n".join(lines)
 
-    # --- Sessions ---
+    # --- Sessions / recaps / artifacts / disk usage ---
+    # Diagnostics never follow symlinks inside .claudex/ either: the walk is
+    # fd-anchored like every other .claudex operation (v2.3.1).
     claudex_dir = Path(cwd) / ".claudex"
-    sessions_dir = claudex_dir / "sessions"
+    usage = _claudex_usage(claudex_dir)
+    if usage.get("refused"):
+        lines.append("\n.claudex/ is a symlink: ignored (Claudex refuses to use it)")
+    if usage.get("unavailable"):
+        lines.append(
+            "\nSessions/recaps/artifacts: not inventoried (this platform lacks the "
+            "fd-relative file calls the no-symlink walk needs)"
+        )
+        metrics_summary = _get_metrics_summary()
+        lines.append(f"\nMetrics (this session):\n{metrics_summary}")
+        return "\n".join(lines)
     session_entries = []
-    if sessions_dir.is_dir():
-        for f in sorted(sessions_dir.iterdir()):
-            if f.is_file() and f.suffix == ".md":
-                try:
-                    rounds = _read_session_rounds(f)
-                    stat = f.stat()
-                    age_secs = time.time() - stat.st_mtime
-                    if age_secs < 3600:
-                        age_str = f"{int(age_secs / 60)}m ago"
-                    else:
-                        age_str = f"{age_secs / 3600:.1f}h ago"
-                    size_kb = stat.st_size / 1024
-                    name = f.stem
-                    session_entries.append(
-                        f"  {name:<20s} Round {rounds}/{MAX_SESSION_ROUNDS}  "
-                        f"({age_str}, {size_kb:.1f} KB)"
-                    )
-                except OSError:
-                    pass
-
+    for name, rounds, mtime, size in usage.get("sessions", []):
+        age_secs = time.time() - mtime
+        age_str = f"{int(age_secs / 60)}m ago" if age_secs < 3600 else f"{age_secs / 3600:.1f}h ago"
+        session_entries.append(
+            f"  {name:<20s} Round {rounds}/{MAX_SESSION_ROUNDS}  "
+            f"({age_str}, {size / 1024:.1f} KB)"
+        )
     if session_entries:
         lines.append(f"\nSessions ({len(session_entries)} active):")
         lines.extend(session_entries)
     else:
         lines.append("\nSessions: none")
 
-    # --- Recaps ---
-    recaps_dir = claudex_dir / "recaps"
-    recap_count = 0
-    recap_bytes = 0
-    if recaps_dir.is_dir():
-        for f in recaps_dir.iterdir():
-            if f.is_file():
-                try:
-                    recap_count += 1
-                    recap_bytes += f.stat().st_size
-                except OSError:
-                    pass
+    recap_count, recap_bytes = usage.get("recaps", (0, 0))
     if recap_count:
         lines.append(f"Recaps: {recap_count} file(s) ({recap_bytes / 1024:.1f} KB)")
     else:
         lines.append("Recaps: none")
 
-    # --- Artifact run dirs ---
-    run_dir_count = 0
-    run_dir_bytes = 0
-    if claudex_dir.is_dir():
-        for entry in claudex_dir.iterdir():
-            if entry.is_dir() and entry.name.startswith("run-") and not entry.is_symlink():
-                run_dir_count += 1
-                for root_path, _dirs, files in os.walk(entry):
-                    for fname in files:
-                        try:
-                            run_dir_bytes += os.path.getsize(os.path.join(root_path, fname))
-                        except OSError:
-                            pass
+    run_dir_count, run_dir_bytes = usage.get("runs", (0, 0))
     if run_dir_count:
         lines.append(f"Artifacts: {run_dir_count} run dir(s) ({run_dir_bytes / 1024:.1f} KB)")
     else:
         lines.append("Artifacts: none")
 
-    # --- Total .claudex/ disk usage ---
-    total_bytes = 0
-    if claudex_dir.is_dir():
-        for root_path, _dirs, files in os.walk(claudex_dir):
-            for fname in files:
-                try:
-                    total_bytes += os.path.getsize(os.path.join(root_path, fname))
-                except OSError:
-                    pass
-        lines.append(f"\n.claudex/ total: {total_bytes / 1024:.1f} KB")
+    if "total" in usage:
+        lines.append(f"\n.claudex/ total: {usage['total'] / 1024:.1f} KB")
+        ignore_state = _claudex_ignore_state(claudex_dir)
+        if ignore_state == "unverified":
+            lines.append(
+                "WARNING: .claudex/.gitignore has rules other than `*` (Claudex never "
+                "overwrites it), so Claudex cannot confirm session documents and "
+                "artifacts stay out of git. Make its only rule `*`."
+            )
+        elif ignore_state == "missing":
+            lines.append(
+                "WARNING: .claudex/.gitignore is missing, so .claudex/ files can show "
+                "up in git. Claudex recreates it on its next write."
+            )
 
     # --- Metrics ---
     metrics_summary = _get_metrics_summary()
@@ -3510,7 +4673,7 @@ async def codex_ping(params: Optional[PingInput] = None) -> str:
         return (
             "Codex CLI not found in PATH.\n"
             "Install: npm i -g @openai/codex\n"
-            "Sign in: /codex:login"
+            "Sign in: /claudex:login"
         )
 
     if not params.model_test:
@@ -3530,30 +4693,30 @@ async def codex_ping(params: Optional[PingInput] = None) -> str:
         elif state == "env-key":
             auth = "API key from CODEX_API_KEY (environment; model_test=true validates it)"
         elif state == "missing":
-            auth = f"{detail} — run /codex:login"  # always carry the fix
+            auth = f"{detail} — run /claudex:login"  # always carry the fix
         else:
             auth = detail
         lines.append(f"Auth:        {auth}")
 
         lines.append(f"Run cap:     {_run_cap_status_value()}")
 
-        roots = _allowed_roots()
+        resolution = _roots_resolution()
+        roots = resolution.roots
+        source_label = _ROOTS_SOURCE_LABELS.get(resolution.source, resolution.source)
         if roots and _roots_span_filesystem():
             lines.append(
-                f"Roots:       {len(roots)} configured — confinement NOMINAL "
+                f"Roots:       {len(roots)} configured ({source_label}): confinement NOMINAL "
                 "(a root spans the whole filesystem or home; narrow it)"
             )
-        elif roots and _roots_are_cloud_default():
+        elif roots and resolution.source == "cloud-default":
             lines.append(
-                f"Roots:       cloud session default ({roots[0]}) — confinement active"
+                f"Roots:       cloud session default ({roots[0]}) - confinement active"
             )
         elif roots:
-            lines.append(f"Roots:       {len(roots)} configured — confinement active")
+            lines.append(f"Roots:       {len(roots)} configured ({source_label}) - confinement active")
         else:
-            lines.append(
-                f"Roots:       NOT CONFIGURED — every project directory is "
-                f"denied until {ALLOWED_ROOTS_ENV} is set"
-            )
+            lines.append(f"Roots:       NOT CONFIGURED ({source_label}): every project directory is denied")
+            lines.append(f"             {_no_roots_message(resolution)}")
 
         lines.append(
             "Model test:  not run (pass model_test=true to spend one execution)"
@@ -3767,7 +4930,7 @@ async def codex_login(params: Optional[LoginInput] = None) -> str:
     if codex_path == "codex" and not shutil.which("codex"):
         return (
             f"{ERROR_PREFIX}Codex CLI not found. Install it with:\n"
-            f"  {CODEX_INSTALL_CMD}\nthen run /codex:login again."
+            f"  {CODEX_INSTALL_CMD}\nthen run /claudex:login again."
         )
 
     if params.restart:
@@ -4062,40 +5225,88 @@ def _write_job_file(job_id: str, *, status_only: bool = False) -> None:
     path = _safe_claudex_path(job["project_dir"], "jobs", f"{job_id}.md")
     if path is None:
         return
+    header = (
+        f"# Codex job {job_id}\n"
+        f"Tool: codex_{job['tool']}\n"
+        f"Status: {job['status']}\n"
+    )
+    if status_only:
+        content = header
+    else:
+        header += f"Finished: {datetime.now(timezone.utc).isoformat()}\n\n---\n\n"
+        content = header + (job["result"] or "")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        if _HAVE_DIR_FD:
+            _write_job_content_fd(path, content)
+        elif _PATHWISE_FALLBACK:
+            _write_job_content_pathwise(path, content)
+        else:
+            raise _no_fd_support()
         _ensure_claudex_ignored(path.parent.parent)
+    except OSError as exc:
+        logger.warning("Job file write failed for %s: %s", job_id, exc)
+
+
+def _write_job_content_fd(path: Path, content: str) -> None:
+    """0600 job record written relative to the jobs dir fd (no symlink follows).
+
+    Atomic via renameat when available (Linux, macOS); otherwise written in
+    place, which a crash could leave partial (readers then see a short body).
+    """
+    _ensure_parent_dir(path)
+    sub_fd = _open_claudex_subdir(path.parent.parent, path.parent.name, create=True)
+    try:
         try:
-            os.chmod(path.parent, 0o700)
+            os.fchmod(sub_fd, 0o700)
         except OSError:
             pass
-        header = (
-            f"# Codex job {job_id}\n"
-            f"Tool: codex_{job['tool']}\n"
-            f"Status: {job['status']}\n"
-        )
-        if status_only:
-            content = header
-        else:
-            header += f"Finished: {datetime.now(timezone.utc).isoformat()}\n\n---\n\n"
-            content = header + (job["result"] or "")
-        # Atomic replace via temp file (0600): a crash mid-write never destroys
-        # a valid record, and job files are not world-readable.
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+        flags = os.O_WRONLY | os.O_CREAT
+        if not _HAVE_RENAME_DIR_FD:
+            fd = _open_leaf(sub_fd, path.name, flags | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                os.fchmod(f.fileno(), 0o600)
                 f.write(content)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, path)
+            return
+        tmp_name = f".{path.name}.{uuid.uuid4().hex[:8]}.tmp"
+        fd = _open_leaf(sub_fd, tmp_name, flags | os.O_EXCL, 0o600)
+        try:
+            # Atomic replace: a crash mid-write never destroys a valid record,
+            # and job files are not world-readable.
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.rename(tmp_name, path.name, src_dir_fd=sub_fd, dst_dir_fd=sub_fd)
         except OSError:
             try:
-                os.unlink(tmp_path)
+                os.unlink(tmp_name, dir_fd=sub_fd)
             except OSError:
                 pass
             raise
-    except OSError as exc:
-        logger.warning("Job file write failed for %s: %s", job_id, exc)
+    finally:
+        os.close(sub_fd)
+
+
+def _write_job_content_pathwise(path: Path, content: str) -> None:
+    """Fallback for platforms without dir_fd support (Windows): best-effort."""
+    if path.parent.is_symlink() or path.parent.parent.is_symlink():
+        raise OSError(f"refusing symlinked job directory: {path.parent}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 async def _run_job(job_id: str, fn, tool_params) -> None:
@@ -4289,8 +5500,12 @@ async def codex_result(params: JobResultInput) -> str:
         lines = ["Jobs this server session:"]
         for jid, j in sorted(_jobs.items(), key=lambda kv: kv[1]["submitted"]):
             elapsed = (j["finished"] or time.time()) - j["submitted"]
+            # A job whose project is no longer allowed (roots changed or
+            # revoked) is listed without its path (v2.4).
+            _, denied = _authorized_cwd(j["project_dir"])
+            where = "[project no longer allowed]" if denied else j["project_dir"]
             lines.append(
-                f"  {jid}  codex_{j['tool']:<12s} {j['status']:<9s} {elapsed:>5.0f}s  {j['project_dir']}"
+                f"  {jid}  codex_{j['tool']:<12s} {j['status']:<9s} {elapsed:>5.0f}s  {where}"
             )
         return "\n".join(lines)
 
@@ -4307,15 +5522,18 @@ async def codex_result(params: JobResultInput) -> str:
         if _auth_err:
             return _auth_err
         path = _safe_claudex_path(pd, "jobs", f"{params.job_id}.md")
-        if path is not None and path.is_file():
+        content = None
+        if path is not None:
             try:
-                # Bounded read from one handle (no stat/read TOCTOU gap)
-                with open(path, "r", encoding="utf-8") as f:
-                    content = f.read(2_000_001)
-                if len(content) > 2_000_000:
-                    return f"{ERROR_PREFIX}Job file suspiciously large (>2MB); read it directly: .claudex/jobs/{params.job_id}.md"
+                # Bounded no-follow read from one handle (no stat/read TOCTOU gap)
+                content = _read_text_nofollow(path, max_chars=2_000_001)
+            except FileNotFoundError:
+                content = None
             except (OSError, UnicodeDecodeError) as exc:
                 return f"{ERROR_PREFIX}Job file unreadable: {exc}"
+            if content is not None and len(content) > 2_000_000:
+                return f"{ERROR_PREFIX}Job file suspiciously large (>2MB); read it directly: .claudex/jobs/{params.job_id}.md"
+        if content is not None:
             status_match = re.search(r'^Status: (\w+)$', content, re.MULTILINE)
             disk_status = status_match.group(1) if status_match else "unknown"
             if disk_status in ("queued", "running"):
@@ -4341,10 +5559,21 @@ async def codex_result(params: JobResultInput) -> str:
             "can be read from .claudex/jobs/. Use job_id='list' to see live jobs."
         )
 
+    # Re-check the job's project against the current roots: revoking or
+    # narrowing them also withholds results already in memory (v2.4).
+    _, _auth_err = _authorized_cwd(job["project_dir"])
+    if _auth_err:
+        return _auth_err
+
     if job["status"] in ("queued", "running") and params.wait_seconds > 0:
         task = _job_tasks.get(params.job_id)
         if task is not None:
             await asyncio.wait([task], timeout=params.wait_seconds)
+
+    # Again after the wait: roots may have been revoked meanwhile.
+    _, _auth_err = _authorized_cwd(job["project_dir"])
+    if _auth_err:
+        return _auth_err
 
     if job["status"] in ("queued", "running"):
         elapsed = time.time() - job["submitted"]
@@ -4363,7 +5592,141 @@ async def codex_result(params: JobResultInput) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _write_roots_config(data: dict) -> Path:
+    """Atomically write the per-user roots config (0600 file, 0700 dir).
+
+    POSIX: the config folder is opened without following a symlink, must be
+    owned by this account, and the file is created and renamed relative to
+    that folder's fd, so nothing can redirect the write (v2.4).
+    """
+    path = _config_path()
+    path.parent.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.mkdir(path.parent, 0o700)
+    except FileExistsError:
+        pass
+    _check_config_ancestors(path)
+    body = json.dumps({**data, "version": ROOTS_CONFIG_VERSION,
+                       "updated": datetime.now(timezone.utc).isoformat()}, indent=2) + "\n"
+    tmp_name = f".config.{uuid.uuid4().hex}.tmp"
+    if os.name == "nt" or not _HAVE_RENAME_DIR_FD:
+        tmp = path.parent / tmp_name
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return path
+    dir_fd = os.open(path.parent, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+    try:
+        st = os.fstat(dir_fd)
+        if st.st_uid != os.getuid():
+            raise OSError(errno.EPERM, f"{path.parent} is owned by another account")
+        os.fchmod(dir_fd, 0o700)
+        fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+                     0o600, dir_fd=dir_fd)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
+            os.rename(tmp_name, path.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except OSError:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dir_fd)
+    return path
+
+
+def _validate_configured_root(raw: str) -> tuple[Optional[Path], str]:
+    """(resolved root, "") or (None, reason) for one --configure-roots folder."""
+    expanded = os.path.expanduser(raw)
+    if not os.path.isabs(expanded):
+        return None, "must be an absolute path"
+    if not os.path.isdir(expanded):
+        return None, "is not an existing folder"
+    resolved = Path(expanded).resolve()
+    homes = _home_dirs()
+    if resolved == resolved.parent:
+        return None, "is a filesystem root; pick your project folders"
+    if resolved in homes:
+        return None, "is your whole home folder; pick your project folders"
+    for home in homes:
+        for denied in ALWAYS_DENIED_SUBPATHS:
+            denied_path = (home / denied).resolve()
+            if resolved == denied_path or resolved.is_relative_to(denied_path):
+                return None, "is a protected location"
+    return resolved, ""
+
+
+def _roots_cli(argv: list) -> int:
+    """Terminal-only roots management (v2.4). Not reachable from any MCP tool,
+    so a model can never widen its own workspace."""
+    if "--revoke-roots" in argv:
+        path = _write_roots_config({"deny_all": True, "allowed_roots": []})
+        print(f"Claudex roots REVOKED in {path}.")
+        print("Every Claudex server on this computer now denies all project folders,")
+        print("whatever else is configured. Takes effect on the next call.")
+        print(f"Re-enable with: {_configure_roots_command()}")
+        return 0
+    if "--configure-roots" in argv:
+        idx = argv.index("--configure-roots")
+        raw_roots = []
+        for arg in argv[idx + 1:]:
+            if arg.startswith("-"):
+                break
+            raw_roots.append(arg)
+        if not raw_roots:
+            print("Usage: --configure-roots <folder> [<folder> ...]", file=sys.stderr)
+            return 2
+        good, errors = [], []
+        for raw in raw_roots:
+            root, why = _validate_configured_root(raw)
+            if root is None:
+                errors.append(f"  {raw}: {why}")
+            elif str(root) not in good:
+                good.append(str(root))
+        if errors:
+            print("Nothing saved. Fix these folders:", file=sys.stderr)
+            print("\n".join(errors), file=sys.stderr)
+            return 2
+        path = _write_roots_config({"deny_all": False, "allowed_roots": good})
+        print(f"Saved {len(good)} folder(s) to {path}:")
+        for root in good:
+            print(f"  {root}")
+        print("Takes effect on the next Codex call; no restart needed.")
+        print(f"Note: {ALLOWED_ROOTS_ENV} and --allowed-roots, when set, take precedence")
+        print("over this file.")
+        return 0
+    # --show-roots
+    state, _, detail = _load_roots_config()
+    resolution = _roots_resolution()
+    print(f"Config file: {_config_path()} ({state})")
+    if state == "malformed":
+        print(f"  problem: {detail}")
+    print(f"This shell resolves: {_ROOTS_SOURCE_LABELS.get(resolution.source, resolution.source)}")
+    for root in resolution.roots:
+        print(f"  {root}")
+    print("(Servers launched by Claude apps may see different environment variables;")
+    print(" codex_status shows what a running server resolved.)")
+    return 0
+
+
 if __name__ == "__main__":
+    if any(flag in sys.argv for flag in ("--configure-roots", "--revoke-roots", "--show-roots")):
+        sys.exit(_roots_cli(sys.argv[1:]))
     # Structured roots transport: `server.py --allowed-roots <path> [<path> ...]`
     # takes precedence over CLAUDEX_ALLOWED_ROOTS and needs no separator parsing.
     # NOTE: the shipping launchers still pass roots via the env var — this argv

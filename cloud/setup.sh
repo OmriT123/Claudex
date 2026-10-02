@@ -46,6 +46,14 @@ add_marketplace() {
   fi
 }
 
+# Path of the installed server.py for $PLUGIN, from `claude plugin list --json`.
+installed_server() {
+  claude plugin list --json 2>/dev/null | awk -v id="$PLUGIN" '
+    /"id":/          { cur = $0; sub(/.*"id": *"/, "", cur); sub(/".*/, "", cur) }
+    /"installPath":/ { if (cur == id) { p = $0; sub(/.*"installPath": *"/, "", p); sub(/".*/, "", p); print p "/server/server.py"; exit } }
+  '
+}
+
 main() {
   local failed=0 server
   log "setup starting"
@@ -62,15 +70,18 @@ main() {
     log "FAIL: plugin install $PLUGIN"; failed=1
   fi
 
-  # First `uv run` downloads the server's deps; do it now, not on first use.
-  server=$(ls -d "$HOME"/.claude/plugins/cache/"$MARKETPLACE_NAME"/claudex/*/server/server.py 2>/dev/null | tail -1)
-  if [ -n "$server" ] && (cd /tmp && timeout 180 uv run --script "$server" </dev/null >/dev/null 2>&1); then
-    log "server dependencies cached"
+  # Prepare the server's deps now, not on first use. Resolve the INSTALLED
+  # copy from Claude Code's records (the cache can hold several versions).
+  server=$(installed_server)
+  if [ -z "$server" ]; then
+    log "FAIL: could not locate the installed $PLUGIN (claude plugin list --json)"; failed=1
+  elif (cd /tmp && timeout 300 uv sync --locked --script "$server" </dev/null >/dev/null 2>&1); then
+    log "server dependencies prepared for $server"
   else
-    log "FAIL: server dependency pre-warm"; failed=1
+    log "FAIL: server dependency preparation (uv sync --locked --script $server)"; failed=1
   fi
 
-  if [ "$failed" -eq 0 ]; then log "setup finished: OK"; else log "setup finished with failures (session still starts)"; fi
+  if [ "$failed" -eq 0 ]; then log "setup finished: OK"; else log "setup finished WITH FAILURES (session still starts; see $LOG)"; fi
 }
 
 main 2>&1 | tee -a "$LOG"
