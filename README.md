@@ -1,6 +1,8 @@
-# Claudex — Claude Code Plugin <sup>v3.0.0</sup>
+# Claudex <sup>v3.0.0</sup>
 
-Give Claude Code a Codex-powered teammate. Two different AI architectures collaborate on the same codebase — planning, security-testing, debugging, verification, and decision support.
+**OpenAI's Codex as an independent second opinion inside Claude, Claude Code and Cowork.**
+
+Give Claude a Codex-powered teammate. Two different AI architectures work on the same codebase: parallel planning, plan critique, code and diff review, red-teaming, debugging and tradeoff analysis. Codex always runs read-only.
 
 Ask in plain words ("use Codex to review this independently") or run a command
 such as `/claudex:plan`. Works in Claude Code and, through your claude.ai
@@ -562,9 +564,7 @@ handling: [PRIVACY.md](PRIVACY.md).
 
 ## Credits
 
-Created by **Omri Tal** — [GitHub](https://github.com/OmriT123) | [botique.co.il](https://www.botique.co.il) | hello@botique.co.il
-
-Infrastructure & logic contributions by **Gad Cohen**, COO @ [Evolven](https://www.evolven.com) — [LinkedIn](https://www.linkedin.com/in/gad-cohen-a4856/)
+Infrastructure and logic contributions by **Gad Cohen**, COO @ [Evolven](https://www.evolven.com) ([LinkedIn](https://www.linkedin.com/in/gad-cohen-a4856/)).
 
 ## License
 
@@ -572,5 +572,5 @@ MIT
 
 ## Author
 
-**Omri Tal — Botique AI Solutions**
-AI systems, agents & automation for business · [www.botique.co.il](https://www.botique.co.il) · [hello@botique.co.il](mailto:hello@botique.co.il)
+**Omri Tal, Botique AI Solutions**
+Custom AI systems, agents and automation · [botique.co.il](https://www.botique.co.il) · [LinkedIn](https://www.linkedin.com/in/omri-tal-ai) · [GitHub](https://github.com/OmriT123) · [omri@botique.co.il](mailto:omri@botique.co.il)
