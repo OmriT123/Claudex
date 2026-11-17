@@ -121,7 +121,7 @@ All analysis tools (`codex_plan`, `codex_critique`, `codex_brainstorm`, `codex_c
 
 ### Response Metadata Footer
 
-Every successful Codex response includes a footer: `_Codex: {model}, {effort}, {elapsed}s_`. Reference this for transparency when reporting to the user, e.g.: "Codex (gpt-6-astra, high, 45s) suggests..."
+Every successful Codex response includes a footer: `_Codex: {model}, {effort}, {elapsed}s_`. Reference this for transparency when reporting to the user, e.g.: "Codex (gpt-6.2-astra, high, 45s) suggests..."
 
 ---
 
@@ -367,7 +367,7 @@ When Codex disagrees with your approach:
 
 ## Model & Reasoning
 
-**Model:** `gpt-6-astra` (GPT-6 Astra) by default — the only sanctioned model. Overridable per-call via `model` parameter for deliberate one-offs. Needs Codex CLI ≥ 0.153.1; older CLIs get an actionable upgrade error.
+**Model:** `gpt-6.2-astra` (GPT-6.2 Astra) by default — the only sanctioned model. Overridable per-call via `model` parameter for deliberate one-offs. Needs Codex CLI ≥ 0.153.1; older CLIs get an actionable upgrade error.
 
 **Reasoning effort:** `high` by default on **every** tool (reviews and recaps too). Override with `reasoning_effort` parameter:
 - `low` — minimal reasoning, fast

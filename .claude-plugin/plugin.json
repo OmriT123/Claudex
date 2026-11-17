@@ -1,7 +1,7 @@
 {
   "name": "claudex",
   "description": "Codex (OpenAI) as a second-opinion teammate for Claude: independent planning, plan critique, code and diff review, red-teaming, debugging and tradeoff analysis, in a read-only sandbox.",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "author": {
     "name": "Omri Tal",
     "url": "https://www.botique.co.il",

@@ -1,4 +1,4 @@
-# Claudex <sup>v3.0.0</sup>
+# Claudex <sup>v3.0.1</sup>
 
 **OpenAI's Codex as an independent second opinion inside Claude, Claude Code and Cowork.**
 
@@ -53,7 +53,7 @@ the Ubuntu terminal. Native Windows and the Windows desktop app are not
 supported yet: Claudex is untested there and Codex's native Windows sandbox is
 still experimental.
 
-1. **Codex CLI ≥ 0.153.1** — the bridge to OpenAI. Older CLIs are rejected by the API for the default `gpt-6-astra` model (`requires a newer version of Codex`). Your ChatGPT account must also have GPT-6 Astra access (OpenAI is rolling it out in stages; Enterprise workspaces enable it explicitly) — Claudex never falls back to another model silently:
+1. **Codex CLI ≥ 0.153.1** — the bridge to OpenAI. Older CLIs are rejected by the API for the default `gpt-6.2-astra` model (`requires a newer version of Codex`). Your ChatGPT account must also have GPT-6.2 Astra access (OpenAI is rolling it out in stages; Enterprise workspaces enable it explicitly) — Claudex never falls back to another model silently:
    ```bash
    npm i -g @openai/codex@latest
    codex login
@@ -447,7 +447,7 @@ tracks stay tracked either way).
 
 ## Defaults
 
-- **Model**: `gpt-6-astra` — OpenAI's GPT-6 Astra, the only sanctioned default (overridable per-call via `model` parameter for deliberate one-offs). Requires Codex CLI ≥ 0.153.1 (see Prerequisites)
+- **Model**: `gpt-6.2-astra` — OpenAI's GPT-6.2 Astra, the only sanctioned default (overridable per-call via `model` parameter for deliberate one-offs). Requires Codex CLI ≥ 0.153.1 (see Prerequisites)
 - **Reasoning effort**: `high` on **every** tool, reviews and recaps included (override per-call: `low`, `medium`, `high`, `xhigh`, `max` — reserve `xhigh`/`max` for hard architectural decisions; Astra's `ultra` delegation tier is intentionally not exposed)
 - **Reasoning summary**: `detailed` (overridable: `detailed`, `concise`, `none`)
 - **Sandbox**: `read-only` — Codex reads your repo but never modifies it
@@ -489,7 +489,7 @@ Codex uses your ChatGPT subscription quota (with `CODEX_API_KEY`, usage is bille
 
 **Session context management** — Session documents are capped at 32KB. When a session exceeds this, the oldest rounds are dropped first to stay within the limit. Sessions expire after 24 hours of inactivity.
 
-**Error handling** — The server detects specific Codex CLI errors and returns user-friendly messages for "not authenticated", "rate limit/429", "model requires a newer version of Codex" (CLI too old for `gpt-6-astra` — upgrade hint with the pinned floor), a proxy/network policy blocking the OpenAI host (names the host), connection failures, and empty output cases. Codex runs with bounded connection retries, so an unreachable endpoint fails in under a minute instead of hanging until the timeout. All error responses use a consistent `[Claudex Error]` prefix.
+**Error handling** — The server detects specific Codex CLI errors and returns user-friendly messages for "not authenticated", "rate limit/429", "model requires a newer version of Codex" (CLI too old for `gpt-6.2-astra` — upgrade hint with the pinned floor), a proxy/network policy blocking the OpenAI host (names the host), connection failures, and empty output cases. Codex runs with bounded connection retries, so an unreachable endpoint fails in under a minute instead of hanging until the timeout. All error responses use a consistent `[Claudex Error]` prefix.
 
 **Environment** — Codex gets an allowlisted environment (`PATH`, `HOME`, proxy and CA variables, …); everything else is stripped. Codex's own credentials (`CODEX_API_KEY`, `CODEX_ACCESS_TOKEN`) are passed to codex spawns only (never to git) and are hidden from the commands Codex's model runs. Codex telemetry, plugin and app traffic are disabled.
 
@@ -544,7 +544,7 @@ Claudex/
 | Symptom | Fix |
 |---------|-----|
 | "Codex CLI not found" | `npm i -g @openai/codex` |
-| "Codex CLI is too old for model 'gpt-6-astra'" | `npm i -g @openai/codex@latest` — needs ≥ 0.153.1 |
+| "Codex CLI is too old for model 'gpt-6.2-astra'" | `npm i -g @openai/codex@latest` — needs ≥ 0.153.1 |
 | "Codex is not signed in" | `/claudex:login` (or `codex login` in a terminal; cloud: `CODEX_API_KEY` also works) |
 | "A network policy blocked Codex's connection to <host>" | Allow that host in your sandbox's network settings (Claude Code cloud: environment → Network access), then start a new session |
 | "Rate limit reached" | Wait for 5-hour window reset |
