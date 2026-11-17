@@ -63,12 +63,13 @@ from pydantic import BaseModel, Field, ConfigDict
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "gpt-6-astra"  # GPT-6 Astra (v2.1); per-call `model` override stays
-SERVER_VERSION = "3.0.0"  # kept equal to plugin.json + desktop-extension/manifest.json (tested)
+DEFAULT_MODEL = "gpt-6.2-astra"  # GPT-6.2 Astra (v3.0.1; was gpt-6-astra since v2.1); per-call `model` override stays
+SERVER_VERSION = "3.0.1"  # kept equal to plugin.json + desktop-extension/manifest.json (tested)
 DEFAULT_REASONING_EFFORT = "high"  # on every tool; Astra's own default is "medium"
 EXEC_TIMEOUT_SECONDS = 1200  # 20 min max per Codex call
 # Floor for the default model: older CLIs are rejected by the API (HTTP 400
-# "requires a newer version of Codex"). Provenance + caveats:
+# "requires a newer version of Codex"). Established live for gpt-6-astra;
+# NOT yet re-verified for gpt-6.2-astra (v3.0.1). Provenance + caveats:
 # docs/context/system_explanation.md → Config + env.
 MIN_CODEX_VERSION = "0.153.1"
 CODEX_INSTALL_CMD = "npm i -g @openai/codex@latest"
@@ -149,7 +150,7 @@ _SEVERITY_ORDER = {"critical": 0, "warning": 1, "suggestion": 2, "positive": 3}
 # Codebase-first preambles
 # ---------------------------------------------------------------------------
 
-# Operating contract shared by both preambles. Tuned for GPT-6 Astra per
+# Operating contract shared by both preambles. Tuned for GPT-6 Astra (carried to GPT-6.2 Astra) per
 # OpenAI's model guidance: Astra asks clarifying questions more readily than
 # its predecessors (this run is non-interactive — nobody can answer), follows
 # instructions more literally (so precedence must be explicit — repository
@@ -3021,7 +3022,7 @@ async def _run_codex_once(
         "-c", "skills.include_instructions=false",
         "-c", "skills.bundled.enabled=false",
         # --- Single agent (v2.1): multi-agent delegation is default-ON on CLI
-        # >= 0.153 and the catalog marks gpt-6-astra `multi_agent_version: v2`.
+        # >= 0.153 and the catalog marked gpt-6-astra `multi_agent_version: v2` (6.2: assume the same).
         # Verified on 0.153.4 via `codex debug prompt-input`: `agents.enabled=false`
         # alone removes the <multi_agent_role>/<multi_agent_mode> blocks; the
         # feature flag alone does NOT (metadata wins). Config-key form throughout
@@ -3186,7 +3187,7 @@ async def _run_codex_once(
                     f"{ERROR_PREFIX}The API rejected model '{model}' as needing a newer "
                     f"Codex, but the installed CLI (v{installed}) already meets the pinned "
                     f"floor (v{MIN_CODEX_VERSION}). Check that your ChatGPT account has "
-                    f"GPT-6 Astra access, or install the latest CLI:\n  {CODEX_INSTALL_CMD}"
+                    f"GPT-6.2 Astra access, or install the latest CLI:\n  {CODEX_INSTALL_CMD}"
                 )
             # Default model, parseable version below the floor: the one case where
             # "too old" is actually established.

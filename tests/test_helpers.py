@@ -2750,7 +2750,7 @@ class TestAstraAlignment:
     """Default model/effort, effort ladder, operating contract, CLI floor."""
 
     def test_default_model_is_astra(self):
-        assert DEFAULT_MODEL == "gpt-6-astra"
+        assert DEFAULT_MODEL == "gpt-6.2-astra"
 
     def test_min_codex_version_carries_astra_harness(self):
         import server as srv
@@ -2808,13 +2808,14 @@ class TestAstraAlignment:
 
     @pytest.mark.asyncio
     async def test_model_requires_newer_cli_is_actionable(self, tmp_path, monkeypatch):
-        """Live-observed on codex-cli 0.149.0: the API rejects gpt-6-astra with a
+        """Live-observed on codex-cli 0.149.0 (for gpt-6-astra; same shape for the
+        current default gpt-6.2-astra): the API rejects the default model with a
         400 'requires a newer version of Codex'. Must map to an upgrade hint,
         not the generic 'exited with code 1' nor the auth/rate-limit matchers."""
         import server as server_mod
-        stderr = (b'warning: Model metadata for `gpt-6-astra` not found.\n'
+        stderr = (b'warning: Model metadata for `gpt-6.2-astra` not found.\n'
                   b'ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",'
-                  b'"message":"The \'gpt-6-astra\' model requires a newer version of Codex. '
+                  b'"message":"The \'gpt-6.2-astra\' model requires a newer version of Codex. '
                   b'Please upgrade to the latest app or CLI and try again."}}')
         async def fake_check(*, consume=False):
             server_mod._version_cache["installed"] = "0.149.0"  # the live-observed case
@@ -2823,7 +2824,7 @@ class TestAstraAlignment:
         monkeypatch.setitem(server_mod._version_cache, "installed", "")
         result = await self._run_failing_codex(stderr, tmp_path)
         assert result.startswith(ERROR_PREFIX)
-        assert "too old for model 'gpt-6-astra'" in result
+        assert "too old for model 'gpt-6.2-astra'" in result
         assert "installed: v0.149.0" in result
         assert f">= v{server_mod.MIN_CODEX_VERSION}" in result
         assert "not authenticated" not in result.lower()
@@ -2852,7 +2853,7 @@ class TestAstraAlignment:
         is wrong or the account lacks Astra access. The two diagnoses are exclusive —
         no 'too old' / 'Update to >= vX' text may appear here."""
         import server as server_mod
-        stderr = b'ERROR: {"message":"The \'gpt-6-astra\' model requires a newer version of Codex."}'
+        stderr = b'ERROR: {"message":"The \'gpt-6.2-astra\' model requires a newer version of Codex."}'
         async def fake_check(*, consume=False):
             server_mod._version_cache["installed"] = "0.153.4"
             return ""
@@ -2861,7 +2862,7 @@ class TestAstraAlignment:
         result = await self._run_failing_codex(stderr, tmp_path)
         assert result.startswith(ERROR_PREFIX)
         assert "(v0.153.4) already meets the pinned floor" in result
-        assert "GPT-6 Astra access" in result
+        assert "GPT-6.2 Astra access" in result
         assert "too old" not in result
         assert f">= v{server_mod.MIN_CODEX_VERSION}" not in result
 
@@ -2878,7 +2879,7 @@ class TestAstraAlignment:
             server_mod._version_cache["installed"] = "0.153.4"
             return ""
         monkeypatch.setattr(server_mod, "_check_codex_version", fake_check)
-        stderr = b'ERROR: {"message":"The \'gpt-6-astra\' model requires a newer version of Codex."}'
+        stderr = b'ERROR: {"message":"The \'gpt-6.2-astra\' model requires a newer version of Codex."}'
         result = await self._run_failing_codex(stderr, tmp_path)
         assert calls == [False]  # resolved in-path, without consuming the one-shot warning
         assert "already meets the pinned floor" in result
@@ -2889,7 +2890,7 @@ class TestAstraAlignment:
         """Version probe failed/in backoff (installed == "") or unparseable (pre-release):
         the message must not claim 'too old' — it has no evidence either way."""
         import server as server_mod
-        stderr = b'ERROR: {"message":"The \'gpt-6-astra\' model requires a newer version of Codex."}'
+        stderr = b'ERROR: {"message":"The \'gpt-6.2-astra\' model requires a newer version of Codex."}'
         for seeded, shown in (("", "unknown"), ("0.154.0-beta.1", "'0.154.0-beta.1'")):
             async def fake_check(*, consume=False, _v=seeded):
                 server_mod._version_cache["installed"] = _v

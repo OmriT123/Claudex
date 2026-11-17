@@ -18,7 +18,7 @@ Run through these diagnostic checks in order. Stop at the first failure and help
 2. **Codex CLI version?**
    - Run: `codex --version`
    - Outdated = below `MIN_CODEX_VERSION` (0.153.1). Below that floor the API rejects the
-     default `gpt-6-astra` model on every call ("requires a newer version of Codex").
+     default `gpt-6.2-astra` model on every call ("requires a newer version of Codex").
    - If outdated: suggest `npm i -g @openai/codex@latest`, then `/reload-plugins` (or a
      session restart) — the server caches the version check once per process lifetime,
      and a reload respawns it. The same applies after `/plugin update claudex@omri-plugins`.
