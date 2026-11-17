@@ -69,7 +69,7 @@ DEFAULT_REASONING_EFFORT = "high"  # on every tool; Astra's own default is "medi
 EXEC_TIMEOUT_SECONDS = 1200  # 20 min max per Codex call
 # Floor for the default model: older CLIs are rejected by the API (HTTP 400
 # "requires a newer version of Codex"). Established live for gpt-6-astra;
-# NOT yet re-verified for gpt-6.2-astra (v3.0.1). Provenance + caveats:
+# gpt-6.2-astra verified live on 0.169.0 (2026-11-17); no lower 6.2 floor established. Provenance + caveats:
 # docs/context/system_explanation.md → Config + env.
 MIN_CODEX_VERSION = "0.153.1"
 CODEX_INSTALL_CMD = "npm i -g @openai/codex@latest"
@@ -3022,7 +3022,7 @@ async def _run_codex_once(
         "-c", "skills.include_instructions=false",
         "-c", "skills.bundled.enabled=false",
         # --- Single agent (v2.1): multi-agent delegation is default-ON on CLI
-        # >= 0.153 and the catalog marked gpt-6-astra `multi_agent_version: v2` (6.2: assume the same).
+        # >= 0.153 and the catalog marked gpt-6-astra `multi_agent_version: v2` (6.2: same, per the 0.169.0 catalog).
         # Verified on 0.153.4 via `codex debug prompt-input`: `agents.enabled=false`
         # alone removes the <multi_agent_role>/<multi_agent_mode> blocks; the
         # feature flag alone does NOT (metadata wins). Config-key form throughout

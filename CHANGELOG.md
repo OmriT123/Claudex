@@ -10,8 +10,8 @@ All notable changes to Claudex. Versions follow the plugin manifest.
 - Your ChatGPT account needs GPT-6.2 Astra access (Plus, Pro, Enterprise, Edu
   at launch). Update the Codex CLI first: `npm i -g @openai/codex@latest`.
 - The pinned CLI floor (`MIN_CODEX_VERSION` 0.153.1) was established for
-  `gpt-6-astra` and is not yet re-verified for 6.2. If the API reports
-  "requires a newer version of Codex", update the CLI to latest.
+  `gpt-6-astra`; 6.2 was verified live on CLI 0.169.0 (lower versions untested).
+  If the API reports "requires a newer version of Codex", update the CLI to latest.
 
 ## 3.0.0 (2026-10-01) - plugin renamed to `claudex`
 
